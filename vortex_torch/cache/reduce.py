@@ -16,7 +16,7 @@ class Mean(vOp):
 
     # Dispatch table: (x_format, out_format) -> (impl, final_out_format)
     _impl_map: Dict[Tuple[FORMAT, FORMAT], Tuple[Callable, FORMAT]] = {
-        (FORMAT.PAGED, FORMAT.PAGED): (mean_launcher, FORMAT.RAGGED),
+        (FORMAT.PAGED, FORMAT.PAGED): (mean_launcher, FORMAT.PAGED),
         # Add more (x_fmt, o_fmt) -> (impl, out_fmt) pairs as needed.
     }
 
