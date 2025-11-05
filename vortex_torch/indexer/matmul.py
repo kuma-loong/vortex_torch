@@ -14,7 +14,9 @@ class GeMV(vOp):
     contract: a lightweight **profiling** phase that produces a metadata tensor,
     and an **execution** phase that performs the actual computation.
     
-    :math: ``
+    .. math::
+
+        o = y_i x_i^T, \quad y_i \in \mathbb{R}^{S \times 1 \times D}, \quad x_i \in \mathbb{R}^{1 \times 1 \times D}.
 
     Implements:
         - ``profile(x: :class:`~vortex_torch.vTensor`, y: :class:`~vortex_torch.vTensor`, ctx) -> :class:`~vortex_torch.vTensor``
