@@ -1,0 +1,18 @@
+vortex\_torch.indexer.context
+=============================
+
+.. automodule:: vortex_torch.indexer.context
+
+   
+   .. rubric:: Functions
+
+   .. autosummary::
+   
+      get_ctx
+   
+   .. rubric:: Classes
+
+   .. autosummary::
+   
+      Context
+   

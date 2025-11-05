@@ -1,17 +1,42 @@
 import torch
 from .triton_kernels.mv_impl import triton_mv
 from typing import Tuple, Dict, Callable
-from ..op import vOp
 from .context import Context
-from ..tensor import vTensor, as_vtensor, FORMAT
+from ..abs import vTensor, as_vtensor, FORMAT, vOp
 
 
 class GeMV(vOp):
+    
     """
-    Contract preserved:
-      - profile(x: vTensor, y: vTensor, ctx) -> vTensor
-      - execute(x: torch.Tensor, y: torch.Tensor, ctx) -> torch.Tensor
-    No ctx mutation beyond add_aux_memory, and no dtype/device dispatching here.
+    General matrix–vector multiplication (GEMV) operator with format-aware dispatch.
+
+    This operator multiplies a matrix by a vector under the two-phase ``vOp``
+    contract: a lightweight **profiling** phase that produces a metadata tensor,
+    and an **execution** phase that performs the actual computation.
+    
+    :math: ``
+
+    Implements:
+        - ``profile(x: :class:`~vortex_torch.vTensor`, y: :class:`~vortex_torch.vTensor`, ctx) -> :class:`~vortex_torch.vTensor``
+        - ``execute(x: torch.Tensor, y: torch.Tensor, ctx) -> torch.Tensor``
+
+    Args:
+        x (:class:`~vortex_torch.vTensor` | torch.Tensor):
+            Vector operand. In the profiling phase, a :class:`~vortex_torch.vTensor`;
+            in the execution phase, a ``torch.Tensor`` with shape ``(B, 1, D)``.
+        y (:class:`~vortex_torch.vTensor` | torch.Tensor):
+            Matrix operand. In the profiling phase, a :class:`~vortex_torch.vTensor`;
+            in the execution phase, a ``torch.Tensor`` with shape ``(S_{pack}, 1, D)``.
+
+    Returns:
+        :class:`~vortex_torch.vTensor` | torch.Tensor:
+            A vector tensor of shape ``(S_{pack}, 1, 1)`` representing the GEMV
+            result, depending on the phase.
+
+    Notes:
+        * No dtype or device dispatch is performed; the caller must ensure that
+          operands share compatible dtype and device.
+
     """
 
     # Implementation dispatch table: keyed only by (x_format, y_format).

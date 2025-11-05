@@ -5,11 +5,16 @@ import numbers
 
 
 class FORMAT(Enum):
-    # Standard dense batched tensors (e.g., [B, N, D])
+    """Tensor storage/layout format.
+
+    Attributes:
+        BATCHED: Standard dense batched tensors (e.g., ``[B, N, D]``).
+        RAGGED: Ragged tensors with variable-length sequences or elements per batch.
+        PAGED: Paged tensors used for large or streaming data split into pages/chunks.
+    """
+    
     BATCHED = 0
-    # Ragged tensors with variable-length sequences or elements per batch
     RAGGED = 1
-    # Paged tensors used for large or streaming data split into pages/chunks
     PAGED = 2
 
 
@@ -129,7 +134,28 @@ class vTensor(torch.Tensor):
 
 # -------- convenience factory --------
 def as_vtensor(x: torch.Tensor | Any, _format: FORMAT = FORMAT.BATCHED) -> vTensor:
-    """Wrap an input as vTensor (no storage copy). If already vTensor, just update format."""
+    """Wrap an input as ``vTensor`` without copying storage.
+
+    If ``x`` is already a ``vTensor``, this returns the same object (or an
+    equivalent wrapper) after updating its format to ``_format`` when needed.
+
+    Args:
+        x (torch.Tensor | Any): Input to wrap. Typically a ``torch.Tensor``.
+            If a ``vTensor`` is passed, it will be returned (format may be updated).
+        _format (FORMAT, optional): Desired tensor storage/layout format.
+            Defaults to ``FORMAT.BATCHED``.
+
+    Returns:
+        vTensor: A ``vTensor`` that references the same underlying storage as ``x``
+        (no data copy). Device, dtype, and shape are preserved unless the target
+        ``_format`` requires metadata-only adjustments.
+
+    Example:
+        >>> t = torch.randn(2, 4, 8)
+        >>> vt = as_vtensor(t)  # FORMAT.BATCHED by default
+        >>> vt_ragged = as_vtensor(vt, _format=FORMAT.RAGGED)
+    """
+    
     if isinstance(x, vTensor):
         x._format = _format
         return x

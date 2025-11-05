@@ -1,12 +1,15 @@
 from __future__ import annotations
 from typing import Any, Final, Union
 import torch
-from ..context_base import ContextBase
+from ..abs import ContextBase
 from ..utils import UNSET, Mode
 
 
 class Context(ContextBase):
-    """Mutable, single-instance context; populate later via .create(...)."""
+    """
+    Mutable, single-instance context; populate later via .create(...).
+    """
+    
     __slots__ =  ContextBase.__slots__ + (
         # indices / indptr
         "dense_kv_indices", "sparse_kv_indices", "dense_kv_indptr", "sparse_kv_indptr", "kv_last_page_len", "batch_size",
@@ -24,7 +27,48 @@ class Context(ContextBase):
         # auxilary memory in graph
         "_aux_total_bytes",
     )
+    
+    # --- index tensors ---
+    dense_kv_indices: torch.Tensor  #: Dense KV index tensor for mapping keys/values.
+    sparse_kv_indices: torch.Tensor  #: Sparse KV index tensor for irregular KV layout.
+    dense_kv_indptr: torch.Tensor    #: CSR-style indptr for dense KV segments.
+    sparse_kv_indptr: torch.Tensor   #: CSR-style indptr for sparse KV segments.
+    kv_last_page_len: int            #: Length of the last KV page.
+    batch_size: int                  #: Active batch size.
 
+    # --- workload info (winfo) ---
+    winfo_q_indices: torch.Tensor    #: Query indices used in workload scheduling.
+    winfo_kv_offsets: torch.Tensor   #: KV offsets per workload.
+    winfo_kv_lens: torch.Tensor      #: KV lengths per workload.
+    winfo_num_workloads: int         #: Number of workloads in the current batch.
+    winfo_chunk_size: int            #: Chunk size for workload partitioning.
+    max_num_workloads: int           #: Maximum number of workloads allowed.
+
+    # --- chunk limits ---
+    max_chunk_size: int              #: Maximum allowed chunk size.
+    min_chunk_size: int              #: Minimum allowed chunk size.
+
+    # --- head / shape configuration ---
+    group_size: int                  #: Group size for grouped attention.
+    num_kv_heads: int                #: Number of KV heads.
+    num_qo_heads: int                #: Number of query/output heads.
+    head_dim: int                    #: Dimension per attention head.
+
+    # --- hardware / paging ---
+    num_sms: int                     #: Number of streaming multiprocessors (SMs).
+    page_size: int                   #: Page size used for memory paging.
+    max_num_pages: int               #: Total available pages.
+    max_num_pages_per_request: int   #: Page limit per individual request.
+
+    # --- miscellaneous ---
+    indexer_dtype: torch.dtype       #: Dtype used by indexer operations.
+    topk_val: int                    #: Top-K value used in pruning or selection.
+    page_reserved_bos: int           #: Reserved page count for BOS (begin-of-sequence).
+    page_reserved_eos: int           #: Reserved page count for EOS (end-of-sequence).
+
+    # --- auxiliary ---
+    _aux_total_bytes: int            #: Accumulated auxiliary memory in bytes.
+    
     def __init__(self) -> None:
         # Start as an empty shell (no big allocations).
         for name in self.__slots__:

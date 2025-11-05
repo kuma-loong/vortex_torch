@@ -1,7 +1,8 @@
 from abc import ABC, abstractmethod
-from ..context_base import ContextBase
 import torch
 from typing import Dict, Tuple
+from ..abs import ContextBase
+
 
 class vFlow(ABC):
     def __init__(self):

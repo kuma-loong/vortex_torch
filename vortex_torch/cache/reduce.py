@@ -1,18 +1,34 @@
 import torch
-from ..op import vOp
+from ..abs import vOp
 from .context import Context
 from .triton_kernels import mean_launcher
-from ..tensor import vTensor, as_vtensor, FORMAT
+from ..abs import vTensor, FORMAT
 from typing import Tuple, Dict, Callable
 
 class Mean(vOp):
+    
     """
-    Mean reduction op with format-dispatch.
-    Contract preserved:
-      - profile(x: vTensor, output: vTensor, loc: torch.Tensor, ctx) -> vTensor
-      - execute(x: torch.Tensor, output: torch.Tensor, loc: torch.Tensor, ctx) -> torch.Tensor
-    NOTE: output=None is NOT supported at the moment.
+    Mean reduction operator with format-aware dispatch.
+
+    This operator computes the mean of the input tensor and supports a
+    two-phase contract for profiling and execution. The public API mirrors
+    the ``vOp`` interface while specializing behavior for mean reduction.
+
+    Notes:
+        * ``output=None`` is currently **not** supported.
+        * The ``profile`` phase should return a logical ``vTensor`` describing
+          the resulting shape/dtype without performing full computation.
+        * The ``execute`` phase performs the actual mean reduction and writes
+          to ``output`` if provided.
+
+    Examples:
+        Basic idea of the two-phase flow:
+
+        >>> vt = vTensor(...)                 # logical tensor
+        >>> out_vt = Mean().profile(vt, vTensor(...), loc, ctx)
+        >>> out = Mean().execute(x, torch.empty_like(x.mean()), loc, ctx)
     """
+    
 
     # Dispatch table: (x_format, out_format) -> (impl, final_out_format)
     _impl_map: Dict[Tuple[FORMAT, FORMAT], Tuple[Callable, FORMAT]] = {

@@ -1,10 +1,11 @@
+import torch
+from typing import Dict
+
 from .flow import vFlow
 from ..indexer import topK, GeMV
 from ..cache import Mean
-import torch
-from ..context_base import ContextBase
+from ..abs import ContextBase
 from .registry import register
-from typing import Dict
 
 @register("block_sparse_attention")
 class BlockSparseAttention(vFlow):

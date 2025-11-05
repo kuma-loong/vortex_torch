@@ -1,9 +1,9 @@
 import torch
 from typing import Any, Tuple, Dict, Callable
-from ..op import vOp
+from ..abs import vOp
 from vortex_torch_C import topk_output
 from .context import Context
-from ..tensor import vTensor, FORMAT
+from ..abs import vTensor, FORMAT
 
 
 class topK(vOp):

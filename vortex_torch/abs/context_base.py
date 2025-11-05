@@ -1,18 +1,30 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
-from typing import Any, List, Union
+from typing import Any, List, Union, Literal
 import torch
-from .utils import UNSET, Mode
+from ..utils import UNSET, Mode
 
 class ContextBase(ABC):
     """
-    Abstract base for context objects with ONLY two allowed attributes:
-      - mode: str        # operating mode, e.g. "profile"/"execute"
-      - created: bool    # whether the context has been populated
-    All behaviors are abstract and must be implemented by subclasses.
+    Abstract base class for runtime contexts.
+
+    This class defines the minimal contract that all context implementations
+    must follow. It exposes two primary public attributes:
+
+    - ``mode`` (str): The current operating mode, e.g. ``"profile"`` or ``"execute"``.
+    - ``_created`` (bool): Whether the context has been populated via :meth:`create`.
+
+    Subclasses are responsible for implementing the lifecycle behavior and may
+    carry additional internal state as needed, but the public surface should stay
+    minimal and consistent.
     """
+    
     __slots__ = ("name", "mode", "_created")
 
+    name: str                                #: Human-readable context name.
+    mode: Literal["profile", "execute"]      #: Current operating mode.
+    _created: bool                           #: Backing flag for ``created`` property.
+    
     @property
     def created(self) -> bool:
         return self._created
@@ -21,6 +33,7 @@ class ContextBase(ABC):
     @abstractmethod
     def create(self, *args: Any, **kwargs: Any) -> "ContextBase":
         """Populate the context (idempotency/overwrite rules are up to the subclass)."""
+        
         raise NotImplementedError
 
     
@@ -45,14 +58,27 @@ class ContextBase(ABC):
             return int(t.element_size() * t.nelement())
 
     def add_aux_memory(self, obj: Union[int, torch.Tensor]) -> int:
+        
         """
-        Accumulate auxiliary memory.
-        - If obj is an int: treated as bytes.
-        - If obj is a torch.Tensor: converts to bytes and adds.
-        Returns the added bytes.
-        NOTE: This is a simple accumulator. Calling multiple times on tensors that share
-              the same storage (or the same tensor) will add multiple times.
+        Accumulate auxiliary memory usage and return the number of bytes added.
+
+        Args:
+            obj (int | torch.Tensor): If an ``int``, it is treated as a number
+                of bytes to add. If a ``torch.Tensor``, its size in bytes is
+                computed via :meth:`_tensor_nbytes` and added.
+
+        Returns:
+            int: The number of bytes that were added to the auxiliary total.
+
+        Raises:
+            TypeError: If ``obj`` is neither an ``int`` nor a ``torch.Tensor``.
+            ValueError: If the computed number of bytes is negative.
+
+        Notes:
+            This is a simple accumulator. Calling it multiple times on tensors
+            that share storage (or on the same tensor) will double-count.
         """
+        
         if isinstance(obj, int):
             nbytes = obj
         elif isinstance(obj, torch.Tensor):
@@ -68,12 +94,18 @@ class ContextBase(ABC):
 
 
     def clear_aux_memory(self) -> None:
-        """Reset the total auxiliary memory to zero."""
+        """
+        Reset the total auxiliary memory to zero.
+        """
+        
         self._aux_total_bytes = 0
         
     
     def summary(self) -> None:
-        """Print fields; tensor fields show shape/dtype/device, and append memory totals incl. auxiliary."""
+        """
+        Print fields; tensor fields show shape/dtype/device, and append memory totals incl. auxiliary.
+        """
+        
         def _fmt_bytes(n: int) -> str:
             units = ("B", "KB", "MB", "GB", "TB", "PB")
             f = float(n)
