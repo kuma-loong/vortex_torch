@@ -47,6 +47,8 @@ beta: float = 1.0
     o_dim0 = tl.arange(0, o_D0)
     o_dim1 = tl.arange(0, o_D1)
     
+    alpha_bf16 = tl.full((), alpha, dtype=tl.bfloat16)
+    beta_bf16 = tl.full((), beta, dtype=tl.bfloat16)
     
     for i in range(start, end):
         
@@ -77,7 +79,7 @@ beta: float = 1.0
             o_i = tl.minimum(x_i, y_i)
             
         elif OP_TYPE == "add":
-            o_i = tl.add(alpha * x_i, beta * y_i)
+            o_i = tl.add(alpha_bf16 * x_i, beta_bf16 * y_i)
 
         elif OP_TYPE == "mul":
             o_i = x_i * y_i
@@ -133,20 +135,20 @@ def _elementwise_binary_rrr(
 x: torch.Tensor,
 y: torch.Tensor,
 o: torch.Tensor,
+winfo_offsets: torch.Tensor,
+winfo_lens: torch.Tensor,
+winfo_num_workloads: torch.Tensor,
+max_chunk_size: int,
 op_type: Literal["maximum", "minimum", "add", "mul"],
 alpha: float,
 beta: float,
-winfo_kv_offsets: torch.Tensor,
-winfo_kv_lens: torch.Tensor,
-winfo_num_workloads: torch.Tensor,
-max_chunk_size: int,
 num_sms: int
 ):  
     
     elementwise_binary_rrr_kernel[(8 * num_sms,)](
         x, y, o, 
-        winfo_kv_offsets,
-        winfo_kv_lens,
+        winfo_offsets,
+        winfo_lens,
         winfo_num_workloads,
         max_chunk_size,
         x.shape[-2], 
@@ -214,7 +216,8 @@ beta: float = 1.0
     # Persistent cache: the current x[x_idx] as a whole [x_D0, D1] tile
     current_x_idx = tl.full((), -1, dtype=tl.int32)
     x_i = tl.zeros((x_D0, x_D1), dtype=tl.bfloat16)
-
+    alpha_bf16 = tl.full((), alpha, dtype=tl.bfloat16)
+    beta_bf16 = tl.full((), beta, dtype=tl.bfloat16)
     
     for i in range(start, end):
         # Select x for this workload
@@ -254,7 +257,7 @@ beta: float = 1.0
             o_i = tl.minimum(x_i[None,:,:], y_i)
             
         elif OP_TYPE == "add":
-            o_i = tl.add(alpha * x_i[None,:,:], beta * y_i)
+            o_i = tl.add(alpha_bf16 * x_i[None,:,:], beta_bf16 * y_i)
 
         elif OP_TYPE == "mul":
             o_i = x_i[None,:,:] * y_i
@@ -309,24 +312,24 @@ def _elementwise_binary_bpr(
 x: torch.Tensor,
 y: torch.Tensor,
 o: torch.Tensor,
+indices: torch.Tensor,
+winfo_x_indices: torch.Tensor,
+winfo_y_offsets: torch.Tensor,
+winfo_y_lens: torch.Tensor,
+winfo_num_workloads: torch.Tensor,
+max_chunk_size: int,
 op_type: Literal["maximum", "minimum", "add", "mul"],
 alpha: float,
 beta: float,
-dense_kv_indices: torch.Tensor,
-winfo_q_indices: torch.Tensor,
-winfo_kv_offsets: torch.Tensor,
-winfo_kv_lens: torch.Tensor,
-winfo_num_workloads: torch.Tensor,
-max_chunk_size: int,
 num_sms: int,
 ):  
     
     elementwise_binary_bpr_kernel[(8 * num_sms,)](
         x, y, o, 
-        dense_kv_indices,
-        winfo_q_indices,
-        winfo_kv_offsets,
-        winfo_kv_lens,
+        indices,
+        winfo_x_indices,
+        winfo_y_offsets,
+        winfo_y_lens,
         winfo_num_workloads,
         max_chunk_size,
         x.shape[-2], 
@@ -386,6 +389,8 @@ beta: float = 1.0
     o_dim0 = tl.arange(0, o_D0)
     o_dim1 = tl.arange(0, o_D1)
 
+    alpha_bf16 = tl.full((), alpha, dtype=tl.bfloat16)
+    beta_bf16 = tl.full((), beta, dtype=tl.bfloat16)
     
     for i in range(start, end):
         
@@ -420,7 +425,7 @@ beta: float = 1.0
             o_i = tl.minimum(x_i, y_i)
             
         elif OP_TYPE == "add":
-            o_i = tl.add(alpha * x_i, beta * y_i)
+            o_i = tl.add(alpha_bf16 * x_i, beta_bf16 * y_i)
 
         elif OP_TYPE == "mul":
             o_i = x_i * y_i
@@ -474,22 +479,22 @@ def _elementwise_binary_rpr(
 x: torch.Tensor,
 y: torch.Tensor,
 o: torch.Tensor,
+indices: torch.Tensor,
+winfo_offsets: torch.Tensor,
+winfo_lens: torch.Tensor,
+winfo_num_workloads: torch.Tensor,
+max_chunk_size: int,
 op_type: Literal["maximum", "minimum", "add", "mul"],
 alpha: float,
 beta: float,
-dense_kv_indices: torch.Tensor,
-winfo_kv_offsets: torch.Tensor,
-winfo_kv_lens: torch.Tensor,
-winfo_num_workloads: torch.Tensor,
-max_chunk_size: int,
 num_sms: int
 ):  
     
     elementwise_binary_rpr_kernel[(8 * num_sms,)](
         x, y, o, 
-        dense_kv_indices,
-        winfo_kv_offsets,
-        winfo_kv_lens,
+        indices,
+        winfo_offsets,
+        winfo_lens,
         winfo_num_workloads,
         max_chunk_size,
         x.shape[-2], 

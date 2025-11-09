@@ -99,19 +99,16 @@ ctx: Context
 def _normalize_inplace_r(
 x: torch.Tensor,
 dim: int,
-dense_kv_indptr: torch.Tensor,
+indptr: torch.Tensor,
 page_reserved_bos: int, 
 page_reserved_eos: int,
 topk_val: int,
-batch_size: int,
-num_kv_heads: int
+batch_size: int
 ):  
-    
-    eff_batch_size = batch_size * num_kv_heads
-   
-    normalize_inplace_r_kernel[(eff_batch_size,)](
+       
+    normalize_inplace_r_kernel[(batch_size,)](
         x,
-        dense_kv_indptr,
+        indptr,
         page_reserved_bos,
         page_reserved_eos,
         topk_val,

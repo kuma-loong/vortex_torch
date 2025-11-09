@@ -108,19 +108,19 @@ ctx: Context
 def _softmax_inplace_r(
 x: torch.Tensor,
 dim: int,
-dense_kv_indptr: torch.Tensor,
+indptr: torch.Tensor,
+scale: float,
 page_reserved_bos: int, 
 page_reserved_eos: int,
 topk_val: int,
-batch_size: int,
-num_kv_heads: int
+batch_size: int
 ):  
     
-    eff_batch_size = batch_size * num_kv_heads
-   
-    softmax_inplace_r_kernel[(eff_batch_size,)](
+    
+    softmax_inplace_r_kernel[(batch_size,)](
         x,
-        dense_kv_indptr,
+        indptr,
+        scale,
         page_reserved_bos,
         page_reserved_eos,
         topk_val,

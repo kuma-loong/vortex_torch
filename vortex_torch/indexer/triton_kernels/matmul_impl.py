@@ -40,7 +40,7 @@ D: tl.constexpr,
 
     # Persistent cache: the current x[x_idx] as a whole [G, D] tile
     current_x_idx = tl.full((), -1, dtype=tl.int32)
-    x_i = tl.zeros((G, D), dtype=tl.bfloat16)
+    x_i = tl.zeros((G, D), dtype=tl.float32)
 
     
     for i in range(start, end):
@@ -48,9 +48,9 @@ D: tl.constexpr,
         x_idx_i32 = tl.load(winfo_x_indices + i).to(tl.int32)
         if x_idx_i32 != current_x_idx:
             x_base = (x_idx_i32 * x_stride).to(tl.int32)
-            # Load x_i: [G, D] (bf16)
+            # Load x_i: [G, D] (f32)
             x_offs = x_base + (g_ptr[:, None] * D + d_ptr[None, :]).to(tl.int32)
-            x_i = tl.load(x + x_offs)  # bf16
+            x_i = tl.load(x + x_offs).to(tl.float32) # f32
             current_x_idx = x_idx_i32
 
         # Range of y rows for this workload
@@ -61,24 +61,24 @@ D: tl.constexpr,
         # Row indices for this chunk of y
         y_idx_i32 = tl.load(indices + y_off + idx_ptr, mask=valid, other=0).to(tl.int32)
 
-        # Load y_tile: [rows, C, D] (bf16)
+        # Load y_tile: [rows, C, D] (f32)
         # Linear offset: row*C*D + c*D + d
         offs_y = (
             (y_idx_i32[:, None, None] * (C * D)) +
             (c_ptr[None, :, None]     * D) +
             d_ptr[None, None, :]
         ).to(tl.int32)
-        y_tile_bf16 = tl.load(y + offs_y, mask=valid[:, None, None], other=0.0)  # [rows, C, D], bf16
+        y_tile = tl.load(y + offs_y, mask=valid[:, None, None], other=0.0).to(tl.float32)   # [rows, C, D], bf16
 
-        # Reshape to [rows*C, D] as the left operand (bf16)
+        # Reshape to [rows*C, D] as the left operand (f32)
         rows_total: tl.constexpr = max_chunk_size * C
-        y_rc_bf16 = tl.reshape(y_tile_bf16, (rows_total, D))  # [RC, D], bf16
+        y_rc = tl.reshape(y_tile, (rows_total, D))  # [RC, D], f32
 
-        # Use x without transpose: x_i is [G, D] (bf16)
-        # Elementwise multiply in bf16, then cast to fp32 and reduce over D:
-        # [RC, 1, D] * [1, G, D] -> [RC, G, D] (bf16), then sum over D -> [RC, G] (fp32)
-        prod_bf16 = y_rc_bf16[:, None, :] * x_i[None, :, :]   # bf16 mult
-        acc = tl.sum(prod_bf16.to(tl.float32), 2)             # fp32 reduction on D
+        # Use x without transpose: x_i is [G, D] (f32)
+        # Elementwise multiply in f32, then cast to fp32 and reduce over D:
+        # [RC, 1, D] * [1, G, D] -> [RC, G, D] (f32), then sum over D -> [RC, G] (fp32)
+        prod_ = y_rc[:, None, :] * x_i[None, :, :]   # f32 mult
+        acc = tl.sum(prod_, 2)             # fp32 reduction on D
 
         # Reshape back to [rows, C, G] and store (fp32)
         o_i = tl.reshape(acc, (max_chunk_size, C, G))  # [rows, C, G], fp32
@@ -117,10 +117,10 @@ def _mm_bpr(
 x: torch.Tensor,
 y: torch.Tensor,
 o: torch.Tensor,
-dense_kv_indices: torch.Tensor,
-winfo_q_indices: torch.Tensor,
-winfo_kv_offsets: torch.Tensor,
-winfo_kv_lens: torch.Tensor,
+indices: torch.Tensor,
+winfo_x_indices: torch.Tensor,
+winfo_y_offsets: torch.Tensor,
+winfo_y_lens: torch.Tensor,
 winfo_num_workloads: torch.Tensor,
 max_chunk_size: int,
 num_sms: int,
@@ -128,10 +128,10 @@ num_sms: int,
     
     mm_bpr_kernel[(num_sms,)](
         x, y, o, 
-        dense_kv_indices,
-        winfo_q_indices,
-        winfo_kv_offsets,
-        winfo_kv_lens,
+        indices,
+        winfo_x_indices,
+        winfo_y_offsets,
+        winfo_y_lens,
         winfo_num_workloads,
         max_chunk_size,
         x.shape[-2], y.shape[-2], x.shape[-1], num_warps=32, num_stages=1
@@ -192,7 +192,7 @@ o_D1: tl.constexpr
                 x_dim0[None,:,None] * x_D1 + \
                 x_dim1[None, None, :]
 
-        x_i = tl.load(x_i_ptr, mask=valid[:,None,None], other=0.0)
+        x_i = tl.load(x_i_ptr, mask=valid[:,None,None], other=0.0).to(tl.float32)
         
         
         y_i_ptr = y + _off * y_D0 * y_D1 + \
@@ -200,9 +200,9 @@ o_D1: tl.constexpr
                 y_dim0[None,:,None] * y_D1 + \
                 y_dim1[None, None, :]
 
-        y_i = tl.load(y_i_ptr, mask=valid[:,None,None], other=0.0)
+        y_i = tl.load(y_i_ptr, mask=valid[:,None,None], other=0.0).to(tl.float32)
         
-        o_i = tl.sum((x_i[:,None,:,:] * y_i[:,:,None,:]).to(tl.float32), axis=3)
+        o_i = tl.sum((x_i[:,None,:,:] * y_i[:,:,None,:]), axis=3)
         o_i = o_i.to(tl.bfloat16)
         
         o_i_ptr = o + _off * o_D0 * o_D1 + \
@@ -238,8 +238,8 @@ def _mm_rrr(
 x: torch.Tensor,
 y: torch.Tensor,
 o: torch.Tensor,
-winfo_kv_offsets: torch.Tensor,
-winfo_kv_lens: torch.Tensor,
+winfo_offsets: torch.Tensor,
+winfo_lens: torch.Tensor,
 winfo_num_workloads: torch.Tensor,
 max_chunk_size: int,
 num_sms: int
@@ -247,8 +247,8 @@ num_sms: int
     
     mm_rrr_kernel[(8 * num_sms,)](
         x, y, o, 
-        winfo_kv_offsets,
-        winfo_kv_lens,
+        winfo_offsets,
+        winfo_lens,
         winfo_num_workloads,
         max_chunk_size,
         x.shape[-2], 
@@ -292,7 +292,6 @@ o_D1: tl.constexpr
     end   = start + per + (pid < r)
 
     idx_ptr = tl.arange(0, max_chunk_size)
-    
     x_dim0 = tl.arange(0, x_D0)
     x_dim1 = tl.arange(0, x_D1)
     
@@ -320,17 +319,17 @@ o_D1: tl.constexpr
             y_dim1[None, None, :]
         ).to(tl.int32)
         
-        y_i = tl.load(y + offs_y, mask=valid[:, None, None], other=0.0)  # [rows, C, D], bf16
+        y_i = tl.load(y + offs_y, mask=valid[:, None, None], other=0.0).to(tl.float32)  # [rows, C, D], f32
 
         x_i_ptr = x + _off * x_D0 * x_D1 + \
                 idx_ptr[:, None, None] * x_D0 * x_D1 + \
                 x_dim0[None,:,None] * x_D1 + \
                 x_dim1[None, None, :]
 
-        x_i = tl.load(x_i_ptr, mask=valid[:,None,None], other=0.0)
+        x_i = tl.load(x_i_ptr, mask=valid[:,None,None], other=0.0).to(tl.float32)
         
         
-        o_i = tl.sum((x_i[:,None,:,:] * y_i[:,:,None,:]).to(tl.float32), axis=3)
+        o_i = tl.sum((x_i[:,None,:,:] * y_i[:,:,None,:]), axis=3)
         o_i = o_i.to(tl.bfloat16)
         
         o_i_ptr = o + _off * o_D0 * o_D1 + \
@@ -367,9 +366,9 @@ def _mm_rpr(
 x: torch.Tensor,
 y: torch.Tensor,
 o: torch.Tensor,
-dense_kv_indices: torch.Tensor,
-winfo_kv_offsets: torch.Tensor,
-winfo_kv_lens: torch.Tensor,
+indices: torch.Tensor,
+winfo_offsets: torch.Tensor,
+winfo_lens: torch.Tensor,
 winfo_num_workloads: torch.Tensor,
 max_chunk_size: int,
 num_sms: int
@@ -377,9 +376,9 @@ num_sms: int
     
     mm_rpr_kernel[(8 * num_sms,)](
         x, y, o, 
-        dense_kv_indices,
-        winfo_kv_offsets,
-        winfo_kv_lens,
+        indices,
+        winfo_offsets,
+        winfo_lens,
         winfo_num_workloads,
         max_chunk_size,
         x.shape[-2], 
@@ -391,5 +390,3 @@ num_sms: int
         num_warps=4, 
         num_stages=1
     )
-    
-    
