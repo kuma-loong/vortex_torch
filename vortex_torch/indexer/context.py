@@ -105,8 +105,6 @@ class Context(ContextBase):
             if sa.vortex_max_seq_lens < 0
             else (sa.vortex_max_seq_lens + sa.page_size - 1) // sa.page_size
         )
-
-        max_seq_lengths = int(model_runner.model_config.context_len)
         max_bs = int(model_runner.req_to_token_pool.size)
 
         # Backend-known fields
@@ -128,12 +126,11 @@ class Context(ContextBase):
         self.page_size = sa.page_size
 
         # Capacity model (adjust as needed)
-        pages_per_seq = (max_seq_lengths + self.page_size - 1) // self.page_size  # ceil
-        self.max_num_pages = pages_per_seq * max_bs * self.num_kv_heads
+        self.max_num_pages = max_pages_per_req * max_bs * self.num_kv_heads
         self.max_num_pages_per_request = max_pages_per_req
 
         self.topk_val = sa.vortex_topk_val
-        dtype_str = getattr(sa, "indexer_dtype", "float32")
+        dtype_str = getattr(sa, "vortex_indexer_dtype", "float32")
         if isinstance(dtype_str, str):
             self.indexer_dtype = getattr(torch, dtype_str, torch.float32)
         else:

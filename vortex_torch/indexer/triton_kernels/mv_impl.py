@@ -1,10 +1,10 @@
 import torch
 import triton
 import triton.language as tl
-
+from ..context import Context
 
 @triton.jit
-def persistent_mv(
+def mv_bpr_kernel(
 x,
 y,
 o,
@@ -58,24 +58,24 @@ D: tl.constexpr,
         y_tile = tl.load(y + offs, mask=valid[:, None], other=0.0)
         
         o_i = tl.sum((y_tile * x_i[None, :]).to(tl.float32), 1)
+        o_i = o_i.to(tl.bfloat16)
         tl.store(o + y_off + idx_ptr, o_i, mask=valid)
 
 
-def triton_mv(
+def mv_bpr(
 x: torch.Tensor,
 y: torch.Tensor,
 o: torch.Tensor,
-indices: torch.Tensor,
-winfo_x_indices: torch.Tensor,
-winfo_y_offsets: torch.Tensor,
-winfo_y_lens: torch.Tensor,
-winfo_num_workloads: torch.Tensor,
-max_chunk_size: int,
-num_sms: int
+ctx: Context
 ):  
     
-    persistent_mv[(4 * num_sms,)](
-        x, y, o, indices, winfo_x_indices, winfo_y_offsets,
-        winfo_y_lens, winfo_num_workloads, max_chunk_size,
+    mv_bpr_kernel[(4 * ctx.num_sms,)](
+        x, y, o, 
+        ctx.dense_kv_indices,
+        ctx.winfo_q_indices,
+        ctx.winfo_kv_offsets,
+        ctx.winfo_kv_lens,
+        ctx.winfo_num_workloads,
+        ctx.max_chunk_size,
         x.shape[-1], num_warps=8, num_stages=2
     )

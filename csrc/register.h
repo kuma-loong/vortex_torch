@@ -3,6 +3,7 @@
 #include <torch/extension.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <math_constants.h>
 #include <iostream>
 #include <cassert>
 #include <torch/torch.h>

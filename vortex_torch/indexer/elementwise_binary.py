@@ -2,32 +2,36 @@ import torch
 from typing import Tuple, Dict, Callable
 from .context import Context
 from ..abs import vTensor, as_vtensor, FORMAT, vOp
-from .triton_kernels.multiply_impl import multiply_bpr_kernel
+from .triton_kernels.elementwise_binary_impl import elementwise_binary_bpr, elementwise_binary_rrr, elementwise_binary_rpr
 
-class Multiply(vOp):
-    
+class Elementwise_Binary(vOp):
     
     # Implementation dispatch table: keyed only by (x_format, y_format).
     _impl_map: Dict[Tuple[FORMAT, FORMAT], Tuple[Callable, FORMAT]] = {
-        (FORMAT.BATCHED, FORMAT.PAGED): (multiply_bpr_kernel, FORMAT.RAGGED),
+        (FORMAT.RAGGED, FORMAT.RAGGED): (elementwise_binary_rrr, FORMAT.RAGGED),
+        (FORMAT.BATCHED, FORMAT.PAGED): (elementwise_binary_bpr, FORMAT.RAGGED),
+        (FORMAT.RAGGED, FORMAT.PAGED): (elementwise_binary_rpr, FORMAT.RAGGED),
         # Add more (x_fmt, y_fmt) -> (impl, out_fmt) pairs as needed.
     }
 
-    def __init__(self):
+    def __init__(self, alpha: float=1.0, beta: float=1.0):
         super().__init__()
         self.impl: Callable = None
+        self.op_type: str = None
+        self.alpha = alpha
+        self.beta = beta
         self.output_format: FORMAT | None = None
         self.output_buffer: torch.Tensor | None = None
 
     # ---------------- profile ----------------
     def profile(self, x: vTensor, y: vTensor, ctx: Context) -> vTensor:
         # Inputs must be vTensor per the system rule (no mixing with plain tensors).
-        assert isinstance(x, vTensor), f"Multiply.profile expects x to be vTensor, got {type(x)}"
-        assert isinstance(y, vTensor), f"Multiply.profile expects y to be vTensor, got {type(y)}"
+        assert isinstance(x, vTensor), f"Elementwise_Binary.profile expects x to be vTensor, got {type(x)}"
+        assert isinstance(y, vTensor), f"Elementwise_Binary.profile expects y to be vTensor, got {type(y)}"
 
         # Dimensionality checks (expect [*, 1, *] with both tensors being 3D).
         assert len(x.shape) == len(y.shape) == 3, (
-            f"Expected 3D inputs (B/S, C/1, D). Got x.ndim={x.dim()}, y.ndim={y.dim()}"
+            f"Expected 3D inputs (S, C/1, D/1). Got x.ndim={x.dim()}, y.ndim={y.dim()}"
         )
         
         assert (
@@ -36,10 +40,14 @@ class Multiply(vOp):
             y.shape[1] == 1
         ), f"Expected x.shape[1] == y.shape[1] or one of them to be 1 (broadcastable), "
         f"got x.shape={tuple(x.shape)}, y.shape={tuple(y.shape)}"
-   
-        assert x.shape[2] == y.shape[2], (
-            f"Last dimension must match: x.shape[2]={x.shape[2]} vs y.shape[2]={y.shape[2]}"
-        )
+
+        assert (
+            x.shape[2] == y.shape[2] or
+            x.shape[2] == 1 or
+            y.shape[2] == 1
+        ), f"Expected x.shape[2] == y.shape[2] or one of them to be 1 (broadcastable), "
+        f"got x.shape={tuple(x.shape)}, y.shape={tuple(y.shape)}"
+        
 
         # Dispatch by (format_x, format_y).
         x_fmt, y_fmt = x._format, y._format
@@ -52,7 +60,7 @@ class Multiply(vOp):
 
         # Allocate output buffer on x.device, with x.dtype (as per your original logic).
         self.output_buffer = torch.empty(
-            (ctx.max_num_pages, max(x.shape[1], y.shape[1]), x.shape[2]),
+            (ctx.max_num_pages, max(x.shape[1], y.shape[1]), max(x.shape[2], y.shape[2])),
             device=x.device,
             dtype=x.dtype,
         )
@@ -66,13 +74,44 @@ class Multiply(vOp):
     # ---------------- execute ----------------
     def execute(self, x: torch.Tensor, y: torch.Tensor, ctx: Context) -> torch.Tensor:
         # Must call profile() first to set impl and output buffer.
-        assert self.impl is not None, "Multiply.execute called before profile(): impl is None"
-        assert self.output_buffer is not None, "Multiply.execute called before profile(): output_buffer is None"
+        assert self.impl is not None, "Elementwise_Binary.execute called before profile(): impl is None"
+        assert self.output_buffer is not None, "Elementwise_Binary.execute called before profile(): output_buffer is None"
 
         # Run the selected implementation. Keep the original argument order and return type.
         self.impl(
-            x, y, self.output_buffer, ctx
+            x, y, self.output_buffer, self.op_type, self.alpha, self.beta, ctx
         )
 
         # execute returns a plain torch.Tensor by design.
         return self.output_buffer
+
+
+class Maximum(Elementwise_Binary):
+    
+    def __init__(self, alpha = 1, beta = 1):
+        super().__init__(alpha, beta)
+        self.op_type = "maximum"
+
+
+class Minimum(Elementwise_Binary):
+    
+    def __init__(self, alpha = 1, beta = 1):
+        super().__init__(alpha, beta)
+        self.op_type = "minimum"
+        
+        
+class Add(Elementwise_Binary):
+    
+    def __init__(self, alpha = 1, beta = 1):
+        super().__init__(alpha, beta)
+        self.op_type = "add"
+        
+
+class Multiply(Elementwise_Binary):
+    
+    def __init__(self, alpha = 1, beta = 1):
+        super().__init__(alpha, beta)
+        self.op_type = "mul"
+
+
+
