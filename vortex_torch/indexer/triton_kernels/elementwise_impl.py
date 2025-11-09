@@ -144,20 +144,20 @@ ctx: Context
 def _elementwise_rr(
 x: torch.Tensor,
 o: torch.Tensor,
+winfo_offsets: torch.Tensor,
+winfo_lens: torch.Tensor,
+winfo_num_workloads: torch.Tensor,
+max_chunk_size: int,
 op_type: Literal["relu", "sigmoid", "silu", "abs", "add_mul"],
 alpha: float,
 beta: float,
-winfo_kv_offsets: torch.Tensor,
-winfo_kv_lens: torch.Tensor,
-winfo_num_workloads: torch.Tensor,
-max_chunk_size: int,
 num_sms :int
 ):  
     
     elementwise_rr_kernel[(8 * num_sms,)](
         x, o, 
-        winfo_kv_offsets,
-        winfo_kv_lens,
+        winfo_offsets,
+        winfo_lens,
         winfo_num_workloads,
         max_chunk_size,
         x.shape[-2], 

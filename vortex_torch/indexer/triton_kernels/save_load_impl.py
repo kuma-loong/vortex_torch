@@ -93,9 +93,9 @@ ctx: Context
 def _save_rp(
 x: torch.Tensor,
 o: torch.Tensor,
-dense_kv_indices: torch.Tensor,
-winfo_kv_offsets: torch.Tensor,
-winfo_kv_lens: torch.Tensor,
+indices: torch.Tensor,
+winfo_offsets: torch.Tensor,
+winfo_lens: torch.Tensor,
 winfo_num_workloads: torch.Tensor,
 max_chunk_size: int,
 num_sms: int
@@ -103,9 +103,9 @@ num_sms: int
     
     save_rp_kernel[(8 * num_sms,)](
         x, o, 
-        dense_kv_indices,
-        winfo_kv_offsets,
-        winfo_kv_lens,
+        indices,
+        winfo_offsets,
+        winfo_lens,
         winfo_num_workloads,
         max_chunk_size,
         x.shape[-2], 
@@ -208,9 +208,9 @@ ctx: Context
 def _load_pr(
 x: torch.Tensor,
 o: torch.Tensor,
-dense_kv_indices: torch.Tensor,
-winfo_kv_offsets: torch.Tensor,
-winfo_kv_lens: torch.Tensor,
+indices: torch.Tensor,
+winfo_offsets: torch.Tensor,
+winfo_lens: torch.Tensor,
 winfo_num_workloads: torch.Tensor,
 max_chunk_size: int,
 num_sms: int
@@ -218,9 +218,9 @@ num_sms: int
     
     load_pr_kernel[(8 * num_sms,)](
         x, o, 
-        dense_kv_indices,
-        winfo_kv_offsets,
-        winfo_kv_lens,
+        indices,
+        winfo_offsets,
+        winfo_lens,
         winfo_num_workloads,
         max_chunk_size,
         x.shape[-2], 
