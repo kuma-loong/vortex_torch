@@ -102,3 +102,8 @@ class vOp(ABC):
         if ctx.mode == Mode.profile:
             return self.profile(*args, ctx=ctx, **kwargs)
         raise ValueError(f"Unknown mode: {ctx.mode!r}, expected 'profile' or 'execute'")
+    
+    # ------------------------------ helpers ------------------------------ #
+    def _prefix(self) -> str:
+        """Prefix for assertion/log messages with class name."""
+        return f"{self.__class__.__name__}: "

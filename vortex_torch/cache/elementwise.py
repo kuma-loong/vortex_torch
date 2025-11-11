@@ -1,41 +1,45 @@
 import torch
 from ..abs import vOp
 from .context import Context
-from .triton_kernels.reduce_impl import reduce_pp, reduce_rp, reduce_pr, reduce_rr
+from .triton_kernels.elementwise_impl import elementwise_pp, elementwise_rp, elementwise_pr, elementwise_rr
 from ..abs import vTensor, FORMAT, as_vtensor
-from ..utils import ReduceType
+from ..utils import ElementwiseOpType
 from typing import Tuple, Dict, Callable, Optional
 
-
-class Reduce(vOp):
+class Elementwise(vOp):
     """
-    Reduction dispatcher (dim ∈ {1,2}, type = Mean/Max/Min/L2, etc. decided in impl).
+    Unary elementwise op dispatcher (e.g., piecewise/sigmoid/silu-like/abs/affine).
     Dispatch key: (x_format, o_format) -> (impl, resolved_output_format)
 
     Policy:
-      - If `output` is None, prefer an implementation with o_format == FORMAT.RAGGED.
-      - Otherwise, require an exact (x_fmt, o_fmt) match.
-      - Input tensors are rank-3: [B, N, D]; the reduced axis collapses to 1.
+      - If `output` is None, pick implementation with o_format == FORMAT.RAGGED.
+      - Otherwise, require an exact (x_fmt, o_fmt) mapping.
+      - Input/Output logical shapes are rank-3: [B, N, D].
     """
 
-    # Consistent 2-tuple dispatch table
+    # Implementation registry:
+    #   key   = (x_format, o_format)
+    #   value = (callable_impl, resolved_output_format)
     _impl_map: Dict[Tuple[FORMAT, FORMAT], Tuple[Callable, FORMAT]] = {
-        (FORMAT.PAGED,  FORMAT.PAGED):  (reduce_pp, FORMAT.PAGED),
-        (FORMAT.RAGGED, FORMAT.PAGED):  (reduce_rp, FORMAT.PAGED),
-        (FORMAT.PAGED,  FORMAT.RAGGED): (reduce_pr, FORMAT.RAGGED),
-        (FORMAT.RAGGED, FORMAT.RAGGED): (reduce_rr, FORMAT.RAGGED),
+        (FORMAT.PAGED,  FORMAT.PAGED):  (elementwise_pp, FORMAT.PAGED),
+        (FORMAT.PAGED,  FORMAT.RAGGED): (elementwise_pr, FORMAT.RAGGED),
+        (FORMAT.RAGGED, FORMAT.PAGED):  (elementwise_rp, FORMAT.PAGED),
+        (FORMAT.RAGGED, FORMAT.RAGGED): (elementwise_rr, FORMAT.RAGGED),
     }
 
-    def __init__(self, dim: int = 1):
+    def __init__(self, alpha: float = 0.0, beta: float = 1.0):
+        """
+        Parameters
+        ----------
+        alpha, beta : scalars used by certain unary ops (e.g., affine/activation variants).
+        """
         super().__init__()
-        self.dim = dim
-        self.reduce_type: Optional[ReduceType] = None
+        self.alpha = alpha
+        self.beta = beta
+        self.op_type: Optional[int] = None          # runtime-set enum/int for the op
         self.impl: Optional[Callable] = None
         self.output_format: Optional[FORMAT] = None
         self.output_buffer: Optional[torch.Tensor] = None
-        # Validate reduction dimension at construction time.
-        cls = self.__class__.__name__
-        assert self.dim in (1, 2), f"{cls}.__init__: dim must be 1 or 2, got dim={self.dim}"
 
     # ------------------------------ helpers ------------------------------ #
     def _infer_impl_ragged(self, x_fmt: FORMAT) -> Tuple[Callable, FORMAT]:
@@ -51,7 +55,7 @@ class Reduce(vOp):
         return self._impl_map[key]  # -> (impl, out_fmt)
 
     # --------------------------------------------------------------------- #
-    # profile: validate, pick impl/format, and return the provided vTensor
+    # profile: validate, select impl/format, and optionally allocate output
     # --------------------------------------------------------------------- #
     def profile(
         self, x: vTensor, output: Optional[vTensor], loc: torch.Tensor, ctx: Context
@@ -64,27 +68,23 @@ class Reduce(vOp):
         assert x.dim() == 3, f"{prefix}x must be 3D, got ndim={x.dim()} shape={tuple(x.shape)}"
 
         x_fmt = x._format
+        N, D = x.shape[1], x.shape[2]
 
-        # Compute expected output (N, D) given reduction dim
-        # dim==1 -> reduce rows: keep D, set N=1
-        # dim==2 -> reduce cols: keep N, set D=1
-        exp_N = 1 if self.dim == 1 else x.shape[1]
-        exp_D = 1 if self.dim == 2 else x.shape[2]
-
-        # Case A: output not provided -> infer impl (RAGGED) and allocate buffer
+        # Case A: output not provided -> choose RAGGED impl and allocate buffer
         if output is None:
             self.impl, self.output_format = self._infer_impl_ragged(x_fmt)
 
+            # Allocate on x.device/x.dtype; B comes from runtime context
             B = ctx.max_new_tokens_per_batch * ctx.head_num
             self.output_buffer = torch.empty(
-                (B, exp_N, exp_D),
+                (B, N, D),
                 device=x.device,
                 dtype=x.dtype,
             )
             ctx.add_aux_memory(self.output_buffer)
             return as_vtensor(self.output_buffer, self.output_format)
 
-        # Case B: output provided -> validate and pick exact impl by (x_fmt, o_fmt)
+        # Case B: output provided -> validate and select exact impl
         assert isinstance(output, vTensor), f"{prefix}output must be vTensor, got {type(output)}"
         assert output.dim() == 3, f"{prefix}output must be 3D, got ndim={output.dim()} shape={tuple(output.shape)}"
 
@@ -96,27 +96,12 @@ class Reduce(vOp):
         )
         self.impl, self.output_format = self._impl_map[key]
 
-        # Shape checks per reduction dim
-        if self.dim == 1:
-            # Expect (*, 1, x.D)
-            assert output.shape[1] == 1, (
-                f"{prefix}profile(dim=1): expected output.shape[1] == 1, got {tuple(output.shape)}"
-            )
-            assert output.shape[2] == x.shape[2], (
-                f"{prefix}profile(dim=1): expected output.shape[2] == x.shape[2], "
-                f"got {output.shape[2]} vs {x.shape[2]}"
-            )
-        else:  # self.dim == 2
-            # Expect (*, x.N, 1)
-            assert output.shape[2] == 1, (
-                f"{prefix}profile(dim=2): expected output.shape[2] == 1, got {tuple(output.shape)}"
-            )
-            assert output.shape[1] == x.shape[1], (
-                f"{prefix}profile(dim=2): expected output.shape[1] == x.shape[1], "
-                f"got {output.shape[1]} vs {x.shape[1]}"
-            )
+        # Shape consistency: unary elementwise keeps (N,D)
+        assert output.shape[1] == N and output.shape[2] == D, (
+            f"{prefix}output shape mismatch. Expected (*,{N},{D}), got {tuple(output.shape)}"
+        )
 
-        # Device consistency
+        # Device consistency check
         assert x.device == output.device, (
             f"{prefix}x and output must be on the same device "
             f"(x.device={x.device}, output.device={output.device})"
@@ -125,49 +110,60 @@ class Reduce(vOp):
         return output
 
     # --------------------------------------------------------------------- #
-    # execute: run impl and return the (plain) output tensor
+    # execute: run selected impl and return the plain output tensor
     # --------------------------------------------------------------------- #
     def execute(
         self, x: torch.Tensor, output: Optional[torch.Tensor], loc: torch.Tensor, ctx: Context
     ) -> torch.Tensor:
         prefix = self._prefix()
-
-        # Must have selected impl in profile()
         assert self.impl is not None, f"{prefix}called before profile() (impl is None)"
 
         if output is None:
             assert self.output_buffer is not None, f"{prefix}internal output buffer is None; did profile() run?"
             output = self.output_buffer
 
-        # Launch the kernel/implementation: impl(x, output, loc, ctx, dim, reduce_type)
-        self.impl(x, output, loc, ctx, self.dim, self.reduce_type)
+        # Expected signature for impl: impl(x, output, loc, ctx, op_type, alpha, beta)
+        self.impl(x, output, loc, ctx, self.op_type, self.alpha, self.beta)
         return output
 
+
+class Relu(Elementwise):
     
+    def __init__(self, alpha = 0.0, beta = 0.0):
+        super().__init__(alpha, beta)
+        self.op_type = ElementwiseOpType.Relu
 
-class Mean(Reduce):
-    def __init__(self, dim = 1):
-        super().__init__(dim)
-        self.reduce_type = ReduceType.Mean
+class Silu(Elementwise):
     
-
-
-class Max(Reduce):
-    def __init__(self, dim = 1):
-        super().__init__(dim)
-        self.reduce_type = ReduceType.Max
+    def __init__(self, alpha = 0.0, beta = 0.0):
+        super().__init__(alpha, beta)
+        self.op_type = ElementwiseOpType.Silu
         
 
+class Sigmoid(Elementwise):
+    
+    def __init__(self, alpha = 0.0, beta = 0.0):
+        super().__init__(alpha, beta)
+        self.op_type = ElementwiseOpType.Sigmoid
+        
 
-class Min(Reduce):
-    def __init__(self, dim = 1):
-        super().__init__(dim)
-        self.reduce_type = ReduceType.Min
+class Add_Mul(Elementwise):
+    
+    def __init__(self, alpha = 0.0, beta = 1.0):
+        super().__init__(alpha, beta)
+        self.op_type =  ElementwiseOpType.Add_Mul
+
+
+class Abs(Elementwise):
+    
+    def __init__(self, alpha = 0.0, beta = 1.0):
+        super().__init__(alpha, beta)
+        self.op_type =  ElementwiseOpType.Abs
 
 
 
-class L2Norm(Reduce):
-    def __init__(self, dim = 1):
-        super().__init__(dim)
-        self.reduce_type = ReduceType.L2Norm
+
+
+
+
 

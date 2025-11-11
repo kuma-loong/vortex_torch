@@ -2,8 +2,7 @@ import torch
 import triton
 import triton.language as tl
 from ..context import Context
-from typing import Literal
-
+from ...utils import ElementwiseBinaryOpType
 
 @triton.jit
 def elementwise_binary_rrr_kernel(
@@ -72,16 +71,16 @@ beta: float = 1.0
         y_i = tl.load(y_i_ptr, mask=valid[:,None,None], other=0.0)
         
         
-        if OP_TYPE == "maximum":
+        if OP_TYPE == 0:
             o_i = tl.maximum(x_i, y_i)
             
-        elif OP_TYPE == "minimum":
+        elif OP_TYPE == 1:
             o_i = tl.minimum(x_i, y_i)
             
-        elif OP_TYPE == "add":
+        elif OP_TYPE == 2:
             o_i = tl.add(alpha_bf16 * x_i, beta_bf16 * y_i)
 
-        elif OP_TYPE == "mul":
+        elif OP_TYPE == 3:
             o_i = x_i * y_i
                 
         else:
@@ -105,7 +104,7 @@ def elementwise_binary_rrr(
 x: torch.Tensor,
 y: torch.Tensor,
 o: torch.Tensor,
-op_type: Literal["maximum", "minimum", "add", "mul"],
+op_type: ElementwiseBinaryOpType,
 alpha: float,
 beta: float,
 ctx: Context
@@ -123,7 +122,7 @@ ctx: Context
         x.shape[-1],
         y.shape[-1],
         o.shape[-1],
-        op_type,
+        op_type.value,
         alpha,
         beta,
         num_warps=4, 
@@ -139,7 +138,7 @@ winfo_offsets: torch.Tensor,
 winfo_lens: torch.Tensor,
 winfo_num_workloads: torch.Tensor,
 max_chunk_size: int,
-op_type: Literal["maximum", "minimum", "add", "mul"],
+op_type: ElementwiseBinaryOpType,
 alpha: float,
 beta: float,
 num_sms: int
@@ -157,7 +156,7 @@ num_sms: int
         x.shape[-1],
         y.shape[-1],
         o.shape[-1],
-        op_type,
+        op_type.value,
         alpha,
         beta,
         num_warps=4, 
@@ -250,16 +249,16 @@ beta: float = 1.0
         # Elementwise in bf16:
         # [rows, y_D0, y_D1],  [1, x_D0, x_D1] -> [rows, o_D0, o_D1] (bf16)
         
-        if OP_TYPE == "maximum":
+        if OP_TYPE == 0:
             o_i = tl.maximum(x_i[None,:,:], y_i)
             
-        elif OP_TYPE == "minimum":
+        elif OP_TYPE == 1:
             o_i = tl.minimum(x_i[None,:,:], y_i)
             
-        elif OP_TYPE == "add":
+        elif OP_TYPE == 2:
             o_i = tl.add(alpha_bf16 * x_i[None,:,:], beta_bf16 * y_i)
 
-        elif OP_TYPE == "mul":
+        elif OP_TYPE == 3:
             o_i = x_i[None,:,:] * y_i
                 
         else:
@@ -280,7 +279,7 @@ def elementwise_binary_bpr(
 x: torch.Tensor,
 y: torch.Tensor,
 o: torch.Tensor,
-op_type: Literal["maximum", "minimum", "add", "mul"],
+op_type: ElementwiseBinaryOpType,
 alpha: float,
 beta: float,
 ctx: Context
@@ -300,7 +299,7 @@ ctx: Context
         x.shape[-1],
         y.shape[-1],
         o.shape[-1],
-        op_type,
+        op_type.value,
         alpha,
         beta,
         num_warps=4, 
@@ -318,7 +317,7 @@ winfo_y_offsets: torch.Tensor,
 winfo_y_lens: torch.Tensor,
 winfo_num_workloads: torch.Tensor,
 max_chunk_size: int,
-op_type: Literal["maximum", "minimum", "add", "mul"],
+op_type: ElementwiseBinaryOpType,
 alpha: float,
 beta: float,
 num_sms: int,
@@ -338,7 +337,7 @@ num_sms: int,
         x.shape[-1],
         y.shape[-1],
         o.shape[-1],
-        op_type,
+        op_type.value,
         alpha,
         beta,
         num_warps=4, 
@@ -418,16 +417,16 @@ beta: float = 1.0
 
         x_i = tl.load(x_i_ptr, mask=valid[:,None,None], other=0.0)
         
-        if OP_TYPE == "maximum":
+        if OP_TYPE == 0:
             o_i = tl.maximum(x_i, y_i)
             
-        elif OP_TYPE == "minimum":
+        elif OP_TYPE == 1:
             o_i = tl.minimum(x_i, y_i)
             
-        elif OP_TYPE == "add":
+        elif OP_TYPE == 2:
             o_i = tl.add(alpha_bf16 * x_i, beta_bf16 * y_i)
 
-        elif OP_TYPE == "mul":
+        elif OP_TYPE == 3:
             o_i = x_i * y_i
                 
         else:
@@ -448,7 +447,7 @@ def elementwise_binary_rpr(
 x: torch.Tensor,
 y: torch.Tensor,
 o: torch.Tensor,
-op_type: Literal["maximum", "minimum", "add", "mul"],
+op_type: ElementwiseBinaryOpType,
 alpha: float,
 beta: float,
 ctx: Context
@@ -467,7 +466,7 @@ ctx: Context
         x.shape[-1],
         y.shape[-1],
         o.shape[-1],
-        op_type,
+        op_type.value,
         alpha,
         beta,
         num_warps=4, 
@@ -484,7 +483,7 @@ winfo_offsets: torch.Tensor,
 winfo_lens: torch.Tensor,
 winfo_num_workloads: torch.Tensor,
 max_chunk_size: int,
-op_type: Literal["maximum", "minimum", "add", "mul"],
+op_type: ElementwiseBinaryOpType,
 alpha: float,
 beta: float,
 num_sms: int
@@ -503,7 +502,7 @@ num_sms: int
         x.shape[-1],
         y.shape[-1],
         o.shape[-1],
-        op_type,
+        op_type.value,
         alpha,
         beta,
         num_warps=4, 

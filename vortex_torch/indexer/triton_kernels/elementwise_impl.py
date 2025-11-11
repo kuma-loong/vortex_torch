@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 from ..context import Context
 from typing import Literal
-
+from ...utils import ElementwiseOpType
 
 @triton.jit
 def elementwise_rr_kernel(
@@ -73,26 +73,26 @@ def elementwise_rr_kernel(
         x_i = tl.load(x_ptr, mask=valid_rows[:, None, None], other=0.0)  # [rows, x_D0, x_D1], bf16
 
         # ----- Elementwise ops (bf16) -----
-        if OP_TYPE == "relu":
+        if OP_TYPE == 0:
             # piecewise: x >= alpha ? x : beta
             o_i = tl.where(x_i >= alpha_bf16, x_i, beta_bf16)
 
-        elif OP_TYPE == "sigmoid":
+        elif OP_TYPE == 1:
             # σ(alpha, beta; x) = 1 / (1 + exp(beta * x + alpha))
             z = (beta_bf16 * x_i + alpha_bf16)
             o_i = (1.0 / (1.0 + tl.exp(z))).to(tl.bfloat16)
 
-        elif OP_TYPE == "silu":
+        elif OP_TYPE == 2:
             # SiLU(alpha, beta; x) = x / (1 + exp(beta * x + alpha))
             z = (beta_bf16 * x_i + alpha_bf16)
             o_i = (x_i / (1.0 + tl.exp(z))).to(tl.bfloat16)
 
-        elif OP_TYPE == "abs":
+        elif OP_TYPE == 3:
             # |beta * x + alpha|
             z = beta_bf16 * x_i + alpha_bf16
             o_i = tl.abs(z)
 
-        elif OP_TYPE == "add_mul":
+        elif OP_TYPE == 4:
             # beta * x + alpha
             o_i = beta_bf16 * x_i + alpha_bf16
 
@@ -117,7 +117,7 @@ def elementwise_rr_kernel(
 def elementwise_rr(
 x: torch.Tensor,
 o: torch.Tensor,
-op_type: Literal["relu", "sigmoid", "silu", "abs", "add_mul"],
+op_type: ElementwiseOpType,
 alpha: float,
 beta: float,
 ctx: Context
@@ -133,7 +133,7 @@ ctx: Context
         o.shape[-2], 
         x.shape[-1],
         o.shape[-1],
-        op_type,
+        op_type.value,
         alpha,
         beta,
         num_warps=4, 
@@ -148,7 +148,7 @@ winfo_offsets: torch.Tensor,
 winfo_lens: torch.Tensor,
 winfo_num_workloads: torch.Tensor,
 max_chunk_size: int,
-op_type: Literal["relu", "sigmoid", "silu", "abs", "add_mul"],
+op_type: ElementwiseOpType,
 alpha: float,
 beta: float,
 num_sms :int
@@ -164,7 +164,7 @@ num_sms :int
         o.shape[-2], 
         x.shape[-1],
         o.shape[-1],
-        op_type,
+        op_type.value,
         alpha,
         beta,
         num_warps=4, 

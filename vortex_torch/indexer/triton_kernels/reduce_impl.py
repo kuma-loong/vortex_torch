@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 from ..context import Context
 from typing import Literal
-
+from ...utils import ReduceType
 
 @triton.jit
 def reduce_rr_kernel(
@@ -47,16 +47,17 @@ REDUCE_TYPE: tl.constexpr
 
         x_i = tl.load(x_i_ptr, mask=valid[:,None,None], other=0.0).to(tl.float32)
         if DIM == 1:
-            if REDUCE_TYPE == "max":
+            
+            if REDUCE_TYPE == 0:
+                x_i_reduce = tl.sum(x_i, axis=1) / x_D0
+            
+            elif REDUCE_TYPE == 1:
                 x_i_reduce = tl.max(x_i, axis=1)
             
-            elif REDUCE_TYPE == "min":
+            elif REDUCE_TYPE ==  2:
                 x_i_reduce = tl.min(x_i, axis=1)
-            
-            elif REDUCE_TYPE == "mean":
-                x_i_reduce = tl.sum(x_i, axis=1) / x_D0
                 
-            elif REDUCE_TYPE == "l2norm":
+            elif REDUCE_TYPE == 3:
                 x_i_reduce = tl.sqrt(tl.sum(x_i * x_i, axis=1))
                 
             else:
@@ -67,16 +68,17 @@ REDUCE_TYPE: tl.constexpr
             tl.store(o_i_ptr, x_i_reduce, mask=valid[:, None])
         
         elif DIM == 2:
-            if REDUCE_TYPE == "max":
+            
+            if REDUCE_TYPE == 0:
+                x_i_reduce = tl.sum(x_i, axis=2) / x_D1
+                
+            elif REDUCE_TYPE == 1:
                 x_i_reduce = tl.max(x_i, axis=2)
             
-            elif REDUCE_TYPE == "min":
+            elif REDUCE_TYPE == 2:
                 x_i_reduce = tl.min(x_i, axis=2)
             
-            elif REDUCE_TYPE == "mean":
-                x_i_reduce = tl.sum(x_i, axis=2) / x_D1
-            
-            elif REDUCE_TYPE == "l2norm":
+            elif REDUCE_TYPE == 3:
                 x_i_reduce = tl.sqrt(tl.sum(x_i * x_i, axis=2))
                 
             else:
@@ -93,7 +95,7 @@ def reduce_rr(
 x: torch.Tensor,
 o: torch.Tensor,
 dim: int,
-reduce_type: Literal["max", "min", "mean", "l2norm"],
+reduce_type: ReduceType,
 ctx: Context
 ):  
     
@@ -106,7 +108,7 @@ ctx: Context
         x.shape[-2], 
         x.shape[-1], 
         dim, 
-        reduce_type,
+        reduce_type.value,
         num_warps=4, 
         num_stages=1
     )
@@ -116,7 +118,7 @@ def _reduce_rr(
 x: torch.Tensor,
 o: torch.Tensor,
 dim: int,
-reduce_type: Literal["max", "min", "mean", "l2norm"],
+reduce_type: ReduceType,
 winfo_kv_offsets: torch.Tensor,
 winfo_kv_lens: torch.Tensor,
 winfo_num_workloads: torch.Tensor,
@@ -133,7 +135,7 @@ num_sms: int,
         x.shape[-2], 
         x.shape[-1], 
         dim, 
-        reduce_type,
+        reduce_type.value,
         num_warps=4, 
         num_stages=1
     )

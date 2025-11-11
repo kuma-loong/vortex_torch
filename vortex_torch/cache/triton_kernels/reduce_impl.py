@@ -2,89 +2,81 @@ import torch
 import triton
 import triton.language as tl
 from ..context import Context
+from ...utils import ReduceType
 
 @triton.jit
-def mean_kernel(
-    x,                     # *flat* pointer to input pages, row-major per page
-    output,                # *flat* pointer to output buffer
-    loc,                   # pointer to per-token positions (int32/int64)
-    x_D0: tl.constexpr,    # rows   of one page
-    x_D1: tl.constexpr,    # cols   of one page
-    NUM_KV_HEAD: tl.constexpr,
-    PAGE_SIZE: tl.constexpr,
-    DIM: tl.constexpr      # 0 -> mean over rows (per-column mean); 1 -> mean over cols (per-row mean)
-):
-    """
-    This kernel computes a mean vector for a full page [x_D0, x_D1] exactly once,
-    triggered by the *last* token of that page.
-
-    Grid:
-      pid0 = token_id  (typically launched as num_tokens)
-      pid1 = head_id   (0..NUM_KV_HEAD-1)
-
-    Behavior:
-      - Read token_position = loc[token_id]
-      - Only proceed if (token_position + 1) % PAGE_SIZE == 0 (page-end)
-      - Compute page_id = (token_position // PAGE_SIZE) * NUM_KV_HEAD + head_id
-      - Treat x as packed pages; each page is a contiguous [x_D0, x_D1] block in row-major order
-      - If DIM == 1: mean over rows -> length x_D1; write at output[page_id, :x_D1]
-        If DIM == 2: mean over cols -> length x_D0; write at output[page_id, :x_D0]
-
-    Notes:
-      - No upcast to fp32 as requested; reductions happen in the input dtype.
-      - Assumes each page is full (no partial page at end).
-    """
-
+def reduce_pp_kernel(
+x, output, loc,
+x_D0: tl.constexpr,
+x_D1: tl.constexpr,
+NUM_KV_HEAD: tl.constexpr,
+PAGE_SIZE: tl.constexpr,
+REDUCE_TYPE: tl.constexpr,  # 0:Mean, 1:Max, 2:Min, 3:L2Norm
+DIM: tl.constexpr           # 1: over rows (axis=0) -> len x_D1; 2: over cols (axis=1) -> len x_D0
+):  
+    
     token_id = tl.program_id(0)
-    head_id = tl.program_id(1)
+    head_id  = tl.program_id(1)
 
-    # Load the absolute token position for this token_id
     token_position = tl.load(loc + token_id)
 
-    # Only compute at page end to avoid duplicate work
     if (token_position + 1) % PAGE_SIZE != 0:
         return
 
-    # Map (page, head) to a linear page_id
-    page_id = (token_position // PAGE_SIZE) * NUM_KV_HEAD + head_id
-
-    # Byte/element offset to the start of this page in `x`
-    # Each page is a contiguous block of x_D0 * x_D1 elements
+    page_id  = (token_position // PAGE_SIZE) * NUM_KV_HEAD + head_id
     x_offset = page_id * x_D0 * x_D1
 
-    # Build a 2D index for the page load: row-major layout
-    rows = tl.arange(0, x_D0)[:, None]              # shape [x_D0, 1]
-    cols = tl.arange(0, x_D1)[None, :]              # shape [1, x_D1]
-    # Linearized 2D addressing: i * x_D1 + j
+    rows = tl.arange(0, x_D0)[:, None]     # [x_D0, 1]
+    cols = tl.arange(0, x_D1)[None, :]     # [1, x_D1]
     src_ptr = x + x_offset + rows * x_D1 + cols
-
-    # Load the full page block: shape [x_D0, x_D1], in the underlying dtype of `x`
     page_block = tl.load(src_ptr)
 
     if DIM == 1:
-        # Mean over rows (per-column mean) -> vector length x_D1
-        mean_vec = (tl.sum(page_block, axis=0) / x_D0).to(tl.bfloat16)
+        # reduce over rows -> axis=0 -> length x_D1
+        if REDUCE_TYPE == 0:       # Mean
+            reduce_vec = (tl.sum(page_block, axis=0) / x_D0).to(tl.bfloat16)
+        elif REDUCE_TYPE == 1:     # Max
+            reduce_vec = tl.max(page_block, axis=0).to(tl.bfloat16)
+        elif REDUCE_TYPE == 2:     # Min
+            reduce_vec = tl.min(page_block, axis=0).to(tl.bfloat16)
+        else:                      # L2Norm
+            s = tl.sum(page_block * page_block, axis=0)
+            reduce_vec = tl.sqrt(s).to(tl.bfloat16)
+
         dst_ptr = output + page_id * x_D1 + tl.arange(0, x_D1)
-        tl.store(dst_ptr, mean_vec)
+        tl.store(dst_ptr, reduce_vec)
+
     else:
-        # DIM == 2: Mean over cols (per-row mean) -> vector length x_D0
-        mean_vec = (tl.sum(page_block, axis=1) / x_D1).to(tl.bfloat16)
+        # DIM == 2: reduce over cols -> axis=1 -> length x_D0
+        if REDUCE_TYPE == 0:       # Mean
+            reduce_vec = (tl.sum(page_block, axis=1) / x_D1).to(tl.bfloat16)
+        elif REDUCE_TYPE == 1:     # Max
+            reduce_vec = tl.max(page_block, axis=1).to(tl.bfloat16)
+        elif REDUCE_TYPE == 2:     # Min
+            reduce_vec = tl.min(page_block, axis=1).to(tl.bfloat16)
+        else:                      # L2Norm
+            s = tl.sum(page_block * page_block, axis=1)
+            reduce_vec = tl.sqrt(s).to(tl.bfloat16)
+
         dst_ptr = output + page_id * x_D0 + tl.arange(0, x_D0)
-        tl.store(dst_ptr, mean_vec)
+        tl.store(dst_ptr, reduce_vec)
 
 
-def mean_launcher(
+
+
+def reduce_pp(
 x: torch.Tensor,
 output: torch.Tensor,
 loc: torch.LongTensor,
 ctx: Context,
-dim: int
+dim: int,
+reduce_type: ReduceType,
 ):
     
     NNZ = loc.shape[0]
     NUM_KV_HEAD = ctx.head_num
     
-    mean_kernel[(NNZ, NUM_KV_HEAD)](
+    reduce_pp_kernel[(NNZ, NUM_KV_HEAD)](
         x=x,
         output=output,
         loc=loc,
@@ -92,185 +84,134 @@ dim: int
         x_D1=x.shape[2],
         NUM_KV_HEAD=NUM_KV_HEAD,
         PAGE_SIZE=ctx.page_size,
+        REDUCE_TYPE=reduce_type.value,
         DIM=dim
     )
-  
-  
-  
-@triton.jit
-def max_kernel(
-    x,                     # *flat* pointer to input pages, row-major per page
-    output,                # *flat* pointer to output buffer
-    loc,                   # pointer to per-token positions (int32/int64)
-    x_D0: tl.constexpr,    # rows   of one page
-    x_D1: tl.constexpr,    # cols   of one page
-    NUM_KV_HEAD: tl.constexpr,
-    PAGE_SIZE: tl.constexpr,
-    DIM: tl.constexpr      # 1 -> max over rows (per-column max); 2 -> max over cols (per-row max)
-):
-    """
-    This kernel computes a max vector for a full page [x_D0, x_D1] exactly once,
-    triggered by the *last* token of that page.
 
-    Grid:
-      pid0 = token_id  (typically launched as num_tokens)
-      pid1 = head_id   (0..NUM_KV_HEAD-1)
 
-    Behavior:
-      - Read token_position = loc[token_id]
-      - Only proceed if (token_position + 1) % PAGE_SIZE == 0 (page-end)
-      - Compute page_id = (token_position // PAGE_SIZE) * NUM_KV_HEAD + head_id
-      - Treat x as packed pages; each page is a contiguous [x_D0, x_D1] block in row-major order
-      - If DIM == 1: max over rows -> length x_D1; write at output[page_id, :x_D1]
-        If DIM == 2: max over cols -> length x_D0; write at output[page_id, :x_D0]
-
-    Notes:
-      - No upcast to fp32 as requested; reductions happen in the input dtype.
-      - Assumes each page is full (no partial page at end).
-    """
-
-    token_id = tl.program_id(0)
-    head_id = tl.program_id(1)
-
-    # Load the absolute token position for this token_id
-    token_position = tl.load(loc + token_id)
-
-    # Only compute at page end to avoid duplicate work
-    if (token_position + 1) % PAGE_SIZE != 0:
-        return
-
-    # Map (page, head) to a linear page_id
-    page_id = (token_position // PAGE_SIZE) * NUM_KV_HEAD + head_id
-
-    # Byte/element offset to the start of this page in `x`
-    # Each page is a contiguous block of x_D0 * x_D1 elements
-    x_offset = page_id * x_D0 * x_D1
-
-    # Build a 2D index for the page load: row-major layout
-    rows = tl.arange(0, x_D0)[:, None]              # shape [x_D0, 1]
-    cols = tl.arange(0, x_D1)[None, :]              # shape [1, x_D1]
-    # Linearized 2D addressing: i * x_D1 + j
-    src_ptr = x + x_offset + rows * x_D1 + cols
-
-    # Load the full page block: shape [x_D0, x_D1], in the underlying dtype of `x`
-    page_block = tl.load(src_ptr)
-
-    if DIM == 1:
-        # Max over rows (per-column max) -> vector length x_D1
-        max_vec = tl.max(page_block, axis=0).to(tl.bfloat16)
-        dst_ptr = output + page_id * x_D1 + tl.arange(0, x_D1)
-        tl.store(dst_ptr, max_vec)
-    else:
-        # DIM == 2: Max over cols (per-row max) -> vector length x_D0
-        max_vec = tl.max(page_block, axis=1).to(tl.bfloat16)
-        dst_ptr = output + page_id * x_D0 + tl.arange(0, x_D0)
-        tl.store(dst_ptr, max_vec)
-
-def max_launcher(
+def _reduce_pp(
 x: torch.Tensor,
 output: torch.Tensor,
 loc: torch.LongTensor,
-ctx: Context,
-dim: int
+num_kv_heads: int,
+page_size: int,
+dim: int,
+reduce_type: ReduceType,
 ):
     
     NNZ = loc.shape[0]
-    NUM_KV_HEAD = ctx.head_num
+    NUM_KV_HEAD = num_kv_heads
     
-    max_kernel[(NNZ, NUM_KV_HEAD)](
+    reduce_pp_kernel[(NNZ, NUM_KV_HEAD)](
         x=x,
         output=output,
         loc=loc,
         x_D0=x.shape[1],
         x_D1=x.shape[2],
         NUM_KV_HEAD=NUM_KV_HEAD,
-        PAGE_SIZE=ctx.page_size,
+        PAGE_SIZE=page_size,
+        REDUCE_TYPE=reduce_type.value,
         DIM=dim
     )
-  
+
 
 
 @triton.jit
-def min_kernel(
-    x,                     # *flat* pointer to input pages, row-major per page
-    output,                # *flat* pointer to output buffer
-    loc,                   # pointer to per-token positions (int32/int64)
-    x_D0: tl.constexpr,    # rows   of one page
-    x_D1: tl.constexpr,    # cols   of one page
+def reduce_rp_kernel(
+    x, output, loc,
+    x_D0: tl.constexpr,              # rows per token-page
+    x_D1: tl.constexpr,              # cols per token-page
     NUM_KV_HEAD: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
-    DIM: tl.constexpr      # 1 -> min over rows (per-column min); 2 -> min over cols (per-row min)
+    REDUCE_TYPE: tl.constexpr,       # 0: Mean, 1: Max, 2: Min, 3: L2Norm (not RMS)
+    DIM: tl.constexpr                # 1: reduce over rows -> len x_D1; 2: reduce over cols -> len x_D0
 ):
-    """
-    This kernel computes a min vector for a full page [x_D0, x_D1] exactly once,
-    triggered by the *last* token of that page.
-
-    Grid:
-      pid0 = token_id  (typically launched as num_tokens)
-      pid1 = head_id   (0..NUM_KV_HEAD-1)
-
-    Behavior:
-      - Read token_position = loc[token_id]
-      - Only proceed if (token_position + 1) % PAGE_SIZE == 0 (page-end)
-      - Compute page_id = (token_position // PAGE_SIZE) * NUM_KV_HEAD + head_id
-      - Treat x as packed pages; each page is a contiguous [x_D0, x_D1] block in row-major order
-      - If DIM == 1: min over rows -> length x_D1; write at output[page_id, :x_D1]
-        If DIM == 2: min over cols -> length x_D0; write at output[page_id, :x_D0]
-
-    Notes:
-      - No upcast to fp32 as requested; reductions happen in the input dtype.
-      - Assumes each page is full (no partial page at end).
-    """
-
+    
+    # Program IDs:
+    #   pid0 = token index (0 .. num_tokens-1)
+    #   pid1 = head  index (0 .. NUM_KV_HEAD-1)
     token_id = tl.program_id(0)
-    head_id = tl.program_id(1)
+    head_id  = tl.program_id(1)
 
-    # Load the absolute token position for this token_id
+    # Load the absolute position of this token (used to map to page index).
     token_position = tl.load(loc + token_id)
 
-    # Only compute at page end to avoid duplicate work
+    # Only the last token of a page triggers the reduction.
     if (token_position + 1) % PAGE_SIZE != 0:
         return
 
-    # Map (page, head) to a linear page_id
+    # Output page index:
+    #   Logical page = token_position // PAGE_SIZE
+    #   One vector per head, so linearize by NUM_KV_HEAD.
     page_id = (token_position // PAGE_SIZE) * NUM_KV_HEAD + head_id
 
-    # Byte/element offset to the start of this page in `x`
-    # Each page is a contiguous block of x_D0 * x_D1 elements
-    x_offset = page_id * x_D0 * x_D1
+    # Input layout is [num_tokens, num_heads, x_D0, x_D1] (row-major).
+    #   For this token/head, compute the base element offset in `x`.
+    x_offset = (token_id * NUM_KV_HEAD + head_id) * x_D0 * x_D1
 
-    # Build a 2D index for the page load: row-major layout
-    rows = tl.arange(0, x_D0)[:, None]              # shape [x_D0, 1]
-    cols = tl.arange(0, x_D1)[None, :]              # shape [1, x_D1]
-    # Linearized 2D addressing: i * x_D1 + j
+    # Build 2D indices within a page (row-major addressing).
+    rows = tl.arange(0, x_D0)[:, None]      # shape [x_D0, 1]
+    cols = tl.arange(0, x_D1)[None, :]      # shape [1, x_D1]
     src_ptr = x + x_offset + rows * x_D1 + cols
 
-    # Load the full page block: shape [x_D0, x_D1], in the underlying dtype of `x`
+    # Load the full page block for this (token_id, head_id).
+    # Assumes the page is full; add masks here if you have partial tiles.
     page_block = tl.load(src_ptr)
 
+    # Reduction:
     if DIM == 1:
-        # Min over rows (per-column min) -> vector length x_D1
-        min_vec = tl.min(page_block, axis=0).to(tl.bfloat16)
-        dst_ptr = output + page_id * x_D1 + tl.arange(0, x_D1)
-        tl.store(dst_ptr, min_vec)
-    else:
-        # DIM == 2: Min over cols (per-row min) -> vector length x_D0
-        min_vec = tl.min(page_block, axis=1).to(tl.bfloat16)
-        dst_ptr = output + page_id * x_D0 + tl.arange(0, x_D0)
-        tl.store(dst_ptr, min_vec)
+        # Reduce over rows (axis=0) -> output vector length x_D1 (per-column reduce).
+        if REDUCE_TYPE == 0:  # Mean
+            # NOTE: precision-sensitive workloads may want fp32 accumulation:
+            # s = tl.sum(page_block.to(tl.float32), axis=0)
+            # reduce_vec = (s / x_D0).to(tl.bfloat16)
+            reduce_vec = (tl.sum(page_block, axis=0) / x_D0).to(tl.bfloat16)
+        elif REDUCE_TYPE == 1:  # Max
+            reduce_vec = tl.max(page_block, axis=0).to(tl.bfloat16)
+        elif REDUCE_TYPE == 2:  # Min
+            reduce_vec = tl.min(page_block, axis=0).to(tl.bfloat16)
+        else:                   # L2Norm (sqrt(sum(x*x))); NOT RMS
+            # For RMS, use: tl.sqrt(tl.sum(page_block*page_block, axis=0) / x_D0)
+            s = tl.sum(page_block * page_block, axis=0)
+            reduce_vec = tl.sqrt(s).to(tl.bfloat16)
 
-def min_launcher(
+        # Write to output: layout [num_pages, x_D1] for DIM==1.
+        dst_ptr = output + page_id * x_D1 + tl.arange(0, x_D1)
+        tl.store(dst_ptr, reduce_vec)
+
+    else:
+        # DIM == 2: Reduce over cols (axis=1) -> output vector length x_D0 (per-row reduce).
+        if REDUCE_TYPE == 0:  # Mean
+            # s = tl.sum(page_block.to(tl.float32), axis=1)
+            # reduce_vec = (s / x_D1).to(tl.bfloat16)
+            reduce_vec = (tl.sum(page_block, axis=1) / x_D1).to(tl.bfloat16)
+        elif REDUCE_TYPE == 1:  # Max
+            reduce_vec = tl.max(page_block, axis=1).to(tl.bfloat16)
+        elif REDUCE_TYPE == 2:  # Min
+            reduce_vec = tl.min(page_block, axis=1).to(tl.bfloat16)
+        else:                   # L2Norm (sqrt(sum(x*x))); NOT RMS
+            s = tl.sum(page_block * page_block, axis=1)
+            reduce_vec = tl.sqrt(s).to(tl.bfloat16)
+
+        # Write to output: layout [num_pages, x_D0] for DIM==2.
+        dst_ptr = output + page_id * x_D0 + tl.arange(0, x_D0)
+        tl.store(dst_ptr, reduce_vec)
+    
+
+
+def reduce_rp(
 x: torch.Tensor,
 output: torch.Tensor,
 loc: torch.LongTensor,
 ctx: Context,
-dim: int
+dim: int,
+reduce_type: ReduceType,
 ):
     
     NNZ = loc.shape[0]
     NUM_KV_HEAD = ctx.head_num
     
-    min_kernel[(NNZ, NUM_KV_HEAD)](
+    reduce_rp_kernel[(NNZ, NUM_KV_HEAD)](
         x=x,
         output=output,
         loc=loc,
@@ -278,5 +219,289 @@ dim: int
         x_D1=x.shape[2],
         NUM_KV_HEAD=NUM_KV_HEAD,
         PAGE_SIZE=ctx.page_size,
+        REDUCE_TYPE=reduce_type.value,
+        DIM=dim
+    )
+
+
+def _reduce_rp(
+x: torch.Tensor,
+output: torch.Tensor,
+loc: torch.LongTensor,
+num_kv_heads: int,
+page_size: int,
+dim: int,
+reduce_type: ReduceType,
+):
+    
+    NNZ = loc.shape[0]
+    NUM_KV_HEAD = num_kv_heads
+    
+    reduce_rp_kernel[(NNZ, NUM_KV_HEAD)](
+        x=x,
+        output=output,
+        loc=loc,
+        x_D0=x.shape[1],
+        x_D1=x.shape[2],
+        NUM_KV_HEAD=NUM_KV_HEAD,
+        PAGE_SIZE=page_size,
+        REDUCE_TYPE=reduce_type.value,
+        DIM=dim
+    )
+
+
+@triton.jit
+def reduce_pr_kernel(
+x, output, loc,
+x_D0: tl.constexpr,              # rows per page
+x_D1: tl.constexpr,              # cols per page
+NUM_KV_HEAD: tl.constexpr,
+PAGE_SIZE: tl.constexpr,
+REDUCE_TYPE: tl.constexpr,       # 0: Mean, 1: Max, 2: Min, 3: L2Norm (not RMS)
+DIM: tl.constexpr                # 1: reduce over rows -> len x_D1; 2: reduce over cols -> len x_D0
+):
+    """
+    Layouts:
+      x:      [num_pages * NUM_KV_HEAD, x_D0, x_D1]   (page-major, row-major inside page)
+      output: [num_tokens * NUM_KV_HEAD, vec_len]     (token-major; vec_len = x_D1 if DIM==1 else x_D0)
+
+    Behavior:
+      - token_id comes from pid0; head_id comes from pid1.
+      - Read loc[token_id] to get absolute position; only proceed at page end.
+      - Map token -> page via page_idx = (token_position // PAGE_SIZE).
+      - Read the whole page for this (page_idx, head_id), do reduction,
+        then write a single vector to output at (token_id, head_id, :).
+    """
+
+    # --- Program IDs ---
+    token_id = tl.program_id(0)             # [0 .. num_tokens-1]
+    head_id  = tl.program_id(1)             # [0 .. NUM_KV_HEAD-1]
+
+    # --- Trigger only at end-of-page token ---
+    token_position = tl.load(loc + token_id)
+    if (token_position + 1) % PAGE_SIZE != 0:
+        return
+
+    # --- Page indexing for x (page-major) ---
+    # page linear id across heads
+    page_idx = token_position // PAGE_SIZE
+    page_id  = page_idx * NUM_KV_HEAD + head_id
+
+    # Base element offset into x for this (page_id, head_id)
+    # x is laid out as contiguous pages, each page is [x_D0, x_D1]
+    x_offset = page_id * x_D0 * x_D1
+
+    # 2D row-major addressing within the page
+    rows = tl.arange(0, x_D0)[:, None]      # [x_D0, 1]
+    cols = tl.arange(0, x_D1)[None, :]      # [1, x_D1]
+    src_ptr = x + x_offset + rows * x_D1 + cols
+
+    # Load the full page block. Assumes full tiles; add masks if needed.
+    page_block = tl.load(src_ptr)
+
+    # --- Reduction & write-out ---
+    if DIM == 1:
+        # Reduce over rows (axis=0) -> per-column vector, length = x_D1
+        if REDUCE_TYPE == 0:        # Mean
+            # For better accuracy you may upcast: tl.sum(page_block.to(tl.float32), axis=0)
+            reduce_vec = (tl.sum(page_block, axis=0) / x_D0).to(tl.bfloat16)
+        elif REDUCE_TYPE == 1:      # Max
+            reduce_vec = tl.max(page_block, axis=0).to(tl.bfloat16)
+        elif REDUCE_TYPE == 2:      # Min
+            reduce_vec = tl.min(page_block, axis=0).to(tl.bfloat16)
+        else:                       # L2Norm (NOT RMS)
+            s = tl.sum(page_block * page_block, axis=0)
+            reduce_vec = tl.sqrt(s).to(tl.bfloat16)
+
+        # output is token-major: [num_tokens, NUM_KV_HEAD, x_D1]
+        out_base = (token_id * NUM_KV_HEAD + head_id) * x_D1
+        dst_ptr  = output + out_base + tl.arange(0, x_D1)
+        tl.store(dst_ptr, reduce_vec)
+
+    else:
+        # DIM == 2: Reduce over cols (axis=1) -> per-row vector, length = x_D0
+        if REDUCE_TYPE == 0:        # Mean
+            reduce_vec = (tl.sum(page_block, axis=1) / x_D1).to(tl.bfloat16)
+        elif REDUCE_TYPE == 1:      # Max
+            reduce_vec = tl.max(page_block, axis=1).to(tl.bfloat16)
+        elif REDUCE_TYPE == 2:      # Min
+            reduce_vec = tl.min(page_block, axis=1).to(tl.bfloat16)
+        else:                       # L2Norm (NOT RMS)
+            s = tl.sum(page_block * page_block, axis=1)
+            reduce_vec = tl.sqrt(s).to(tl.bfloat16)
+
+        # output is token-major: [num_tokens, NUM_KV_HEAD, x_D0]
+        out_base = (token_id * NUM_KV_HEAD + head_id) * x_D0
+        dst_ptr  = output + out_base + tl.arange(0, x_D0)
+        tl.store(dst_ptr, reduce_vec)
+
+
+def reduce_pr(
+x: torch.Tensor,
+output: torch.Tensor,
+loc: torch.LongTensor,
+ctx: Context,
+dim: int,
+reduce_type: ReduceType,
+):
+    
+    NNZ = loc.shape[0]
+    NUM_KV_HEAD = ctx.head_num
+    
+    reduce_pr_kernel[(NNZ, NUM_KV_HEAD)](
+        x=x,
+        output=output,
+        loc=loc,
+        x_D0=x.shape[1],
+        x_D1=x.shape[2],
+        NUM_KV_HEAD=NUM_KV_HEAD,
+        PAGE_SIZE=ctx.page_size,
+        REDUCE_TYPE=reduce_type.value,
+        DIM=dim
+    )
+    
+def _reduce_pr(
+x: torch.Tensor,
+output: torch.Tensor,
+loc: torch.LongTensor,
+num_kv_heads: int,
+page_size: int,
+dim: int,
+reduce_type: ReduceType,
+):
+    
+    NNZ = loc.shape[0]
+    NUM_KV_HEAD = num_kv_heads
+    
+    reduce_pr_kernel[(NNZ, NUM_KV_HEAD)](
+        x=x,
+        output=output,
+        loc=loc,
+        x_D0=x.shape[1],
+        x_D1=x.shape[2],
+        NUM_KV_HEAD=NUM_KV_HEAD,
+        PAGE_SIZE=page_size,
+        REDUCE_TYPE=reduce_type.value,
+        DIM=dim
+    )
+
+
+@triton.jit
+def reduce_rr_kernel(
+x, output, loc,
+x_D0: tl.constexpr,              # rows per token-page
+x_D1: tl.constexpr,              # cols per token-page
+NUM_KV_HEAD: tl.constexpr,
+PAGE_SIZE: tl.constexpr,
+REDUCE_TYPE: tl.constexpr,       # 0: Mean, 1: Max, 2: Min, 3: L2Norm (not RMS)
+DIM: tl.constexpr                # 1: reduce over rows -> len x_D1; 2: reduce over cols -> len x_D0
+):
+    """
+    Layouts:
+      x:      [num_tokens * NUM_KV_HEAD, x_D0, x_D1]     (token-major)
+      output: [num_tokens * NUM_KV_HEAD, vec_len]        (token-major; vec_len = x_D1 if DIM==1 else x_D0)
+
+    Only the last token of each page performs the reduction and writes to output[token_id, head_id, :].
+    """
+
+
+    # program ids
+    token_id = tl.program_id(0)   # 0..num_tokens-1
+    head_id  = tl.program_id(1)   # 0..NUM_KV_HEAD-1
+
+    # trigger only at end-of-page token
+    token_position = tl.load(loc + token_id)
+    if (token_position + 1) % PAGE_SIZE != 0:
+        return
+
+    # ---- read from x (token-major) ----
+    x_base   = (token_id * NUM_KV_HEAD + head_id) * x_D0 * x_D1
+    rows     = tl.arange(0, x_D0)[:, None]         # [x_D0, 1]
+    cols     = tl.arange(0, x_D1)[None, :]         # [1, x_D1]
+    src_ptr  = x + x_base + rows * x_D1 + cols
+    page_blk = tl.load(src_ptr)                    # assumes full page; add masks if needed
+
+    # ---- reduce ----
+    if DIM == 1:
+        # over rows -> axis=0 -> vector len x_D1
+        if REDUCE_TYPE == 0:       # Mean
+            # For better accuracy you may upcast to fp32 before sum.
+            vec = (tl.sum(page_blk, axis=0) / x_D0).to(tl.bfloat16)
+        elif REDUCE_TYPE == 1:     # Max
+            vec = tl.max(page_blk, axis=0).to(tl.bfloat16)
+        elif REDUCE_TYPE == 2:     # Min
+            vec = tl.min(page_blk, axis=0).to(tl.bfloat16)
+        else:                      # L2Norm (NOT RMS)
+            s = tl.sum(page_blk * page_blk, axis=0)
+            vec = tl.sqrt(s).to(tl.bfloat16)
+
+        # ---- write to output (token-major) ----
+        out_base = (token_id * NUM_KV_HEAD + head_id) * x_D1
+        tl.store(output + out_base + tl.arange(0, x_D1), vec)
+
+    else:
+        # DIM == 2: over cols -> axis=1 -> vector len x_D0
+        if REDUCE_TYPE == 0:       # Mean
+            vec = (tl.sum(page_blk, axis=1) / x_D1).to(tl.bfloat16)
+        elif REDUCE_TYPE == 1:     # Max
+            vec = tl.max(page_blk, axis=1).to(tl.bfloat16)
+        elif REDUCE_TYPE == 2:     # Min
+            vec = tl.min(page_blk, axis=1).to(tl.bfloat16)
+        else:                      # L2Norm (NOT RMS)
+            s = tl.sum(page_blk * page_blk, axis=1)
+            vec = tl.sqrt(s).to(tl.bfloat16)
+
+        out_base = (token_id * NUM_KV_HEAD + head_id) * x_D0
+        tl.store(output + out_base + tl.arange(0, x_D0), vec)
+
+
+
+def reduce_rr(
+x: torch.Tensor,
+output: torch.Tensor,
+loc: torch.LongTensor,
+ctx: Context,
+dim: int,
+reduce_type: ReduceType,
+):
+    
+    NNZ = loc.shape[0]
+    NUM_KV_HEAD = ctx.head_num
+    
+    reduce_rr_kernel[(NNZ, NUM_KV_HEAD)](
+        x=x,
+        output=output,
+        loc=loc,
+        x_D0=x.shape[1],
+        x_D1=x.shape[2],
+        NUM_KV_HEAD=NUM_KV_HEAD,
+        PAGE_SIZE=ctx.page_size,
+        REDUCE_TYPE=reduce_type.value,
+        DIM=dim
+    )
+    
+
+def _reduce_rr(
+x: torch.Tensor,
+output: torch.Tensor,
+loc: torch.LongTensor,
+num_kv_heads: int,
+page_size: int,
+dim: int,
+reduce_type: ReduceType,
+):
+    
+    NNZ = loc.shape[0]
+    NUM_KV_HEAD = num_kv_heads
+    
+    reduce_rr_kernel[(NNZ, NUM_KV_HEAD)](
+        x=x,
+        output=output,
+        loc=loc,
+        x_D0=x.shape[1],
+        x_D1=x.shape[2],
+        NUM_KV_HEAD=NUM_KV_HEAD,
+        PAGE_SIZE=page_size,
+        REDUCE_TYPE=reduce_type.value,
         DIM=dim
     )
