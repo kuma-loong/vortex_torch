@@ -1,6 +1,6 @@
 from .matmul import GeMV, GeMM
 from .output_func import topK
-from .reduce import Max, Mean, Min, L2Norm
+from .reduce import Max, Mean, Min, L2Norm, Sum
 from .scan import Softmax, Normalize
 from .transpose import Transpose
 from .elementwise_binary import Maximum, Minimum, Multiply, Add
@@ -10,7 +10,7 @@ from .context import Context, get_ctx
 __all__ = [ 
     "GeMV", "GeMM",
     "topK",
-    "Max", "Mean", "Min", "L2Norm",
+    "Max", "Mean", "Min", "L2Norm", "Sum",
     "Softmax", "Normalize",
     "Transpose",
     "Maximum", "Minimum", "Multiply", "Add",

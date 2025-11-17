@@ -14,6 +14,7 @@ class ReduceType(Enum):
     Max = 1
     Min = 2
     L2Norm = 3
+    Sum = 4
     
 
 class ElementwiseBinaryOpType(Enum):

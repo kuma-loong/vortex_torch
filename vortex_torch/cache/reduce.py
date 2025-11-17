@@ -171,3 +171,8 @@ class L2Norm(Reduce):
         super().__init__(dim)
         self.reduce_type = ReduceType.L2Norm
 
+class Sum(Reduce):
+    
+    def __init__(self, dim = 1):
+        super().__init__(dim)
+        self.reduce_type = ReduceType.Sum

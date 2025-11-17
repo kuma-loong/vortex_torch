@@ -59,7 +59,10 @@ REDUCE_TYPE: tl.constexpr
                 
             elif REDUCE_TYPE == 3:
                 x_i_reduce = tl.sqrt(tl.sum(x_i * x_i, axis=1))
-                
+            
+            elif REDUCE_TYPE == 4:
+                x_i_reduce = tl.sum(x_i, axis=1)
+
             else:
                 x_i_reduce = tl.zeros((max_chunk_size, x_D1), dtype=tl.bfloat16)
             
@@ -80,7 +83,10 @@ REDUCE_TYPE: tl.constexpr
             
             elif REDUCE_TYPE == 3:
                 x_i_reduce = tl.sqrt(tl.sum(x_i * x_i, axis=2))
-                
+            
+            elif REDUCE_TYPE == 4:
+                x_i_reduce = tl.sum(x_i, axis=2)
+
             else:
                 x_i_reduce = tl.zeros((max_chunk_size, x_D1), dtype=tl.float32)
 
