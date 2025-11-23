@@ -36,7 +36,9 @@ autodoc_mock_imports = [
     "torch",
     "triton",
     "numpy",
-    "vortex_torch_C"
+    "vortex_torch_C",
+    "flash-attn",
+    "flashinfer"
 ]
 
 
