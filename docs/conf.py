@@ -31,6 +31,14 @@ extensions = [
     "sphinx_copybutton",
 ]
 
+
+autodoc_mock_imports = [
+    "torch",
+    "triton",
+    "numpy"
+]
+
+
 autosummary_generate = True
 autosummary_generate_overwrite = False
 autodoc_typehints = "description"
