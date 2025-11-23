@@ -17,7 +17,7 @@ dl.py.method > dt.sig {
 
 /* 进一步单独放大方法名 def xxx  */
 dl.py.method > dt.sig .sig-name {
-    font-size: 1.2em !important;
+    font-size: 1.1em !important;
     font-weight: 700;               /* 让方法名更突出，可选 */
 }
 
