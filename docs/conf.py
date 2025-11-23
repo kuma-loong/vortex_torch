@@ -35,7 +35,8 @@ extensions = [
 autodoc_mock_imports = [
     "torch",
     "triton",
-    "numpy"
+    "numpy",
+    "vortex_torch_C"
 ]
 
 

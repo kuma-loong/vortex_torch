@@ -8,7 +8,7 @@ Chunkwise_NH2HN_Transpose,
 Chunkwise_HN2NH_Transpose,
 Chunkwise_HN2NH_Transpose_FA3
 )
-from typing import Tuple, Any
+from typing import Tuple
 from .context import Context
 
 
