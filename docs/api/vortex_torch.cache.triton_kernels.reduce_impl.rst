@@ -8,5 +8,8 @@ vortex\_torch.cache.triton\_kernels.reduce\_impl
 
    .. autosummary::
    
-      mean_launcher
+      reduce_pp
+      reduce_pr
+      reduce_rp
+      reduce_rr
    

@@ -1,8 +1,10 @@
-vortex\_torch.tensor
-====================
+vortex\_torch.abs.tensor
+========================
 
-.. automodule:: vortex_torch.tensor
-
+.. automodule:: vortex_torch.abs.tensor
+   :members:
+   :undoc-members:
+   :show-inheritance:
    
    .. rubric:: Functions
 

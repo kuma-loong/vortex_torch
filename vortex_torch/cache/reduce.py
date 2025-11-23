@@ -8,14 +8,91 @@ from typing import Tuple, Dict, Callable, Optional
 
 
 class Reduce(vOp):
-    """
-    Reduction dispatcher (dim ∈ {1,2}, type = Mean/Max/Min/L2, etc. decided in impl).
-    Dispatch key: (x_format, o_format) -> (impl, resolved_output_format)
+    r"""
+    Generic reduction dispatcher over the last two logical axes.
 
-    Policy:
-      - If `output` is None, prefer an implementation with o_format == FORMAT.RAGGED.
-      - Otherwise, require an exact (x_fmt, o_fmt) match.
-      - Input tensors are rank-3: [B, N, D]; the reduced axis collapses to 1.
+    This dispatcher covers a family of reductions (mean/max/min/L2-norm/sum,
+    etc.) on rank-3 tensors. The input is treated as
+
+    .. math::
+
+        X \in \mathbb{R}^{B \times N \times D},
+
+    where:
+
+    - :math:`B` is a leading batch-like axis (typically derived from the
+      runtime, e.g. ``max_new_tokens_per_batch * head_num``),
+    - :math:`N` is a sequence or position dimension, and
+    - :math:`D` is a feature/channel dimension.
+
+    The reduction dimension is chosen by :attr:`dim`:
+
+    - ``dim == 1`` (row-wise reduction over :math:`N`):
+
+      .. math::
+
+         \text{out} \in \mathbb{R}^{B \times 1 \times D},
+
+    - ``dim == 2`` (column-wise reduction over :math:`D`):
+
+      .. math::
+
+         \text{out} \in \mathbb{R}^{B \times N \times 1}.
+
+    The exact reduction operation (mean, max, min, L2-norm, sum, etc.) is
+    encoded in :attr:`reduce_type` and interpreted by the implementation.
+
+    Dispatch is based on the pair of tensor formats
+    ``(x_format, o_format)`` and a registry mapping:
+
+    .. code-block:: text
+
+        (x_format, o_format) -> (impl, resolved_output_format)
+
+    Policy
+    ------
+    - If ``output`` is ``None``:
+
+      - :meth:`profile` selects an implementation for
+        ``(x_fmt, FORMAT.RAGGED)`` (i.e. with RAGGED output).
+      - An internal buffer is allocated with logical shape
+        ``[B, exp_N, exp_D]``, where:
+
+        - for ``dim == 1``: ``exp_N = 1``, ``exp_D = D``,
+        - for ``dim == 2``: ``exp_N = N``, ``exp_D = 1``.
+
+    - If ``output`` is provided:
+
+      - :meth:`profile` requires an exact implementation key for
+        ``(x_fmt, o_fmt)``.
+      - The shape of ``output`` must match the expected
+        ``(exp_N, exp_D)`` given :attr:`dim`.
+      - Device consistency is enforced between ``x`` and ``output``.
+
+    Attributes
+    ----------
+    _impl_map : Dict[Tuple[FORMAT, FORMAT], Tuple[Callable, FORMAT]]
+        Dispatch table keyed by ``(x_format, o_format)``. Each entry maps to
+        ``(callable_impl, resolved_output_format)``.
+
+    dim : int
+        Reduction dimension in the logical 3D tensor. Must be either:
+
+        - ``1`` for row-wise reduction over :math:`N`, or
+        - ``2`` for column-wise reduction over :math:`D`.
+
+    reduce_type : Optional[ReduceType]
+        Enum describing which reduction to perform (mean, max, min, L2-norm,
+        sum, etc.).
+
+    impl : Optional[Callable]
+        The resolved implementation selected during :meth:`profile`.
+
+    output_format : Optional[FORMAT]
+        The output tensor format as determined in :meth:`profile`.
+
+    output_buffer : Optional[torch.Tensor]
+        Internal output buffer allocated when ``output`` is ``None``.
     """
 
     # Consistent 2-tuple dispatch table
@@ -27,6 +104,26 @@ class Reduce(vOp):
     }
 
     def __init__(self, dim: int = 1):
+        r"""
+        Initialize a reduction dispatcher.
+
+        Parameters
+        ----------
+        dim : int, optional
+            Logical reduction dimension:
+
+            - ``1`` to reduce over the sequence axis :math:`N` (rows),
+            - ``2`` to reduce over the feature axis :math:`D` (columns).
+
+            Default is ``1``.
+
+        Notes
+        -----
+        The specific reduction operation (mean, max, min, L2-norm, sum,
+        etc.) must be configured separately via :attr:`reduce_type`, e.g.
+        in subclasses like :class:`Mean`, :class:`Max`, :class:`Min`,
+        :class:`L2Norm`, :class:`Sum`.
+        """
         super().__init__()
         self.dim = dim
         self.reduce_type: Optional[ReduceType] = None
@@ -39,9 +136,28 @@ class Reduce(vOp):
 
     # ------------------------------ helpers ------------------------------ #
     def _infer_impl_ragged(self, x_fmt: FORMAT) -> Tuple[Callable, FORMAT]:
-        """
-        Default inference when output is None:
-        choose (x_fmt, FORMAT.RAGGED). Raise if missing.
+        r"""
+        Infer an implementation assuming a RAGGED output format.
+
+        This helper is used when :meth:`profile` is called with
+        ``output is None``. It selects an implementation for the key
+        ``(x_fmt, FORMAT.RAGGED)`` in :attr:`_impl_map`.
+
+        Parameters
+        ----------
+        x_fmt : FORMAT
+            The format of the input tensor ``x``.
+
+        Returns
+        -------
+        (Callable, FORMAT)
+            The implementation callable and the resolved output format.
+
+        Raises
+        ------
+        AssertionError
+            If there is no entry for ``(x_fmt, FORMAT.RAGGED)`` in
+            :attr:`_impl_map`.
         """
         key = (x_fmt, FORMAT.RAGGED)
         assert key in self._impl_map, (
@@ -56,6 +172,55 @@ class Reduce(vOp):
     def profile(
         self, x: vTensor, output: Optional[vTensor], loc: torch.Tensor, ctx: Context
     ) -> vTensor:
+        r"""
+        Validate inputs, resolve the reduction implementation and output
+        format, and optionally allocate an internal output buffer.
+
+        The input tensor ``x`` is expected to have logical shape
+        ``[B, N, D]``. According to :attr:`dim`, the expected output
+        logical shape is:
+
+        - ``dim == 1``: ``[B, 1, D]``
+        - ``dim == 2``: ``[B, N, 1]``
+
+        The auxiliary tensor ``loc`` carries per-position metadata used
+        by the implementation; its shape and semantics are
+        implementation-defined.
+
+        Parameters
+        ----------
+        x : vTensor
+            Input tensor with logical shape ``[B, N, D]``.
+
+        output : Optional[vTensor]
+            Optional preallocated output tensor. If ``None``, an internal
+            buffer with shape ``[B, exp_N, exp_D]`` is allocated using
+            ``ctx.max_new_tokens_per_batch * ctx.head_num`` for ``B`` and a
+            RAGGED-output implementation is selected. If not ``None``,
+            this tensor must have rank 3 and shape compatible with
+            :attr:`dim` as described above.
+
+        loc : torch.Tensor
+            Auxiliary tensor carrying metadata required by the reduction
+            implementation.
+
+        ctx : Context
+            Execution context that provides the runtime value of ``B`` and
+            is used for auxiliary memory accounting.
+
+        Returns
+        -------
+        vTensor
+            A :class:`vTensor` view representing the resolved output:
+            either the provided ``output`` or an internally allocated
+            buffer.
+
+        Raises
+        ------
+        AssertionError
+            If types, ranks, formats, shapes, or devices are incompatible,
+            or if no implementation is found in :attr:`_impl_map`.
+        """
         prefix = self._prefix()
 
         # --- type & rank checks ---
@@ -86,7 +251,9 @@ class Reduce(vOp):
 
         # Case B: output provided -> validate and pick exact impl by (x_fmt, o_fmt)
         assert isinstance(output, vTensor), f"{prefix}output must be vTensor, got {type(output)}"
-        assert output.dim() == 3, f"{prefix}output must be 3D, got ndim={output.dim()} shape={tuple(output.shape)}"
+        assert output.dim() == 3, (
+            f"{prefix}output must be 3D, got ndim={output.dim()} shape={tuple(output.shape)}"
+        )
 
         o_fmt = output._format
         key = (x_fmt, o_fmt)
@@ -100,7 +267,8 @@ class Reduce(vOp):
         if self.dim == 1:
             # Expect (*, 1, x.D)
             assert output.shape[1] == 1, (
-                f"{prefix}profile(dim=1): expected output.shape[1] == 1, got {tuple(output.shape)}"
+                f"{prefix}profile(dim=1): expected output.shape[1] == 1, "
+                f"got {tuple(output.shape)}"
             )
             assert output.shape[2] == x.shape[2], (
                 f"{prefix}profile(dim=1): expected output.shape[2] == x.shape[2], "
@@ -109,7 +277,8 @@ class Reduce(vOp):
         else:  # self.dim == 2
             # Expect (*, x.N, 1)
             assert output.shape[2] == 1, (
-                f"{prefix}profile(dim=2): expected output.shape[2] == 1, got {tuple(output.shape)}"
+                f"{prefix}profile(dim=2): expected output.shape[2] == 1, "
+                f"got {tuple(output.shape)}"
             )
             assert output.shape[1] == x.shape[1], (
                 f"{prefix}profile(dim=2): expected output.shape[1] == x.shape[1], "
@@ -130,13 +299,50 @@ class Reduce(vOp):
     def execute(
         self, x: torch.Tensor, output: Optional[torch.Tensor], loc: torch.Tensor, ctx: Context
     ) -> torch.Tensor:
+        r"""
+        Execute the selected reduction implementation.
+
+        This method assumes that :meth:`profile` has already selected an
+        implementation and, if needed, allocated an internal output buffer.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Plain input tensor with shape compatible with the
+            :class:`vTensor` validated in :meth:`profile`.
+
+        output : Optional[torch.Tensor]
+            Optional preallocated output tensor. If ``None``, the internal
+            buffer created during :meth:`profile` will be used.
+
+        loc : torch.Tensor
+            Auxiliary tensor carrying metadata required by the reduction
+            implementation.
+
+        ctx : Context
+            Execution context forwarded to the implementation.
+
+        Returns
+        -------
+        torch.Tensor
+            The output tensor written by the implementation: either the
+            provided ``output`` or the internal buffer.
+
+        Raises
+        ------
+        AssertionError
+            If :meth:`profile` has not been called and no implementation or
+            internal buffer is available.
+        """
         prefix = self._prefix()
 
         # Must have selected impl in profile()
         assert self.impl is not None, f"{prefix}called before profile() (impl is None)"
 
         if output is None:
-            assert self.output_buffer is not None, f"{prefix}internal output buffer is None; did profile() run?"
+            assert self.output_buffer is not None, (
+                f"{prefix}internal output buffer is None; did profile() run?"
+            )
             output = self.output_buffer
 
         # Launch the kernel/implementation: impl(x, output, loc, ctx, dim, reduce_type)
@@ -146,33 +352,175 @@ class Reduce(vOp):
     
 
 class Mean(Reduce):
-    def __init__(self, dim = 1):
+    r"""
+    Mean reduction over a single logical axis.
+
+    This operator reduces a rank-3 tensor
+
+    .. math::
+
+        X \in \mathbb{R}^{B \times N \times D}
+
+    by taking the arithmetic mean along one of the inner dimensions, as
+    configured by :attr:`dim`:
+
+    - ``dim == 1``: row-wise mean over :math:`N`, producing
+
+      .. math::
+
+          Y \in \mathbb{R}^{B \times 1 \times D}, \qquad
+          Y[b, 0, d]
+          = \frac{1}{N} \sum_{n=0}^{N-1} X[b, n, d].
+
+    - ``dim == 2``: column-wise mean over :math:`D`, producing
+
+      .. math::
+
+          Y \in \mathbb{R}^{B \times N \times 1}, \qquad
+          Y[b, n, 0]
+          = \frac{1}{D} \sum_{d=0}^{D-1} X[b, n, d].
+
+    Parameters
+    ----------
+    dim : int, optional
+        Logical reduction dimension. Must be ``1`` (reduce over
+        :math:`N`) or ``2`` (reduce over :math:`D`). Default is ``1``.
+    """
+    def __init__(self, dim: int = 1):
         super().__init__(dim)
         self.reduce_type = ReduceType.Mean
     
 
 
 class Max(Reduce):
-    def __init__(self, dim = 1):
+    r"""
+    Max reduction over a single logical axis.
+
+    This operator reduces a rank-3 tensor
+
+    .. math::
+
+        X \in \mathbb{R}^{B \times N \times D}
+
+    by taking the maximum along one of the inner dimensions, as
+    configured by :attr:`dim`:
+
+    - ``dim == 1``: row-wise maximum over :math:`N`, producing
+
+      .. math::
+
+          Y \in \mathbb{R}^{B \times 1 \times D}, \qquad
+          Y[b, 0, d]
+          = \max_{0 \le n < N} X[b, n, d].
+
+    - ``dim == 2``: column-wise maximum over :math:`D`, producing
+
+      .. math::
+
+          Y \in \mathbb{R}^{B \times N \times 1}, \qquad
+          Y[b, n, 0]
+          = \max_{0 \le d < D} X[b, n, d].
+
+    Parameters
+    ----------
+    dim : int, optional
+        Logical reduction dimension. Must be ``1`` (reduce over
+        :math:`N`) or ``2`` (reduce over :math:`D`). Default is ``1``.
+    """
+    def __init__(self, dim: int = 1):
         super().__init__(dim)
         self.reduce_type = ReduceType.Max
         
 
 
 class Min(Reduce):
-    def __init__(self, dim = 1):
+    r"""
+    Min reduction over a single logical axis.
+
+    This operator reduces a rank-3 tensor
+
+    .. math::
+
+        X \in \mathbb{R}^{B \times N \times D}
+
+    by taking the minimum along one of the inner dimensions, as
+    configured by :attr:`dim`:
+
+    - ``dim == 1``: row-wise minimum over :math:`N`, producing
+
+      .. math::
+
+          Y \in \mathbb{R}^{B \times 1 \times D}, \qquad
+          Y[b, 0, d]
+          = \min_{0 \le n < N} X[b, n, d].
+
+    - ``dim == 2``: column-wise minimum over :math:`D`, producing
+
+      .. math::
+
+          Y \in \mathbb{R}^{B \times N \times 1}, \qquad
+          Y[b, n, 0]
+          = \min_{0 \le d < D} X[b, n, d].
+
+    Parameters
+    ----------
+    dim : int, optional
+        Logical reduction dimension. Must be ``1`` (reduce over
+        :math:`N`) or ``2`` (reduce over :math:`D`). Default is ``1``.
+    """
+    def __init__(self, dim: int = 1):
         super().__init__(dim)
         self.reduce_type = ReduceType.Min
 
 
 
 class L2Norm(Reduce):
-    def __init__(self, dim = 1):
+    r"""
+    L2-norm reduction (not RMS) over a single logical axis.
+
+    This operator reduces a rank-3 tensor
+
+    .. math::
+
+        X \in \mathbb{R}^{B \times N \times D}
+
+    by computing an L2 norm along one of the inner dimensions, as
+    configured by :attr:`dim`. The reduction is *not* normalized by the
+    number of elements (it is an L2 norm, not an RMS):
+
+    - ``dim == 1``: row-wise L2 norm over :math:`N`, producing
+
+      .. math::
+
+          Y \in \mathbb{R}^{B \times 1 \times D}, \qquad
+          Y[b, 0, d]
+          = \sqrt{\sum_{n=0}^{N-1} X[b, n, d]^2}.
+
+    - ``dim == 2``: column-wise L2 norm over :math:`D`, producing
+
+      .. math::
+
+          Y \in \mathbb{R}^{B \times N \times 1}, \qquad
+          Y[b, n, 0]
+          = \sqrt{\sum_{d=0}^{D-1} X[b, n, d]^2}.
+
+    Notes
+    -----
+    This is a pure L2 norm over the reduced axis:
+
+    .. math::
+
+        \|v\|_2 = \sqrt{\sum_i v_i^2},
+
+    with no division by the number of elements. It should not be
+    confused with RMS (root mean square).
+
+    Parameters
+    ----------
+    dim : int, optional
+        Logical reduction dimension. Must be ``1`` (reduce over
+        :math:`N`) or ``2`` (reduce over :math:`D`). Default is ``1``.
+    """
+    def __init__(self, dim: int = 1):
         super().__init__(dim)
         self.reduce_type = ReduceType.L2Norm
-
-class Sum(Reduce):
-    
-    def __init__(self, dim = 1):
-        super().__init__(dim)
-        self.reduce_type = ReduceType.Sum

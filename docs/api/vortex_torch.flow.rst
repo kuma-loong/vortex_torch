@@ -1,4 +1,4 @@
-﻿vortex\_torch.flow
+vortex\_torch.flow
 ==================
 
 .. automodule:: vortex_torch.flow
@@ -11,3 +11,6 @@
    :recursive:
 
    algorithms
+   flow
+   loader
+   registry

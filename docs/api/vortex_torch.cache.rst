@@ -1,4 +1,4 @@
-﻿vortex\_torch.cache
+vortex\_torch.cache
 ===================
 
 .. automodule:: vortex_torch.cache
@@ -10,4 +10,9 @@
    :toctree:
    :recursive:
 
+   context
+   elementwise
+   elementwise_binary
+   fill
+   matmul
    reduce

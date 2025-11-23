@@ -12,7 +12,7 @@ copyright = f"{datetime.now():%Y}, {author}"
 # Read package version safely (avoid clashing with Sphinx's `version` config)
 try:
     from importlib.metadata import version as pkg_version
-    release = pkg_version("vortex_torch")   # <-- change to your real distribution name if needed (e.g. "vortex")
+    release = pkg_version("Vortex")   # <-- change to your real distribution name if needed (e.g. "vortex")
 except Exception:
     release = "1.0.0"
 
@@ -33,12 +33,11 @@ extensions = [
 
 autosummary_generate = True
 autosummary_generate_overwrite = False
-
 autodoc_typehints = "description"
 autodoc_member_order = "bysource"
 autodoc_default_options = {
-    "members": True,
-    "undoc-members": True,
+    #"members": True,
+    "undoc-members": False,
     "show-inheritance": True,
 }
 
@@ -60,3 +59,6 @@ intersphinx_mapping = {
 }
 
 todo_include_todos = True
+
+def setup(app):
+    app.add_css_file("custom.css")

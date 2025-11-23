@@ -8,7 +8,7 @@ Installation
 
 .. code-block:: bash
 
-   pip install -e .
+   pip install vortex-torch
 
 Quick Example
 -------------
@@ -27,4 +27,6 @@ API Reference
    :toctree: api
    :recursive:
 
-   vortex_torch
+   vortex_torch.indexer
+   vortex_torch.cache
+   vortex_torch.flow

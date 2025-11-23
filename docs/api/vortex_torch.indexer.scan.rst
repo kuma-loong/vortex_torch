@@ -2,11 +2,14 @@ vortex\_torch.indexer.scan
 ==========================
 
 .. automodule:: vortex_torch.indexer.scan
-
+   :members:
+   :undoc-members:
+   :show-inheritance:
    
-   .. rubric:: Functions
+   .. rubric:: Classes
 
    .. autosummary::
    
-      softmax
+      Normalize
+      Softmax
    

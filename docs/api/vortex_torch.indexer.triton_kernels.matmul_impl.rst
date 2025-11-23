@@ -8,5 +8,7 @@ vortex\_torch.indexer.triton\_kernels.matmul\_impl
 
    .. autosummary::
    
-      triton_mv
+      mm_bpr
+      mm_rpr
+      mm_rrr
    

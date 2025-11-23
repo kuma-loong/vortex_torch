@@ -10,5 +10,9 @@ vortex\_torch.cache.triton\_kernels
    :toctree:
    :recursive:
 
+   elementwise_binary_impl
+   elementwise_impl
+   fill_impl
+   matmul_impl
    reduce_impl
    set_kv

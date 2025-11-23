@@ -6,11 +6,41 @@ from .triton_kernels.elementwise_binary_impl import elementwise_binary_bpr, elem
 from ..utils import ElementwiseBinaryOpType
 
 class Elementwise_Binary(vOp):
-    """
-    Binary elementwise dispatcher for rank-3 logical tensors [S, C, D].
-    - Dispatch is keyed by (x_format, y_format).
-    - Output logical shape is broadcast over (C, D) and keeps S from runtime context.
-    - Alpha/Beta are scalar params used by certain ops (e.g., axpby).
+    r"""
+    Binary elementwise dispatcher for rank-3 logical tensors ``[S, C, D]``.
+
+    This operator dispatches to a binary elementwise implementation based on the
+    pair of input formats ``(x._format, y._format)``. The logical output shape:
+
+    - keeps the ``S`` axis from the runtime context (``ctx.max_num_pages``), and
+    - follows broadcasting over the ``(C, D)`` axes.
+
+    Scalar parameters ``alpha`` and ``beta`` can be used by certain binary
+    operations (e.g. an ``axpby``-style op).
+
+    Attributes
+    ----------
+    _impl_map : Dict[Tuple[FORMAT, FORMAT], Tuple[Callable, FORMAT]]
+        Dispatch table keyed by ``(x_format, y_format)``. Each entry maps to
+        ``(callable_impl, resolved_output_format)``.
+
+    alpha : float
+        Scalar parameter used by some ops. Default is ``1.0``.
+
+    beta : float
+        Scalar parameter used by some ops. Default is ``1.0``.
+
+    impl : Optional[Callable]
+        The resolved implementation selected during :meth:`profile`.
+
+    op_type : Optional[ElementwiseBinaryOpType]
+        The operator type used by the implementation.
+
+    output_format : Optional[FORMAT]
+        The output tensor format as determined in :meth:`profile`.
+
+    output_buffer : Optional[torch.Tensor]
+        Preallocated output tensor buffer that stores the binary result.
     """
 
     # Implementation dispatch table: keyed by (x_format, y_format).
@@ -33,9 +63,48 @@ class Elementwise_Binary(vOp):
 
     # ---------------- profile ----------------
     def profile(self, x: vTensor, y: vTensor, ctx: Context) -> vTensor:
-        """
-        Validate inputs, select implementation by (x._format, y._format),
-        allocate output buffer with broadcasted (C, D), and return a vTensor view.
+        r"""
+        Validate inputs, select implementation, allocate the output buffer,
+        and return a ``vTensor`` view with the resolved output format.
+
+        The dispatcher:
+
+        - checks that ``x`` and ``y`` are rank-3 tensors of shape ``[S, C, D]``
+        - enforces broadcastability on the ``C`` and ``D`` dimensions
+        - selects an implementation using ``(x._format, y._format)``
+        - allocates an output buffer with shape ``[S_ctx, C_out, D_out]`` where
+
+          .. math::
+
+             C_{\text{out}} = \max(C_x, C_y), \quad
+             D_{\text{out}} = \max(D_x, D_y),
+
+          and ``S_ctx = ctx.max_num_pages``.
+
+        Parameters
+        ----------
+        x : vTensor
+            Left-hand input tensor, rank-3, with logical shape ``[S, C, D]``.
+
+        y : vTensor
+            Right-hand input tensor, rank-3, with logical shape ``[S, C, D]``.
+
+        ctx : Context
+            Execution context providing the runtime ``S`` (``ctx.max_num_pages``)
+            and auxiliary-memory accounting.
+
+        Returns
+        -------
+        vTensor
+            A ``vTensor`` view wrapping the allocated output buffer, using the
+            resolved output format from the dispatch table.
+
+        Raises
+        ------
+        AssertionError
+            If types are not ``vTensor``, if ranks are not 3, if ``C``/``D``
+            are not broadcastable, if formats are unsupported, or if devices
+            of ``x`` and ``y`` do not match.
         """
         prefix = self._prefix()
 
@@ -89,9 +158,37 @@ class Elementwise_Binary(vOp):
 
     # ---------------- execute ----------------
     def execute(self, x: torch.Tensor, y: torch.Tensor, ctx: Context) -> torch.Tensor:
-        """
-        Run the selected implementation into the internal buffer and return it.
-        Expected signature: impl(x, y, output, op_type, alpha, beta, ctx)
+        r"""
+        Execute the selected binary elementwise implementation into the internal
+        output buffer and return it.
+
+        Expected implementation signature::
+
+            impl(x, y, output, op_type, alpha, beta, ctx)
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Left-hand input tensor on the same device as ``y`` and the output
+            buffer.
+
+        y : torch.Tensor
+            Right-hand input tensor on the same device as ``x`` and the output
+            buffer.
+
+        ctx : Context
+            Execution context passed through to the underlying implementation.
+
+        Returns
+        -------
+        torch.Tensor
+            The output tensor stored in ``self.output_buffer``.
+
+        Raises
+        ------
+        AssertionError
+            If :meth:`profile` has not been called (no implementation or buffer),
+            or if there is a device mismatch between inputs and output.
         """
         prefix = self._prefix()
         assert self.impl is not None, f"{prefix}execute called before profile() (impl is None)"
@@ -106,31 +203,118 @@ class Elementwise_Binary(vOp):
 
 
 class Maximum(Elementwise_Binary):
-    
-    def __init__(self, alpha = 1, beta = 1):
+    r"""
+    Elementwise maximum between two tensors.
+
+    This operator computes the pointwise maximum:
+
+    .. math::
+
+        \operatorname{out}(x, y) = \max(x, y)
+
+    Broadcasting over the ``(C, D)`` axes is supported as described in
+    :class:`Elementwise_Binary`.
+
+    Parameters
+    ----------
+    alpha : float, optional
+        Scalar parameter forwarded to the binary kernel. It is not used
+        by the maximum operation itself. Default is ``1.0``.
+
+    beta : float, optional
+        Scalar parameter forwarded to the binary kernel. It is not used
+        by the maximum operation itself. Default is ``1.0``.
+    """
+    def __init__(self, alpha: float = 1.0, beta: float = 1.0):
         super().__init__(alpha, beta)
         self.op_type = ElementwiseBinaryOpType.Maximum
 
 
 class Minimum(Elementwise_Binary):
-    
-    def __init__(self, alpha = 1, beta = 1):
+    r"""
+    Elementwise minimum between two tensors.
+
+    This operator computes the pointwise minimum:
+
+    .. math::
+
+        \operatorname{out}(x, y) = \min(x, y)
+
+    Broadcasting over the ``(C, D)`` axes is supported as described in
+    :class:`Elementwise_Binary`.
+
+    Parameters
+    ----------
+    alpha : float, optional
+        Scalar parameter forwarded to the binary kernel. It is not used
+        by the minimum operation itself. Default is ``1.0``.
+
+    beta : float, optional
+        Scalar parameter forwarded to the binary kernel. It is not used
+        by the minimum operation itself. Default is ``1.0``.
+    """
+    def __init__(self, alpha: float = 1.0, beta: float = 1.0):
         super().__init__(alpha, beta)
         self.op_type = ElementwiseBinaryOpType.Minimum
         
-        
+
 class Add(Elementwise_Binary):
-    
-    def __init__(self, alpha = 1, beta = 1):
+    r"""
+    Affine combination of two tensors.
+
+    This operator computes a weighted sum of the two inputs:
+
+    .. math::
+
+        \operatorname{out}(x, y) = \alpha x + \beta y
+
+    With the defaults :math:`\alpha = 1` and :math:`\beta = 1`, this
+    reduces to standard elementwise addition:
+
+    .. math::
+
+        \operatorname{out}(x, y) = x + y
+
+    Broadcasting over the ``(C, D)`` axes is supported as described in
+    :class:`Elementwise_Binary`.
+
+    Parameters
+    ----------
+    alpha : float, optional
+        Scalar multiplier for :math:`x`. Default is ``1.0``.
+
+    beta : float, optional
+        Scalar multiplier for :math:`y`. Default is ``1.0``.
+    """
+    def __init__(self, alpha: float = 1.0, beta: float = 1.0):
         super().__init__(alpha, beta)
         self.op_type = ElementwiseBinaryOpType.Add
         
 
 class Multiply(Elementwise_Binary):
-    
-    def __init__(self, alpha = 1, beta = 1):
+    r"""
+    Elementwise product of two tensors.
+
+    This operator computes the pointwise product:
+
+    .. math::
+
+        \operatorname{out}(x, y) = x \cdot y
+
+    Broadcasting over the ``(C, D)`` axes is supported as described in
+    :class:`Elementwise_Binary`.
+
+    Parameters
+    ----------
+    alpha : float, optional
+        Scalar parameter forwarded to the binary kernel. It is not used
+        by the pure multiplication operation itself. Default is ``1.0``.
+
+    beta : float, optional
+        Scalar parameter forwarded to the binary kernel. It is not used
+        by the pure multiplication operation itself. Default is ``1.0``.
+    """
+    def __init__(self, alpha: float = 1.0, beta: float = 1.0):
         super().__init__(alpha, beta)
         self.op_type = ElementwiseBinaryOpType.Mul
-
-
 

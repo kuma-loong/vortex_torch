@@ -8,5 +8,5 @@ vortex\_torch.indexer.triton\_kernels.mv\_impl
 
    .. autosummary::
    
-      triton_mv
+      mv_bpr
    

@@ -7,21 +7,80 @@ from typing import Tuple, Dict, Callable, Optional
 
 
 class GeMM(vOp):
-    """
-    GEMM dispatcher for O = Y @ X^T on page/token tiled layouts.
+    r"""
+    General matrix-matrix multiplication dispatcher for page/token-tiled layouts.
 
-    Layout/shape convention (logical 3D tensors):
-      x: [B, Nx, K]
-      y: [B, Ny, K]
-      o: [B, Ny, Nx]   (i.e., rows from y, cols from x)
+    This operator computes a batched GEMM of the form
 
-    Dispatch key:
-      (x_format, y_format, o_format) -> (impl, resolved_output_format)
+    .. math::
 
-    Policy:
-      - If `output` is None, prefer implementations with o_format == FORMAT.RAGGED.
-      - Otherwise, require an exact (x_fmt, y_fmt, o_fmt) mapping.
-      - K dimension must match: x.shape[2] == y.shape[2].
+        O_b = Y_b X_b^\top, \qquad b = 0, \dots, B-1,
+
+    where, for each batch index :math:`b`,
+
+    - :math:`X_b \in \mathbb{R}^{N_x \times K}`,
+    - :math:`Y_b \in \mathbb{R}^{N_y \times K}`, and
+    - :math:`O_b \in \mathbb{R}^{N_y \times N_x}`.
+
+    In the logical 3D layout used by this dispatcher, the tensors have
+    shapes
+
+    .. math::
+
+        X &\in \mathbb{R}^{B \times N_x \times K}, \\
+        Y &\in \mathbb{R}^{B \times N_y \times K}, \\
+        O &\in \mathbb{R}^{B \times N_y \times N_x},
+
+    where the leading dimension :math:`B` is a batch-like axis typically
+    derived from the runtime (for example,
+    ``max_new_tokens_per_batch * head_num`` in an attention-style kernel).
+
+    Dispatch is based on the triplet of tensor formats
+    ``(x_format, y_format, o_format)`` and a registry mapping:
+
+    .. code-block:: text
+
+        (x_format, y_format, o_format) -> (impl, resolved_output_format)
+
+    Policy
+    ------
+    - If ``output`` is ``None``:
+
+      - :meth:`profile` selects an implementation with
+        ``o_format == FORMAT.RAGGED``, i.e. a key
+        ``(x_fmt, y_fmt, FORMAT.RAGGED)`` in :attr:`_impl_map`.
+      - An internal buffer is allocated with logical shape
+        ``[B, N_y, N_x]`` on the same device and with the same dtype as
+        ``x``.
+
+    - If ``output`` is provided:
+
+      - :meth:`profile` requires an exact implementation key for
+        ``(x_fmt, y_fmt, o_fmt)``.
+      - The shape of ``output`` must be rank-3 with last two dimensions
+        ``(N_y, N_x)``.
+      - Device consistency is enforced across ``x``, ``y`` and ``output``.
+
+    Additionally, the shared inner dimension :math:`K` must match:
+
+    .. math::
+
+        K_x = x.\text{shape}[2], \quad K_y = y.\text{shape}[2], \quad K_x = K_y.
+
+    Attributes
+    ----------
+    _impl_map : Dict[Tuple[FORMAT, FORMAT, FORMAT], Tuple[Callable, FORMAT]]
+        Dispatch table keyed by ``(x_format, y_format, o_format)``. Each
+        entry maps to ``(callable_impl, resolved_output_format)``.
+
+    impl : Optional[Callable]
+        The resolved implementation selected during :meth:`profile`.
+
+    output_format : Optional[FORMAT]
+        The output tensor format as determined in :meth:`profile`.
+
+    output_buffer : Optional[torch.Tensor]
+        Internal output buffer allocated when ``output`` is ``None``.
     """
 
     # Implementation registry:
@@ -35,19 +94,47 @@ class GeMM(vOp):
     }
 
     def __init__(self):
-        
+        r"""
+        Initialize a GEMM dispatcher.
+
+        The dispatcher itself does not take algorithmic parameters; it
+        simply holds the resolved implementation, output format, and
+        optional internal output buffer selected during :meth:`profile`.
+        """
         super().__init__()
         self.impl: Optional[Callable] = None
         self.output_format: Optional[FORMAT] = None
         self.output_buffer: Optional[torch.Tensor] = None
 
-    
     def _infer_impl_ragged(
         self, x_fmt: FORMAT, y_fmt: FORMAT
     ) -> Tuple[Callable, FORMAT]:
-        """
-        Default inference when output is None:
-        choose (x_fmt, y_fmt, FORMAT.RAGGED). Raise if missing.
+        r"""
+        Infer an implementation assuming a RAGGED output format.
+
+        This helper is used when :meth:`profile` is called with
+        ``output is None``. It selects an implementation for the key
+        ``(x_fmt, y_fmt, FORMAT.RAGGED)`` in :attr:`_impl_map`.
+
+        Parameters
+        ----------
+        x_fmt : FORMAT
+            Format of the right-hand operand ``x`` (which is transposed
+            inside the GEMM).
+
+        y_fmt : FORMAT
+            Format of the left-hand operand ``y``.
+
+        Returns
+        -------
+        (Callable, FORMAT)
+            The implementation callable and the resolved output format.
+
+        Raises
+        ------
+        AssertionError
+            If there is no entry for
+            ``(x_fmt, y_fmt, FORMAT.RAGGED)`` in :attr:`_impl_map`.
         """
         key = (x_fmt, y_fmt, FORMAT.RAGGED)
         assert key in self._impl_map, (
@@ -63,6 +150,67 @@ class GeMM(vOp):
     def profile(
         self, x: vTensor, y: vTensor, output: Optional[vTensor], loc: torch.Tensor, ctx: Context
     ) -> vTensor:
+        r"""
+        Validate inputs, resolve the GEMM implementation and output format,
+        and optionally allocate an internal output buffer.
+
+        The logical shapes are:
+
+        - ``x``: ``[B, N_x, K]``
+        - ``y``: ``[B, N_y, K]``
+        - ``output`` (if provided): ``[B_out, N_y, N_x]``
+
+        with the constraint that the inner dimension :math:`K` matches:
+
+        .. math::
+
+            x.\text{shape}[2] = y.\text{shape}[2].
+
+        The auxiliary tensor ``loc`` carries per-position or per-tile
+        metadata used by the implementation (for example, page indices or
+        tiling information); its shape and semantics are kernel-defined.
+
+        Parameters
+        ----------
+        x : vTensor
+            Right-hand operand in ``Y @ X^T``, with logical shape
+            ``[B, N_x, K]``.
+
+        y : vTensor
+            Left-hand operand in ``Y @ X^T``, with logical shape
+            ``[B, N_y, K]``.
+
+        output : Optional[vTensor]
+            Optional preallocated output tensor. If ``None``, an internal
+            buffer with shape ``[B, N_y, N_x]`` is allocated using
+            ``ctx.max_new_tokens_per_batch * ctx.head_num`` for the
+            leading dimension and a RAGGED-output implementation is
+            selected. If not ``None``, this tensor must have rank 3
+            and last two dimensions ``(N_y, N_x)``, with a format
+            compatible with :attr:`_impl_map`.
+
+        loc : torch.Tensor
+            Auxiliary tensor carrying metadata required by the GEMM
+            implementation.
+
+        ctx : Context
+            Execution context that provides the runtime value of ``B``
+            and is used for auxiliary memory accounting.
+
+        Returns
+        -------
+        vTensor
+            A :class:`vTensor` view representing the resolved output:
+            either the provided ``output`` or an internally allocated
+            buffer.
+
+        Raises
+        ------
+        AssertionError
+            If types, ranks, inner-dimension match, formats, shapes, or
+            devices are incompatible, or if no implementation is found
+            in :attr:`_impl_map`.
+        """
         prefix = self._prefix()
 
         # --- type & rank checks ---
@@ -97,7 +245,9 @@ class GeMM(vOp):
 
         # Case B: output provided -> validate and select exact impl
         assert isinstance(output, vTensor), f"{prefix}output must be vTensor, got {type(output)}"
-        assert output.dim() == 3, f"{prefix}output must be 3D, got ndim={output.dim()} shape={tuple(output.shape)}"
+        assert output.dim() == 3, (
+            f"{prefix}output must be 3D, got ndim={output.dim()} shape={tuple(output.shape)}"
+        )
 
         o_fmt = output._format
         key = (x_fmt, y_fmt, o_fmt)
@@ -126,11 +276,52 @@ class GeMM(vOp):
     def execute(
         self, x: torch.Tensor, y: torch.Tensor, output: Optional[torch.Tensor], loc: torch.Tensor, ctx: Context
     ) -> torch.Tensor:
+        r"""
+        Execute the selected GEMM implementation.
+
+        This method assumes that :meth:`profile` has already selected an
+        implementation and, if needed, allocated an internal output buffer.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Plain right-hand operand tensor with shape compatible with the
+            :class:`vTensor` validated in :meth:`profile`.
+
+        y : torch.Tensor
+            Plain left-hand operand tensor with shape compatible with the
+            :class:`vTensor` validated in :meth:`profile`.
+
+        output : Optional[torch.Tensor]
+            Optional preallocated output tensor. If ``None``, the internal
+            buffer created during :meth:`profile` will be used.
+
+        loc : torch.Tensor
+            Auxiliary tensor carrying metadata required by the GEMM
+            implementation.
+
+        ctx : Context
+            Execution context forwarded to the implementation.
+
+        Returns
+        -------
+        torch.Tensor
+            The output tensor written by the implementation: either the
+            provided ``output`` or the internal buffer.
+
+        Raises
+        ------
+        AssertionError
+            If :meth:`profile` has not been called and no implementation or
+            internal buffer is available.
+        """
         prefix = self._prefix()
         assert self.impl is not None, f"{prefix}called before profile() (impl is None)"
 
         if output is None:
-            assert self.output_buffer is not None, f"{prefix}internal output buffer is None; did profile() run?"
+            assert self.output_buffer is not None, (
+                f"{prefix}internal output buffer is None; did profile() run?"
+            )
             output = self.output_buffer
 
         # Expected signature for impl: impl(x, y, output, loc, ctx)

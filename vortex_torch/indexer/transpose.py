@@ -5,9 +5,46 @@ from ..abs import vTensor, as_vtensor, FORMAT, vOp
 from .triton_kernels.transpose_impl import transpose_rr
 
 class Transpose(vOp):
-    """
-    Transpose dispatcher for rank-3 logical tensors [S, D0, D1] -> [S, D1, D0].
-    Dispatch is keyed by the input vTensor's format only.
+    r"""
+    Transpose dispatcher for rank-3 logical tensors.
+
+    This operator transposes the last two dimensions of a rank-3 tensor
+    while keeping the leading axis unchanged. The input is treated as
+
+    .. math::
+
+        X \in \mathbb{R}^{S \times D_0 \times D_1},
+
+    and the output has logical shape
+
+    .. math::
+
+        Y \in \mathbb{R}^{S \times D_1 \times D_0},
+
+    with
+
+    .. math::
+
+        Y[s, d_1, d_0] = X[s, d_0, d_1].
+
+    The leading dimension :math:`S` may represent a true sequence axis or
+    a packed axis (e.g. :math:`S_{\text{pack}} = \sum_b S_b`); the transpose
+    is applied independently for each slice along that axis.
+
+    Dispatch is keyed only by the input tensor format ``x._format``.
+
+    Attributes
+    ----------
+    _impl_map : Dict[FORMAT, Tuple[Callable, FORMAT]]
+        Dispatch table keyed by ``x_format``. Each entry maps to
+        ``(callable_impl, resolved_output_format)``.
+    impl : Optional[Callable]
+        The resolved implementation selected during :meth:`profile`.
+    output_format : Optional[FORMAT]
+        The output tensor format as determined in :meth:`profile`.
+    output_buffer : Optional[torch.Tensor]
+        Preallocated output tensor buffer with logical shape
+        ``[S, D_1, D_0]``.
     """
 
     # Implementation dispatch table: keyed only by x_format.
@@ -26,15 +63,50 @@ class Transpose(vOp):
 
     # ---------------- profile ----------------
     def profile(self, x: vTensor, ctx: Context) -> vTensor:
-        """
-        Validate inputs, choose implementation by x._format, allocate output buffer,
-        and return an as_vtensor view with the resolved format.
+        r"""
+        Validate the input, select an implementation, allocate the output
+        buffer, and return a :class:`vTensor` view with the resolved format.
+
+        The input tensor is expected to have logical shape
+        ``[S_in, D_0, D_1]``. The output buffer is allocated with shape
+
+        .. math::
+
+            [S, D_1, D_0],
+
+        where :math:`S` is taken from ``ctx.max_num_pages`` to match the
+        runtime configuration for the leading dimension.
+
+        Parameters
+        ----------
+        x : vTensor
+            Input tensor to be transposed, with logical shape
+            ``[S_in, D_0, D_1]``.
+
+        ctx : Context
+            Execution context providing ``ctx.max_num_pages`` for the leading
+            dimension and tracking auxiliary memory usage.
+
+        Returns
+        -------
+        vTensor
+            A ``vTensor`` view wrapping the internally allocated output
+            buffer with the resolved output format.
+
+        Raises
+        ------
+        AssertionError
+            If ``x`` is not a :class:`vTensor`, if its rank is not 3, or if
+            no implementation is registered for ``x._format``.
         """
         prefix = self._prefix()
 
         # Type & rank checks
         assert isinstance(x, vTensor), f"{prefix}profile expects x to be vTensor, got {type(x)}"
-        assert x.dim() == 3, f"{prefix}expected 3D input [S, D0, D1], got ndim={x.dim()} shape={tuple(x.shape)}"
+        assert x.dim() == 3, (
+            f"{prefix}expected 3D input [S, D0, D1], "
+            f"got ndim={x.dim()} shape={tuple(x.shape)}"
+        )
 
         # Dispatch by input format
         x_fmt = x._format
@@ -45,7 +117,7 @@ class Transpose(vOp):
         self.impl, self.output_format = self._impl_map[x_fmt]
 
         # Allocate output buffer: [S, D1, D0]
-        # S is derived from runtime context (number of pages/tokens in your pipeline)
+        # S is derived from runtime context (number of pages/tokens in the pipeline)
         S = ctx.max_num_pages
         D0, D1 = x.shape[1], x.shape[2]
         self.output_buffer = torch.empty(
@@ -62,14 +134,40 @@ class Transpose(vOp):
 
     # ---------------- execute ----------------
     def execute(self, x: torch.Tensor, ctx: Context) -> torch.Tensor:
-        """
-        Run the selected implementation using the internal output buffer.
+        r"""
+        Run the selected transpose implementation and return the output buffer.
+
+        The implementation transposes the last two dimensions of ``x`` into
+        the internal buffer stored in :attr:`output_buffer`, leaving the
+        leading dimension unchanged.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor to be transposed, on the same device as the
+            internal output buffer.
+
+        ctx : Context
+            Execution context passed through to the implementation.
+
+        Returns
+        -------
+        torch.Tensor
+            The internally allocated output tensor with shape
+            ``[S, D_1, D_0]``.
+
+        Raises
+        ------
+        AssertionError
+            If :meth:`profile` has not been called and the internal output
+            buffer or implementation is not available.
         """
         prefix = self._prefix()
         assert self.impl is not None, f"{prefix}execute called before profile() (impl is None)"
-        assert self.output_buffer is not None, f"{prefix}internal output buffer is None; did profile() run?"
+        assert self.output_buffer is not None, (
+            f"{prefix}internal output buffer is None; did profile() run?"
+        )
 
-        # Run selected implementation; keep original call signature.
         # Expected signature: impl(x, output, ctx)
         self.impl(x, self.output_buffer, ctx)
         return self.output_buffer
