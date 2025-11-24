@@ -2,7 +2,7 @@ import torch
 from typing import Dict
 
 from .flow import vFlow
-from ..indexer import topK, GeMV, Softmax, Max, Sum, GeMM, Maximum, Multiply
+from ..indexer import topK, GeMV, Softmax, Max, Sum, GeMM, Maximum, Multiply, L2Norm
 from ..cache import Mean as CMean, Max as CMax, Min as CMin
 from ..abs import ContextBase
 from .registry import register
