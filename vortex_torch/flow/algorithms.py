@@ -2,7 +2,7 @@ import torch
 from typing import Dict
 
 from .flow import vFlow
-from ..indexer import topK, GeMV, Softmax, Max, Sum, GeMM, Maximum, Multiply
+from ..indexer import topK, GeMV, Softmax, Max, Sum, GeMM, Maximum, Multiply, L2Norm
 from ..cache import Mean as CMean, Max as CMax, Min as CMin
 from ..abs import ContextBase
 from .registry import register
@@ -565,6 +565,74 @@ class GQADynamicHybridSparseAttention(vFlow):
           - max: max key per dimension
           - min: min key per dimension
         """
+        return {
+            "centroids": (1, head_dim),
+            "max": (1, head_dim),
+            "min": (1, head_dim),
+        }
+
+
+
+@register("gqa_dynamic_entropy_sparse_attention")
+class GQADynamicEntropySparseAttention(vFlow):
+    """
+    Dynamic-entropy gated sparse attention.
+
+    Two scoring paths per page:
+      1) Centroid path with softmax over pages; its query-group energy
+         (L2 norm across queries) forms a confidence gate.
+      2) QUEST-style envelope path (max/min upper bound).
+
+    We scale the centroid score by the confidence and then take an
+    elementwise max with the QUEST score before top-k.
+    """
+    def __init__(self):
+        super().__init__()
+        # Block path
+        self.gemm = GeMM()
+        self.softmax = Softmax(dim=0, scale=0.09)
+        self.max_over_heads = Max(dim=2)
+        self.l2_over_queries = L2Norm(dim=1)
+        self.mul = Multiply()
+        # QUEST path
+        self.mul_max = Multiply()
+        self.mul_min = Multiply()
+        self.maximum = Maximum()
+        self.sum_over_dim = Sum(dim=2)
+        self.max_over_queries = Max(dim=1)
+        # Merge + output
+        self.merge = Maximum()
+        self.output_func = topK()
+        # Cache reductions
+        self.reduction_mean = CMean(dim=1)
+        self.reduction_max = CMax(dim=1)
+        self.reduction_min = CMin(dim=1)
+
+    def forward_indexer(self, q, o, cache: Dict[str, torch.Tensor], ctx: ContextBase):
+        # Block scoring and confidence
+        score_block = self.gemm(q, cache["centroids"], ctx=ctx)
+        self.softmax(score_block, ctx=ctx)
+        aggr_block = self.max_over_heads(score_block, ctx=ctx)
+        conf = self.l2_over_queries(score_block, ctx=ctx)
+        gated_block = self.mul(aggr_block, conf, ctx=ctx)
+
+        # QUEST scoring
+        s_max = self.mul_max(q, cache["max"], ctx=ctx)
+        s_min = self.mul_min(q, cache["min"], ctx=ctx)
+        s = self.maximum(s_max, s_min, ctx=ctx)
+        score_quest = self.sum_over_dim(s, ctx=ctx)
+        aggr_quest = self.max_over_queries(score_quest, ctx=ctx)
+
+        # Merge and select
+        combined = self.merge(gated_block, aggr_quest, ctx=ctx)
+        self.output_func(combined, o, ctx=ctx)
+
+    def forward_cache(self, cache: Dict[str, torch.Tensor], loc: torch.Tensor, ctx: ContextBase):
+        self.reduction_mean(cache["k"], cache["centroids"], loc=loc, ctx=ctx)
+        self.reduction_max(cache["k"], cache["max"], loc=loc, ctx=ctx)
+        self.reduction_min(cache["k"], cache["min"], loc=loc, ctx=ctx)
+
+    def create_cache(self, page_size: int, head_dim: int):
         return {
             "centroids": (1, head_dim),
             "max": (1, head_dim),
