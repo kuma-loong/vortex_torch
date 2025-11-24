@@ -496,75 +496,12 @@ class GQAQuestSparseAttention(vFlow):
         }
 
 
-@register("gqa_hybrid_sparse_attention")
-class GQAHybridSparseAttention(vFlow):
-    r"""
-    Hybrid dynamic sparse attention that combines centroid routing and QUEST-style
-    envelope routing.
+# For agent developers!
+# The ops are not reusable, even if they have the same semantic meaning. Internally, they will initialize different memory buffer.
+# For example, in Quest attention, we need to define two multiply operators.
 
-    Cache tensors (inner shapes):
-    - "centroids": (1, head_dim)
-    - "max":       (1, head_dim)
-    - "min":       (1, head_dim)
-
-    Indexer path:
-    - Path A (centroid): score_c = softmax_S( GeMM(q, centroids) );
-      reduce across grouped queries with Max(dim=1) -> [S, 1, 1].
-    - Path B (QUEST): s = max(q*max, q*min); score_q = Sum(dim=2);
-      reduce across grouped queries with Max(dim=1) -> [S, 1, 1].
-    - Blend: combined = alpha * score_c + (1 - alpha) * score_q.
-      Finally, topK over pages.
-
-    Notes
-    -----
-    - The softmax over S encourages exploration/exploitation behavior across
-      pages; the QUEST envelope contributes a conservative upper bound signal.
-    - alpha in [0,1] weights the two signals (default 0.5/0.5).
-    """
-    def __init__(self, alpha: float = 0.5):
-        super().__init__()
-        # indexer ops
-        self.gemm = GeMM()
-        self.softmax = Softmax(dim=0, scale=0.09)
-        self.max_over_groups = Max(dim=1)      # reduce over H_q
-        self.sum_feat = Sum(dim=2)             # reduce over D
-        self.mul = Multiply()
-        self.maximum = Maximum()
-        self.mix = Add(alpha=alpha, beta=1.0 - alpha)
-        self.output_func = topK()
-
-        # cache ops
-        self.centroid_reduce = CMean(dim=1)
-        self.max_reduce = CMax(dim=1)
-        self.min_reduce = CMin(dim=1)
-
-    def forward_indexer(self, q, o, cache, ctx):
-        # Path A: centroid similarity with S-wise softmax, then group max
-        score_c = self.gemm(q, cache["centroids"], ctx=ctx)
-        self.softmax(score_c, ctx=ctx)
-        aggr_c = self.max_over_groups(score_c, ctx=ctx)  # [S, 1, 1]
-
-        # Path B: QUEST-style upper bound
-        s_max = self.mul(q, cache["max"], ctx=ctx)
-        s_min = self.mul(q, cache["min"], ctx=ctx)
-        s_env = self.maximum(s_max, s_min, ctx=ctx)
-        score_q = self.sum_feat(s_env, ctx=ctx)          # [S, H_q, 1]
-        aggr_q = self.max_over_groups(score_q, ctx=ctx)  # [S, 1, 1]
-
-        # Blend and route
-        combined = self.mix(aggr_c, aggr_q, ctx=ctx)     # [S, 1, 1]
-        self.output_func(combined, o, ctx=ctx)
-
-    def forward_cache(self, cache: Dict[str, torch.Tensor], loc: torch.Tensor, ctx: ContextBase):
-        # Update centroids and envelopes per request in batch-major view
-        self.centroid_reduce(cache["k"], cache["centroids"], loc=loc, ctx=ctx)
-        self.max_reduce(cache["k"], cache["max"], loc=loc, ctx=ctx)
-        self.min_reduce(cache["k"], cache["min"], loc=loc, ctx=ctx)
-
-    def create_cache(self, page_size: int, head_dim: int):
-        return {
-            "centroids": (1, head_dim),
-            "max": (1, head_dim),
-            "min": (1, head_dim),
-        }
+# In forward indexer, q can be viewed as [1, H_q, D] or [B, H_q, D] (B=1) and cache["xxx"] can be viewed as [S, r, c] (r, c defined in create_cache) logically.
+# In forward cache, the cache["xxx"] is viewed as [B, r, c]  (r, c defined in create_cache) logically.
+# Thus, all the tensors have 3 dimensions. Reduce operators (Mean, Max, Min, etc) will always keep the dims.
+# GeMM(x, y) = yx^t, which might be different from typical definitions.
 
