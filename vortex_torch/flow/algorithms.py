@@ -43,10 +43,14 @@ class BlockSparseAttention(vFlow):
 
          .. math::
 
-             o \in \mathbb{R}^{S_{\mathrm{sparse}} \times 1 \times 1},
+             o \in \mathbb{R}^{S} \times 1 \times 1},
 
-         where :math:`S_{\mathrm{sparse}}` is a packed sparse page axis
-         as described in :class:`vFlow`.
+         Here :math:`S` is the leading page axis. Internally it is a packed
+         axis (often denoted :math:`S_{\mathrm{pack}}`), obtained by
+         concatenating the pages from all requests. As a user, you can simply
+         think of :math:`S` as "the number of pages for this request"; the
+         vFlow kernels and :class:`ContextBase` will take care of mapping
+         between per-request page counts and the packed layout automatically.
 
     Cache layout
     ------------
@@ -68,7 +72,7 @@ class BlockSparseAttention(vFlow):
       .. math::
 
           \text{cache["centroids"]} \sim
-          \mathbb{R}^{S_{\mathrm{pack}} \times 1 \times D},
+          \mathbb{R}^{S} \times 1 \times D},
 
     - In :meth:`forward_cache` (batch-major view):
 
@@ -127,8 +131,7 @@ class BlockSparseAttention(vFlow):
             - ``cache["k"]`` and ``cache["v"]`` are page-packed key/value
               tensors,
             - ``cache["centroids"]`` is interpreted as
-              ``[S_pack, 1, D]`` (page-packed centroids), with
-              :math:`S_{\mathrm{pack}} = \sum_i S_i`.
+              ``[S, 1, D]`` (page-packed centroids).
 
         ctx : ContextBase
             Runtime context carrying page layout, top-k configuration
@@ -214,7 +217,7 @@ class BlockSparseAttention(vFlow):
             - ``"centroids"`` with inner shape ``(1, head_dim)``, which
               becomes
 
-              - ``[S_pack, 1, head_dim]`` in :meth:`forward_indexer`,
+              - ``[S, 1, head_dim]`` in :meth:`forward_indexer`,
               - ``[B, 1, head_dim]`` in :meth:`forward_cache`.
         """
         return {
@@ -235,9 +238,15 @@ class GQABlockSparseAttention(vFlow):
     - Centroids cache ``cache["centroids"]`` has inner shape
       ``(1, head_dim)`` and is viewed as:
 
-      - ``[S_pack, 1, D]`` in :meth:`forward_indexer`,
+      - ``[S, 1, D]`` in :meth:`forward_indexer`,
       - ``[B, 1, D]`` in :meth:`forward_cache`.
-
+      Here :math:`S` is the leading page axis. Internally it is a packed
+      axis (often denoted :math:`S_{\mathrm{pack}}`), obtained by
+      concatenating the pages from all requests. As a user, you can simply
+      think of :math:`S` as "the number of pages for this request"; the
+      vFlow kernels and :class:`ContextBase` will take care of mapping
+      between per-request page counts and the packed layout automatically.
+      
     For a design similar in spirit to grouped-query block sparsity, see
     the GQA sparse attention formulation in:
 
@@ -270,8 +279,8 @@ class GQABlockSparseAttention(vFlow):
         1. Apply :class:`GeMM` between queries and centroids:
 
            - ``q``: ``[B, H_q, D]``
-           - ``cache["centroids"]`` (indexer view): ``[S_pack, 1, D]``
-           - ``score``: ``[S_pack, H_q, 1]`` (logical ``[S, Ny, Nx]``)
+           - ``cache["centroids"]`` (indexer view): ``[S, 1, D]``
+           - ``score``: ``[S, H_q, 1]`` (logical ``[S, Ny, Nx]``)
 
         2. Apply in-place softmax over the leading (page) axis with a
            scaling factor ``scale``:
@@ -352,12 +361,19 @@ class GQAQuestSparseAttention(vFlow):
       - ``cache["max"]`` and ``cache["min"]``: ``(1, head_dim)``
         → viewed as
 
-        - ``[S_pack, 1, D]`` in :meth:`forward_indexer`,
+        - ``[S, 1, D]`` in :meth:`forward_indexer`,
         - ``[B, 1, D]`` in :meth:`forward_cache`.
 
       - ``cache["k"]``: standard key cache with inner shape
         ``(page_size, head_dim)``.
 
+      Here :math:`S` is the leading page axis. Internally it is a packed
+      axis (often denoted :math:`S_{\mathrm{pack}}`), obtained by
+      concatenating the pages from all requests. As a user, you can simply
+      think of :math:`S` as "the number of pages for this request"; the
+      vFlow kernels and :class:`ContextBase` will take care of mapping
+      between per-request page counts and the packed layout automatically.
+      
     Routing intuition
     -----------------
     For each query and page envelope:
@@ -401,15 +417,15 @@ class GQAQuestSparseAttention(vFlow):
         Let:
 
         - ``q``: ``[B, H_q, D]``
-        - ``cache["max"]``: ``[S_pack, 1, D]``
-        - ``cache["min"]``: ``[S_pack, 1, D]``
+        - ``cache["max"]``: ``[S, 1, D]``
+        - ``cache["min"]``: ``[S, 1, D]``
 
         Steps:
 
         1. ``s_max = q * max_envelope``
         2. ``s_min = q * min_envelope``
         3. ``s = max(s_max, s_min)`` (elementwise)
-        4. ``score = sum(s, dim=D)`` → ``[S_pack, H_q, 1]``
+        4. ``score = sum(s, dim=D)`` → ``[S, H_q, 1]``
         5. ``aggr_score = max(score, dim=H_q)`` → per-page scalar
         6. :class:`topK` converts ``aggr_score`` into sparse page
            indices ``o`` of shape ``[S_sparse, 1, 1]``.
@@ -468,106 +484,3 @@ class GQAQuestSparseAttention(vFlow):
             "max": (1, head_dim),
             "min": (1, head_dim),
         }
-
-
-
-# Generated by GPT5.1
-@register("gqa_dynamic_hybrid_sparse_attention")
-class GQADynamicHybridSparseAttention(vFlow):
-    """
-    Dynamic hybrid sparse attention:
-      - Maintains mean, max, and min statistics per block.
-      - Uses a block-sparse (centroid-based) score path.
-      - Uses a Quest-style (max/min) score path.
-      - Combines them via element-wise max as a dynamic gating signal.
-    """
-
-    def __init__(self):
-        super().__init__()
-
-        # ----- indexer ops -----
-        # Block-style scoring
-        self.gemm = GeMM()
-        self.softmax = Softmax(dim=0, scale=0.09)
-        self.max_over_heads = Max(dim=2)   # same as GQABlockSparseAttention
-
-        # Quest-style scoring
-        self.mul_max = Multiply()
-        self.mul_min = Multiply()
-        self.max_elementwise = Maximum()
-        self.sum_over_dim = Sum(dim=2)     # same as GQAQuestSparseAttention
-        self.max_over_queries = Max(dim=1)
-
-        # Combine block + quest scores
-        self.merge_scores = Maximum()      # element-wise max between the two scores
-
-        # Final selection
-        self.output_func = topK()
-
-        # ----- cache ops -----
-        self.reduction_mean = CMean(dim=1)  # centroids
-        self.reduction_max = CMax(dim=1)    # per-dim max
-        self.reduction_min = CMin(dim=1)    # per-dim min
-
-    def forward_indexer(self, q, o, cache: Dict[str, torch.Tensor], ctx: ContextBase):
-        """
-        q: query tensor (GQA-packed)
-        o: indexer output tensor (indices / scores buffer for topK)
-        cache: contains "centroids", "max", "min"
-        """
-
-        # ---- 1. Block-style centroid scoring ----
-        # score_block: [*, *, num_blocks] (same shape as in GQABlockSparseAttention)
-        score_block = self.gemm(q, cache["centroids"], ctx=ctx)
-        self.softmax(score_block, ctx=ctx)
-        # Aggregate over heads → [*, num_blocks]
-        aggr_block = self.max_over_heads(score_block, ctx=ctx)
-
-        # ---- 2. Quest-style max/min gating ----
-        # Element-wise products with cached max/min stats
-        s_max = self.mul_max(q, cache["max"], ctx=ctx)
-        s_min = self.mul_min(q, cache["min"], ctx=ctx)
-
-        # Take the element-wise max between the two projections
-        s = self.max_elementwise(s_max, s_min, ctx=ctx)
-
-        # Sum over feature dimension → [num_queries, num_heads, num_blocks]
-        score_quest = self.sum_over_dim(s, ctx=ctx)
-
-        # Aggregate over queries → [num_heads, num_blocks] or [*, num_blocks]
-        aggr_quest = self.max_over_queries(score_quest, ctx=ctx)
-
-        # ---- 3. Dynamic merge ----
-        # For each block, take whichever score (block vs quest) is stronger
-        # This yields a per-block dynamic gate.
-        combined_score = self.merge_scores(aggr_block, aggr_quest, ctx=ctx)
-
-        # ---- 4. Top-K block selection ----
-        self.output_func(combined_score, o, ctx=ctx)
-
-    def forward_cache(self, cache: Dict[str, torch.Tensor], loc: torch.Tensor, ctx: ContextBase):
-        """
-        cache["k"]: full key buffer for the page
-        loc: index of the page / block being updated
-        """
-
-        # Update mean (centroids)
-        self.reduction_mean(cache["k"], cache["centroids"], loc=loc, ctx=ctx)
-
-        # Update per-dimension maxima and minima
-        self.reduction_max(cache["k"], cache["max"], loc=loc, ctx=ctx)
-        self.reduction_min(cache["k"], cache["min"], loc=loc, ctx=ctx)
-
-    def create_cache(self, page_size: int, head_dim: int):
-        """
-        For each block/page we maintain:
-          - centroids: mean key per dimension
-          - max: max key per dimension
-          - min: min key per dimension
-        """
-        return {
-            "centroids": (1, head_dim),
-            "max": (1, head_dim),
-            "min": (1, head_dim),
-        }
-

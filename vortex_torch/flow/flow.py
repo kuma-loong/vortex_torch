@@ -81,18 +81,20 @@ class vFlow(ABC):
        .. math::
 
            \text{cache[key]} \sim
-           \mathbb{R}^{S_{\text{pack}} \times r \times c},
+           \mathbb{R}^{S \times r \times c},
 
-       where
+       
 
-       .. math::
-
-           S_{\text{pack}} = \sum_{i=0}^{B-1} S_i
-
-       is the total number of pages packed across all requests, and
        :math:`(r, c)` is the per-key inner shape declared via
        :meth:`create_cache` or implicitly for ``"k"``/``"v"``.
 
+        Here :math:`S` is the leading page axis. Internally it is a packed
+        axis (often denoted :math:`S_{\mathrm{pack}}`), obtained by
+        concatenating the pages from all requests. As a user, you can simply
+        think of :math:`S` as "the number of pages for this request"; the
+        vFlow kernels and :class:`ContextBase` will take care of mapping
+        between per-request page counts and the packed layout automatically.
+    
     2. **Cache-update view (batch-major)** — used in :meth:`forward_cache`:
 
        .. math::
@@ -140,7 +142,7 @@ class vFlow(ABC):
                {\text{page_size} \cdot \text{head_dim}}.
 
     This ignores the leading dimension (whether :math:`B` or
-    :math:`S_{\text{pack}}`) and compares only inner shapes to the
+    :math:`S`) and compares only inner shapes to the
     baseline ``(page_size, head_dim)``.
 
     Subclass responsibilities
@@ -149,7 +151,7 @@ class vFlow(ABC):
 
     - :meth:`forward_indexer(q, o, cache, ctx)`:
       compute sparse page indices (or routing scores) from queries,
-      using cache in the :math:`S_{\text{pack}}` view.
+      using cache in the :math:`S` view.
 
     - :meth:`forward_cache(cache, loc, ctx)`:
       update cache tensors using the :math:`B`-major view and positional
@@ -203,9 +205,8 @@ class vFlow(ABC):
           .. math::
 
               \text{cache[key]}
-              \sim \mathbb{R}^{S_{\text{pack}} \times r \times c},
+              \sim \mathbb{R}^{S \times r \times c},
 
-          where :math:`S_{\text{pack}} = \sum_i S_i` and
           :math:`(r, c)` are the per-key inner dimensions obtained from
           :meth:`get_cache_meta_info`.
 
@@ -219,7 +220,7 @@ class vFlow(ABC):
         --------
         Implementations should:
 
-        - interpret ``cache`` in the :math:`S_{\text{pack}}` view,
+        - interpret ``cache`` in the :math:`S` view,
         - use ``q`` and relevant cache tensors to score/select pages,
         - respect per-request bounds derived from ``ctx``,
         - write the resulting sparse indices (or routing representation)
@@ -291,7 +292,7 @@ class vFlow(ABC):
 
         This method **does not allocate** tensors. It only declares the
         per-key inner dimensions :math:`(r, c)`; the runtime will attach
-        the appropriate leading axis (:math:`B` or :math:`S_{\text{pack}}`)
+        the appropriate leading axis (:math:`B` or :math:`S`)
         depending on whether the cache is used in :meth:`forward_cache`
         or :meth:`forward_indexer`.
 
@@ -357,7 +358,7 @@ class vFlow(ABC):
         Dict[str, Tuple[int, int]]
             Mapping from cache tensor names to inner shapes ``(r, c)``.
             The runtime will later prepend either a batch axis ``B`` or a
-            packed-page axis ``S_pack`` when materializing the tensors.
+            packed-page axis ``S`` when materializing the tensors.
 
         Raises
         ------
@@ -392,7 +393,7 @@ class vFlow(ABC):
               \frac{r_{\text{key}} \cdot c_{\text{key}}}
                    {\text{page_size} \cdot \text{head_dim}}.
 
-        The leading dimension (:math:`B` or :math:`S_{\text{pack}}`) is
+        The leading dimension (:math:`B` or :math:`S`) is
         not included in this ratio on purpose; it is a per-page
         normalization.
 
