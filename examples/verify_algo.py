@@ -50,7 +50,8 @@ def verify_algos(
 trials: int = 2,
 topk_val: int = 30,
 vortex_module_name: str = "gqa_block_sparse_attention",
-model_name: str = "Qwen/Qwen3-1.7B"
+model_name: str = "Qwen/Qwen3-1.7B",
+sparse_attention: bool = True
 ):  
 
     llm = sgl.Engine(model_path=model_name, 
@@ -59,7 +60,7 @@ model_name: str = "Qwen/Qwen3-1.7B"
                     vortex_topk_val=topk_val,   
                     disable_overlap_schedule=True,
                     attention_backend="flashinfer",
-                    enable_vortex_sparsity=True,
+                    enable_vortex_sparsity=sparse_attention,
                     vortex_page_reserved_bos=1,
                     vortex_page_reserved_eos=2,
                     vortex_layers_skip=list(range(1)),
@@ -180,6 +181,13 @@ def parse_args():
         help='HuggingFace model name to load (default: "Qwen/Qwen3-1.7B").',
     )
 
+    parser.add_argument(
+        "-f", "--full-attention",
+        action="store_true",
+        help="Use full attention instead of vortex sparse attention.",
+    )
+
+
     return parser.parse_args()
 
 if __name__ == "__main__":
@@ -190,6 +198,7 @@ if __name__ == "__main__":
         topk_val=args.topk_val,
         vortex_module_name=args.vortex_module_name,
         model_name=args.model_name,
+        sparse_attention=not(args.full_attention)
     )
     print(summary)
 
