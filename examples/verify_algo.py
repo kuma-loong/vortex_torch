@@ -153,6 +153,4 @@ model_name: str = "Qwen/Qwen3-1.7B"
 if __name__ == "__main__":
    summary = verify_algos()
    print(summary)
-   summary = verify_algos()
-   print(summary)
 
