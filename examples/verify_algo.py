@@ -53,8 +53,7 @@ vortex_module_name: str = "gqa_block_sparse_attention",
 model_name: str = "Qwen/Qwen3-1.7B"
 ):  
     
-    current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    output_file = f"{current_time}.jsonl"
+
     llm = sgl.Engine(model_path=model_name, 
                     disable_cuda_graph=False,
                     page_size=16,
@@ -149,12 +148,13 @@ model_name: str = "Qwen/Qwen3-1.7B"
     
     results.insert(0, global_summary)
 
-    with jsonlines.open(output_file, "w") as f:
-        f.write_all(results)
+    del llm
 
     return global_summary
 
 if __name__ == "__main__":
+   summary = verify_algos()
+   print(summary)
    summary = verify_algos()
    print(summary)
 
