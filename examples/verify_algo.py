@@ -51,7 +51,8 @@ trials: int = 2,
 topk_val: int = 30,
 vortex_module_name: str = "gqa_block_sparse_attention",
 model_name: str = "Qwen/Qwen3-1.7B",
-sparse_attention: bool = True
+sparse_attention: bool = True,
+mem: float = 0.8
 ):  
 
     llm = sgl.Engine(model_path=model_name, 
@@ -66,7 +67,7 @@ sparse_attention: bool = True
                     vortex_layers_skip=list(range(1)),
                     vortex_module_name=vortex_module_name,
                     vortex_max_seq_lens=12288,
-                    mem_fraction_static=0.8
+                    mem_fraction_static=mem
                     )
     
     dataset = load_dataset("math-ai/amc23", split="test")
@@ -187,7 +188,12 @@ def parse_args():
         help="Use full attention instead of vortex sparse attention.",
     )
 
-
+    parser.add_argument(
+        "--mem",
+        type=float,
+        default=0.8,
+        help="memory fraction in sglang",
+    )
     return parser.parse_args()
 
 if __name__ == "__main__":
@@ -198,7 +204,8 @@ if __name__ == "__main__":
         topk_val=args.topk_val,
         vortex_module_name=args.vortex_module_name,
         model_name=args.model_name,
-        sparse_attention=not(args.full_attention)
+        sparse_attention=not(args.full_attention),
+        mem=args.mem
     )
     print(summary)
 

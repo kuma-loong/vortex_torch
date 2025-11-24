@@ -500,6 +500,7 @@ class GQAQuestSparseAttention(vFlow):
 # For agent developers!
 # The ops are not reusable, even if they have the same semantic meaning. Internally, they will initialize different memory buffer.
 # For example, in Quest attention, we need to define two multiply operators.
+# In the entire flow, native torch Ops are only allowed to apply to q in forward_indexer. For other tensors, please use vortex_torch ops in indexer/ and cache/.
 
 # In forward indexer, q can be viewed as [1, H_q, D] or [B, H_q, D] (B=1) and cache["xxx"] can be viewed as [S, r, c] (r, c defined in create_cache) logically.
 # In forward cache, the cache["xxx"] is viewed as [B, r, c]  (r, c defined in create_cache) logically.
