@@ -7,6 +7,16 @@ from ..cache import Mean as CMean, Max as CMax, Min as CMin
 from ..abs import ContextBase
 from .registry import register
 
+# The ops are not reusable, even if they have the same semantic meaning. Internally, they will initialize different memory buffer.
+# For example, in Quest attention, we need to define two multiply operators.
+
+# In forward indexer, q can be viewed as [1, H_q, D] or [B, H_q, D] (B=1) and cache["xxx"] can be viewed as [S, r, c] (r, c defined in create_cache) logically.
+# In forward cache, the cache["xxx"] is viewed as [B, r, c]  (r, c defined in create_cache) logically.
+# Thus, all the tensors have 3 dimensions. Reduce operators (Mean, Max, Min, etc) will always keep the dims.
+# GeMM(x, y) = yx^t, which might be different from typical definitions.
+
+
+
 @register("block_sparse_attention")
 class BlockSparseAttention(vFlow):
     r"""
@@ -276,11 +286,11 @@ class GQABlockSparseAttention(vFlow):
 
         Pipeline
         --------
-        1. Apply :class:`GeMM` between queries and centroids:
+        1. Apply :class:`GeMM` between queries and centroids (o = yx^t):
 
            - ``q``: ``[B, H_q, D]``
            - ``cache["centroids"]`` (indexer view): ``[S, 1, D]``
-           - ``score``: ``[S, H_q, 1]`` (logical ``[S, Ny, Nx]``)
+           - ``score``: ``[S, 1, H_q]`` (logical ``[S, Ny, Nx]``)
 
         2. Apply in-place softmax over the leading (page) axis with a
            scaling factor ``scale``:
