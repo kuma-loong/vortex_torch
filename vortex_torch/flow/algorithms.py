@@ -2,8 +2,8 @@ import torch
 from typing import Dict
 
 from .flow import vFlow
-from ..indexer import topK, GeMV, Softmax, Max, Sum, GeMM, Maximum, Multiply, Add
-from ..cache import Mean as CMean, Max as CMax, Min as CMin
+from ..indexer import topK, GeMV, Softmax, Max, Sum, GeMM, Maximum, Multiply, Add, L2Norm, Save, Load
+from ..cache import Mean as CMean, Max as CMax, Min as CMin, L2Norm as CL2Norm
 from ..abs import ContextBase
 from .registry import register
 
@@ -12,6 +12,7 @@ from .registry import register
 
 # In forward indexer, q can be viewed as [1, H_q, D] or [B, H_q, D] (B=1) and cache["xxx"] can be viewed as [S, r, c] (r, c defined in create_cache) logically.
 # In forward cache, the cache["xxx"] is viewed as [B, r, c]  (r, c defined in create_cache) logically.
+# In forward cache, each page is computed only once if page_id appears in loc. During the entire computation, each page id will appear in loc only once.
 # Thus, all the tensors have 3 dimensions. Reduce operators (Mean, Max, Min, etc) will always keep the dims.
 # GeMM(x, y) = yx^t, which might be different from typical definitions.
 
@@ -504,6 +505,10 @@ class GQAQuestSparseAttention(vFlow):
 
 # In forward indexer, q can be viewed as [1, H_q, D] or [B, H_q, D] (B=1) and cache["xxx"] can be viewed as [S, r, c] (r, c defined in create_cache) logically.
 # In forward cache, the cache["xxx"] is viewed as [B, r, c]  (r, c defined in create_cache) logically.
+# In forward cache, each page is computed only once if page_id appears in loc. During the entire computation, each page id will appear in loc only once. Thus, users cannot accumulate tensors through forward_cache.
 # Thus, all the tensors have 3 dimensions. Reduce operators (Mean, Max, Min, etc) will always keep the dims.
-# GeMM(x, y) = yx^t, which might be different from typical definitions.
 
+# Tips 1: GeMM(x, y) = yx^t, which might be different from typical definitions.
+# Tips 2: Except cache["k"], cache["v"] can also be used in forward_cache to collect information (e.g, the norm of v)
+# Tips 3: Quest series perform not very well in downstream tasks. Above is just an example.
+# Tips 4: 
