@@ -13,6 +13,7 @@ for algo in "${sparse_algos[@]}"; do
     --trials 8 \
     --topk-val 30 \
     --vortex-module-name "${algo}" \
-    --model-name Qwen/Qwen3-1.7B
+    --model-name Qwen/Qwen3-1.7B \
+    --mem 0.8
 done
 
