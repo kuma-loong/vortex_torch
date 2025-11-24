@@ -52,7 +52,6 @@ topk_val: int = 30,
 vortex_module_name: str = "gqa_block_sparse_attention",
 model_name: str = "Qwen/Qwen3-1.7B"
 ):  
-    
 
     llm = sgl.Engine(model_path=model_name, 
                     disable_cuda_graph=False,
@@ -146,8 +145,7 @@ model_name: str = "Qwen/Qwen3-1.7B"
         "throughput": total_tokens / e2e_time
     }
     
-    results.insert(0, global_summary)
-
+   
     del llm
 
     return global_summary
