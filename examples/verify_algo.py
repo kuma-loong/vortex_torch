@@ -7,10 +7,10 @@ from lighteval.metrics.dynamic_metrics import (
 )
 from lighteval.tasks.requests import Doc
 from lighteval.utils.language import Language
-import jsonlines
 from lighteval.models.model_output import ModelResponse
-from datetime import datetime
 from datasets import load_dataset, Dataset, concatenate_datasets
+import argparse
+
 
 MATH_QUERY_TEMPLATE = """
 Solve the following math problem efficiently and clearly.  The last line of your response should be of the following format: 'Therefore, the final answer is: $\\boxed{{ANSWER}}$. I hope it is correct' (without quotes) where ANSWER is just the final number or expression that solves the problem. Think step by step before answering.
@@ -145,12 +145,51 @@ model_name: str = "Qwen/Qwen3-1.7B"
         "throughput": total_tokens / e2e_time
     }
     
-   
-    del llm
-
     return global_summary
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Run vortex_torch verify_algos benchmark."
+    )
+
+    parser.add_argument(
+        "--trials",
+        type=int,
+        default=2,
+        help="Number of trials to run (default: 2).",
+    )
+
+    parser.add_argument(
+        "--topk-val",
+        type=int,
+        default=30,
+        help="Top-k value to use in the algorithm (default: 30).",
+    )
+
+    parser.add_argument(
+        "--vortex-module-name",
+        type=str,
+        default="gqa_block_sparse_attention",
+        help='Name of the vortex module to test (default: "gqa_block_sparse_attention").',
+    )
+
+    parser.add_argument(
+        "--model-name",
+        type=str,
+        default="Qwen/Qwen3-1.7B",
+        help='HuggingFace model name to load (default: "Qwen/Qwen3-1.7B").',
+    )
+
+    return parser.parse_args()
+
 if __name__ == "__main__":
-   summary = verify_algos()
-   print(summary)
+    args = parse_args()
+
+    summary = verify_algos(
+        trials=args.trials,
+        topk_val=args.topk_val,
+        vortex_module_name=args.vortex_module_name,
+        model_name=args.model_name,
+    )
+    print(summary)
 
