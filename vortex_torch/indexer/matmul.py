@@ -140,7 +140,13 @@ class GeMV(vOp):
             dtype=x.dtype,
         )
         ctx.add_aux_memory(self.output_buffer)
-
+        
+        for t in [x, y]:
+            if t._format == FORMAT.PAGED:
+                ctx.add_aux_flops(
+                    t.shape[1] * t.shape[2]
+                )
+                
         return as_vtensor(self.output_buffer, self.output_format)
 
     # ---------------- execute ----------------
@@ -336,7 +342,13 @@ class GeMM(vOp):
             dtype=x.dtype,
         )
         ctx.add_aux_memory(self.output_buffer)
-
+        
+        for t in [x, y]:
+            if t._format == FORMAT.PAGED:
+                ctx.add_aux_flops(
+                    t.shape[1] * t.shape[2]
+                )
+                
         return as_vtensor(self.output_buffer, self.output_format)
 
     # ---------------- execute ----------------

@@ -150,6 +150,12 @@ class Softmax(vOp):
         )
         self.impl, self.output_format = self._impl_map[x_fmt]
 
+        for t in [x]:
+            if t._format == FORMAT.PAGED:
+                ctx.add_aux_flops(
+                    t.shape[1] * t.shape[2]
+                )
+                
         # In-place: return the same vTensor view
         return x
 
@@ -335,6 +341,12 @@ class Normalize(vOp):
         )
         self.impl, self.output_format = self._impl_map[x_fmt]
 
+        for t in [x]:
+            if t._format == FORMAT.PAGED:
+                ctx.add_aux_flops(
+                    t.shape[1] * t.shape[2]
+                )
+                
         # In-place: return the same vTensor view
         return x
 

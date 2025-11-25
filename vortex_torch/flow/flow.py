@@ -416,3 +416,46 @@ class vFlow(ABC):
         for (_, cache_shape) in self.get_cache_meta_info(page_size, head_dim).items():
             token_ratio += (cache_shape[0] * cache_shape[1]) / (page_size * head_dim)
         return token_ratio
+
+    def run_indexer_virtual(self, group_size: int, page_size: int, head_dim: int):
+        
+        from ..indexer import Context as IContext
+        from ..abs import as_vtensor, FORMAT
+        
+        ctx = IContext()
+        
+        ctx.group_size = group_size
+        ctx.num_kv_heads = 1
+        ctx.num_qo_heads = group_size
+        ctx.head_dim = head_dim
+        ctx.page_size = page_size
+        ctx.max_num_pages = 0
+        ctx.max_num_pages_per_request = 0
+        
+        device = "cuda"
+        dtype = torch.bfloat16
+        
+        with torch.no_grad():
+                # Dummy placeholders: used only for kernel / graph warm-up
+                q_dummy = as_vtensor(torch.empty((1, group_size, head_dim), device=device, dtype=dtype), FORMAT.BATCHED)
+                o_dummy = as_vtensor(torch.empty((0, 1, 1), device=device, dtype=dtype), FORMAT.RAGGED)
+                cache_meta_info = self.get_cache_meta_info(page_size, head_dim)
+                
+                cache_dummy = {
+                        cache_name:  as_vtensor(torch.zeros(
+                                (0, cache_shape[0], cache_shape[1]),
+                                dtype=dtype,
+                                device=device,
+                            ), FORMAT.PAGED)
+                        
+                        for (cache_name, cache_shape) in cache_meta_info.items()
+                    }
+                
+                self.forward_indexer(q_dummy, o_dummy, cache_dummy, ctx=ctx)
+
+        del q_dummy
+        del o_dummy
+        del cache_dummy
+    
+        return ctx._aux_total_flops
+    

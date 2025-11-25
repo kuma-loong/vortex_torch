@@ -26,6 +26,9 @@ class Context(ContextBase):
         
         # auxilary memory in graph
         "_aux_total_bytes",
+        
+        # auxilary flops in graph
+        "_aux_total_flops"
     )
     
     # --- index tensors ---
@@ -68,6 +71,7 @@ class Context(ContextBase):
 
     # --- auxiliary ---
     _aux_total_bytes: int            #: Accumulated auxiliary memory in bytes.
+    _aux_total_flops: int            #: Accumulated auxiliary flops.
     
     def __init__(self) -> None:
         # Start as an empty shell (no big allocations).
@@ -78,6 +82,8 @@ class Context(ContextBase):
                 object.__setattr__(self, name, "Indexer")
             elif name == "_aux_total_bytes":
                 object.__setattr__(self, name, 0)  # start from 0 bytes
+            elif name == "_aux_total_flops":
+                object.__setattr__(self, name, 0)  # start from 0 flops
             elif name == "batch_size":
                 object.__setattr__(self, name, 0)
             elif name == "mode":

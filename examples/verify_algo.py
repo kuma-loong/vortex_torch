@@ -1,5 +1,6 @@
 import sglang as sgl
-from transformers import AutoTokenizer
+import vortex_torch
+from transformers import AutoTokenizer, AutoConfig
 from lighteval.metrics.dynamic_metrics import (
     ExprExtractionConfig,
     LatexExtractionConfig,
@@ -49,6 +50,7 @@ def generate_requests(dataset: Dataset, field_name: str, data_format: str, trial
 def verify_algos(
 trials: int = 2,
 topk_val: int = 30,
+page_size: int = 16,
 vortex_module_name: str = "gqa_block_sparse_attention",
 model_name: str = "Qwen/Qwen3-1.7B",
 sparse_attention: bool = True,
@@ -57,7 +59,7 @@ mem: float = 0.8
 
     llm = sgl.Engine(model_path=model_name, 
                     disable_cuda_graph=False,
-                    page_size=16,
+                    page_size=page_size,
                     vortex_topk_val=topk_val,   
                     disable_overlap_schedule=True,
                     attention_backend="flashinfer",
@@ -138,13 +140,23 @@ mem: float = 0.8
         else:
             unique_result[item['query']] = max(item["score"], unique_result[item['query']])
 
+    
+    llm_cfg = AutoConfig.from_pretrained(model_name)
+    flow = vortex_torch.flow.build_vflow(vortex_module_name) 
+    memory_access_runtime = flow.run_indexer_virtual(
+        group_size=llm_cfg.num_attention_heads // llm_cfg.num_key_value_heads,
+        page_size=page_size,
+        head_dim=llm_cfg.head_dim,
+    )
+    
     global_summary = {
         f'mean@{trials}': total_accuracy / count if count > 0 else 0,
         f'pass@{trials}': sum(unique_result.values()) / len(unique_result),
         'total_example': count,
         "e2e_time": e2e_time,
         "total_tokens": total_tokens, 
-        "throughput": total_tokens / e2e_time
+        "throughput": total_tokens / e2e_time,
+        "memory_access_runtime (per page)": memory_access_runtime
     }
     
     return global_summary
@@ -166,6 +178,13 @@ def parse_args():
         type=int,
         default=30,
         help="Top-k value to use in the algorithm (default: 30).",
+    )
+    
+    parser.add_argument(
+        "--page-size",
+        type=int,
+        default=16,
+        help="Page Size for Sglang (default: 16).",
     )
 
     parser.add_argument(
@@ -202,6 +221,7 @@ if __name__ == "__main__":
     summary = verify_algos(
         trials=args.trials,
         topk_val=args.topk_val,
+        page_size=args.page_size,
         vortex_module_name=args.vortex_module_name,
         model_name=args.model_name,
         sparse_attention=not(args.full_attention),

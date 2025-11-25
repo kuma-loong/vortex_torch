@@ -2,9 +2,10 @@
 set -e
 
 sparse_algos=(
-  "gqa_block_sparse_attention"
-  "gqa_quest_sparse_attention"
-  "block_sparse_attention"
+  "gqa_value_aware_sparse_attention"
+  # "gqa_block_sparse_attention"
+  # "gqa_quest_sparse_attention"
+  # "block_sparse_attention"
 )
 
 for algo in "${sparse_algos[@]}"; do

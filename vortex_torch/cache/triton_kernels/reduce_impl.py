@@ -40,7 +40,7 @@ DIM: tl.constexpr           # 1: over rows (axis=0) -> len x_D1; 2: over cols (a
         elif REDUCE_TYPE == 2:     # Min
             reduce_vec = tl.min(page_block, axis=0).to(tl.bfloat16)
         else:                      # L2Norm
-            s = tl.sum(page_block * page_block, axis=0)
+            s = tl.sum(page_block * page_block, axis=0).to(tl.float32)
             reduce_vec = tl.sqrt(s).to(tl.bfloat16)
 
         dst_ptr = output + page_id * x_D1 + tl.arange(0, x_D1)
@@ -55,7 +55,7 @@ DIM: tl.constexpr           # 1: over rows (axis=0) -> len x_D1; 2: over cols (a
         elif REDUCE_TYPE == 2:     # Min
             reduce_vec = tl.min(page_block, axis=1).to(tl.bfloat16)
         else:                      # L2Norm
-            s = tl.sum(page_block * page_block, axis=1)
+            s = tl.sum(page_block * page_block, axis=1).to(tl.float32)
             reduce_vec = tl.sqrt(s).to(tl.bfloat16)
 
         dst_ptr = output + page_id * x_D0 + tl.arange(0, x_D0)
@@ -172,7 +172,7 @@ def reduce_rp_kernel(
             reduce_vec = tl.min(page_block, axis=0).to(tl.bfloat16)
         else:                   # L2Norm (sqrt(sum(x*x))); NOT RMS
             # For RMS, use: tl.sqrt(tl.sum(page_block*page_block, axis=0) / x_D0)
-            s = tl.sum(page_block * page_block, axis=0)
+            s = tl.sum(page_block * page_block, axis=0).to(tl.float32)
             reduce_vec = tl.sqrt(s).to(tl.bfloat16)
 
         # Write to output: layout [num_pages, x_D1] for DIM==1.
@@ -190,7 +190,7 @@ def reduce_rp_kernel(
         elif REDUCE_TYPE == 2:  # Min
             reduce_vec = tl.min(page_block, axis=1).to(tl.bfloat16)
         else:                   # L2Norm (sqrt(sum(x*x))); NOT RMS
-            s = tl.sum(page_block * page_block, axis=1)
+            s = tl.sum(page_block * page_block, axis=1).to(tl.float32)
             reduce_vec = tl.sqrt(s).to(tl.bfloat16)
 
         # Write to output: layout [num_pages, x_D0] for DIM==2.
@@ -310,7 +310,7 @@ DIM: tl.constexpr                # 1: reduce over rows -> len x_D1; 2: reduce ov
         elif REDUCE_TYPE == 2:      # Min
             reduce_vec = tl.min(page_block, axis=0).to(tl.bfloat16)
         else:                       # L2Norm (NOT RMS)
-            s = tl.sum(page_block * page_block, axis=0)
+            s = tl.sum(page_block * page_block, axis=0).to(tl.float32)
             reduce_vec = tl.sqrt(s).to(tl.bfloat16)
 
         # output is token-major: [num_tokens, NUM_KV_HEAD, x_D1]
@@ -327,8 +327,9 @@ DIM: tl.constexpr                # 1: reduce over rows -> len x_D1; 2: reduce ov
         elif REDUCE_TYPE == 2:      # Min
             reduce_vec = tl.min(page_block, axis=1).to(tl.bfloat16)
         else:                       # L2Norm (NOT RMS)
-            s = tl.sum(page_block * page_block, axis=1)
+            s = tl.sum(page_block * page_block, axis=1).to(tl.float32)
             reduce_vec = tl.sqrt(s).to(tl.bfloat16)
+
 
         # output is token-major: [num_tokens, NUM_KV_HEAD, x_D0]
         out_base = (token_id * NUM_KV_HEAD + head_id) * x_D0

@@ -92,13 +92,20 @@ class ContextBase(ABC):
         self._aux_total_bytes += nbytes
         return nbytes
 
-
+    def add_aux_flops(self, nflops: int) -> int:
+        
+        self._aux_total_flops += nflops
+    
     def clear_aux_memory(self) -> None:
         """
         Reset the total auxiliary memory to zero.
         """
         
         self._aux_total_bytes = 0
+    
+    def clear_aux_flops(self) -> None:
+
+        self._aux_total_flops = 0
         
     
     def summary(self) -> None:
@@ -113,6 +120,14 @@ class ContextBase(ABC):
                 if f < 1024 or u == units[-1]:
                     return f"{f:.2f} {u}"
                 f /= 1024.0
+
+        def _fmt_flops(n: float) -> str:
+            units = ("FLOPs", "KFLOPs", "MFLOPs", "GFLOPs", "TFLOPs", "PFLOPs", "EFLOPs")
+            f = float(n)
+            for u in units:
+                if f < 1000 or u == units[-1]:
+                    return f"{f:.2f} {u}"
+                f /= 1000.0
 
         print("=== Context Summary ===")
 
@@ -144,14 +159,13 @@ class ContextBase(ABC):
                 continue
             val = getattr(self, name)
             if isinstance(val, torch.Tensor):
-                print(f"{name:<25}: Tensor(shape={tuple(val.shape)}, dtype={val.dtype}, device={val.device})")
                 n = _acc_tensor(val)
                 if val.device.type == "cpu":
                     internal_cpu += n
                 else:
                     internal_gpu += n
             else:
-                print(f"{name:<25}: {val}")
+                pass
 
         # auxiliary memory (single counter, no device split)
         aux_total = int(self._aux_total_bytes)
@@ -164,5 +178,7 @@ class ContextBase(ABC):
         grand_total = internal_cpu + internal_gpu + aux_total
         print(f"GRAND TOTAL  : {grand_total} bytes ({_fmt_bytes(grand_total)})")
 
-
+        print("--- Flops Totals ---")
+        aux_flops = int(self._aux_total_flops)
+        print(f"Auxiliary ALL: {aux_flops} flops ({_fmt_flops(aux_flops)})")
         print("====================================")

@@ -58,7 +58,7 @@ REDUCE_TYPE: tl.constexpr
                 x_i_reduce = tl.min(x_i, axis=1)
                 
             elif REDUCE_TYPE == 3:
-                x_i_reduce = tl.sqrt(tl.sum(x_i * x_i, axis=1))
+                x_i_reduce = tl.sqrt(tl.sum(x_i * x_i, axis=1).to(tl.float32))
             
             elif REDUCE_TYPE == 4:
                 x_i_reduce = tl.sum(x_i, axis=1)
@@ -82,7 +82,7 @@ REDUCE_TYPE: tl.constexpr
                 x_i_reduce = tl.min(x_i, axis=2)
             
             elif REDUCE_TYPE == 3:
-                x_i_reduce = tl.sqrt(tl.sum(x_i * x_i, axis=2))
+                x_i_reduce = tl.sqrt(tl.sum(x_i * x_i, axis=2).to(tl.float32))
             
             elif REDUCE_TYPE == 4:
                 x_i_reduce = tl.sum(x_i, axis=2)

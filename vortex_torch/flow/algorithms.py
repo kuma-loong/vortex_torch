@@ -14,9 +14,8 @@ from .registry import register
 # In forward cache, the cache["xxx"] is viewed as [B, r, c]  (r, c defined in create_cache) logically.
 # In forward cache, each page is computed only once if page_id appears in loc. During the entire computation, each page id will appear in loc only once.
 # Thus, all the tensors have 3 dimensions. Reduce operators (Mean, Max, Min, etc) will always keep the dims.
-# GeMM(x, y) = yx^t, which might be different from typical definitions.
-
-
+# Tips 1: GeMM(x, y) = yx^t, which might be different from typical definitions.
+# Tips 2: Except cache["k"], cache["v"] can also be used in forward_cache to collect information.
 
 @register("block_sparse_attention")
 class BlockSparseAttention(vFlow):
@@ -497,7 +496,6 @@ class GQAQuestSparseAttention(vFlow):
         }
 
 
-
 # For agent developers!
 # The ops are not reusable, even if they have the same semantic meaning. Internally, they will initialize different memory buffer.
 # For example, in Quest attention, we need to define two multiply operators.
@@ -509,6 +507,4 @@ class GQAQuestSparseAttention(vFlow):
 # Thus, all the tensors have 3 dimensions. Reduce operators (Mean, Max, Min, etc) will always keep the dims.
 
 # Tips 1: GeMM(x, y) = yx^t, which might be different from typical definitions.
-# Tips 2: Except cache["k"], cache["v"] can also be used in forward_cache to collect information (e.g, the norm of v)
-# Tips 3: Quest series perform not very well in downstream tasks. Above is just an example.
-# Tips 4: 
+# Tips 2: Except cache["k"], cache["v"] can also be used in forward_cache to collect information.

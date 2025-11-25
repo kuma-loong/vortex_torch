@@ -160,6 +160,12 @@ class Reduce(vOp):
         # Account auxiliary memory
         ctx.add_aux_memory(self.output_buffer)
 
+        for t in [x]:
+            if t._format == FORMAT.PAGED:
+                ctx.add_aux_flops(
+                    t.shape[1] * t.shape[2]
+                )
+                
         # Return vTensor view carrying the dispatched output format
         return as_vtensor(self.output_buffer, self.output_format)
 

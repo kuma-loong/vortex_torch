@@ -19,6 +19,8 @@ class Context(ContextBase):
         
         # auxilary memory in graph
         "_aux_total_bytes",
+        
+        "_aux_total_flops"
     )
 
 
@@ -31,6 +33,8 @@ class Context(ContextBase):
                 object.__setattr__(self, name, "Cache")
             elif name == "_aux_total_bytes":
                 object.__setattr__(self, name, 0)  # start from 0 bytes
+            elif name == "_aux_total_flops":
+                object.__setattr__(self, name, 0)  # start from 0 flops
             elif name == "mode":
                 object.__setattr__(self, name, Mode.profile) 
             else:
