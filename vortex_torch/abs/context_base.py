@@ -113,6 +113,7 @@ class ContextBase(ABC):
         Print fields; tensor fields show shape/dtype/device, and append memory totals incl. auxiliary.
         """
         
+        return 
         def _fmt_bytes(n: int) -> str:
             units = ("B", "KB", "MB", "GB", "TB", "PB")
             f = float(n)

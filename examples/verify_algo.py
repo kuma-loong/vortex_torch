@@ -140,14 +140,16 @@ mem: float = 0.8
         else:
             unique_result[item['query']] = max(item["score"], unique_result[item['query']])
 
-    
-    llm_cfg = AutoConfig.from_pretrained(model_name)
-    flow = vortex_torch.flow.build_vflow(vortex_module_name) 
-    memory_access_runtime = flow.run_indexer_virtual(
-        group_size=llm_cfg.num_attention_heads // llm_cfg.num_key_value_heads,
-        page_size=page_size,
-        head_dim=llm_cfg.head_dim,
-    )
+    if sparse_attention:
+        llm_cfg = AutoConfig.from_pretrained(model_name)
+        flow = vortex_torch.flow.build_vflow(vortex_module_name) 
+        memory_access_runtime = flow.run_indexer_virtual(
+            group_size=llm_cfg.num_attention_heads // llm_cfg.num_key_value_heads,
+            page_size=page_size,
+            head_dim=llm_cfg.head_dim,
+        )
+    else:
+        memory_access_runtime = 0.0
     
     global_summary = {
         f'mean@{trials}': total_accuracy / count if count > 0 else 0,
@@ -156,7 +158,7 @@ mem: float = 0.8
         "e2e_time": e2e_time,
         "total_tokens": total_tokens, 
         "throughput": total_tokens / e2e_time,
-        "memory_access_runtime (per page)": memory_access_runtime
+        "auxilary memory_access_runtime (bytes per page)": memory_access_runtime
     }
     
     return global_summary
@@ -229,3 +231,4 @@ if __name__ == "__main__":
     )
     print(summary)
 
+    exit(0)

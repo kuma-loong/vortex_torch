@@ -2,10 +2,7 @@
 set -e
 
 sparse_algos=(
-  "gqa_value_aware_sparse_attention"
-  # "gqa_block_sparse_attention"
-  # "gqa_quest_sparse_attention"
-  # "block_sparse_attention"
+
 )
 
 for algo in "${sparse_algos[@]}"; do
@@ -15,6 +12,6 @@ for algo in "${sparse_algos[@]}"; do
     --topk-val 30 \
     --vortex-module-name "${algo}" \
     --model-name Qwen/Qwen3-1.7B \
-    --mem 0.8
+    --mem 0.7
 done
 
