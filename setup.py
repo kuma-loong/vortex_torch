@@ -7,7 +7,8 @@ setup(
     packages=find_packages(),
     python_requires=">=3.10",
     install_requires=[
-        "torch>=2.6",
+        "torch>=2.7",
+        "lighteval[math]==0.12.2"
     ],
     ext_modules=[
         CUDAExtension(
