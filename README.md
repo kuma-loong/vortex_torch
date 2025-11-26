@@ -125,7 +125,7 @@ Note: Some operators are not yet fused or fully optimized, which may lead to inc
 
 ## Citation
 
-If you find Vortex useful or relevant to your project and research, please kindly cite our paper:
+If you find Vortex useful or relevant to your project and research, please kindly cite our project:
 
 ```bibtex
 @software{chen2025vortex,
