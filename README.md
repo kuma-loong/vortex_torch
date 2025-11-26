@@ -115,6 +115,7 @@ python openhands_gen.py
 ```
 
 The usage and installation guide of OpenHands can be found in https://docs.openhands.dev/sdk. 
+
 Note: Some operators are not yet fused or fully optimized, which may lead to increased memory usage. Tune down the `mem_fraction_static` if CUDA OOM. This can also impact generation speed during inference. 
 
 ## 📘 API Reference
