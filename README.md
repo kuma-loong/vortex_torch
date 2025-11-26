@@ -19,6 +19,11 @@ It exists to make it easy for researchers and engineers to **prototype**, **exte
 
 Vortex allows you to express novel sparse attention concisely while relying on an optimized execution engine.
 
+<video controls width="600">
+  <source src="assets/demov2.0.mp4" type="video/mp4">
+  Your browser does not support the video tag.
+</video>
+
 ---
 
 ## ✨ Key Features
@@ -45,6 +50,24 @@ cd ../../
 cd vortex_torch
 pip install -e .
 ```
+
+---
+
+## 🤖 AI-Generated Sparse Attention
+
+Vortex is designed not only for hand-crafted sparsity patterns but also for AI-generated sparse attention.
+
+Our demo shows how to use SOTA agents OpenHands (https://openhands.dev/) to generate sparse attention algorithms.
+
+```bash
+export LLM_API_KEY=YOUR_API_KEY
+python openhands_gen.py
+
+```
+
+The usage and installation guide of OpenHands can be found in https://docs.openhands.dev/sdk. 
+
+Note: Some operators are not yet fused or fully optimized, which may lead to increased memory usage. Tune down the `mem_fraction_static` if CUDA OOM. This can also impact generation speed during inference. 
 
 ---
 
@@ -117,20 +140,6 @@ If `vortex_module_path` is not provided, Vortex will automatically search in
 
 ---
 
-## 🤖 AI-Generated Sparse Attention
-Vortex is designed not only for hand-crafted sparsity patterns but also for AI-generated sparse attention.
-
-Our demo shows how to use SOTA agents OpenHands (https://openhands.dev/) to generate sparse attention algorithms.
-
-```bash
-export LLM_API_KEY=YOUR_API_KEY
-python openhands_gen.py
-
-```
-
-The usage and installation guide of OpenHands can be found in https://docs.openhands.dev/sdk. 
-
-Note: Some operators are not yet fused or fully optimized, which may lead to increased memory usage. Tune down the `mem_fraction_static` if CUDA OOM. This can also impact generation speed during inference. 
 
 ## 📘 API Reference
 
