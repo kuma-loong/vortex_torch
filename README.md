@@ -11,7 +11,7 @@ Vortex: A Flexible and Efficient Sparse Attention Framework
 </h3>
 
 <p align="center">
-| <a href="https://docs.vllm.ai"><b>Documentation</b></a> 
+  <a href="https://github.com/Infini-AI-Lab/vortex_torch"><b>Documentation</b></a> 
 </p>
 
 Vortex is a lightweight, modular framework for building **custom sparse attention algorithms** for LLM inference.  
