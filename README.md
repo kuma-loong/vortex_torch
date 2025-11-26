@@ -17,7 +17,7 @@ Vortex: A Flexible and Efficient Sparse Attention Framework
 Vortex is a lightweight, modular framework for building **custom sparse attention algorithms** for LLM inference.  
 It exists to make it easy for researchers and engineers to **prototype**, **extend**, and **deploy** advanced sparsity patterns on modern inference backends such as SGLang—without modifying core model code.
 
-Vortex allows you to express novel sparse attention behaviors concisely while relying on an optimized execution engine.
+Vortex allows you to express novel sparse attention concisely while relying on an optimized execution engine.
 
 ---
 
