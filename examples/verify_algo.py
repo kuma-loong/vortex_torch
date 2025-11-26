@@ -11,7 +11,7 @@ from lighteval.utils.language import Language
 from lighteval.models.model_output import ModelResponse
 from datasets import load_dataset, Dataset, concatenate_datasets
 import argparse
-
+import json
 
 MATH_QUERY_TEMPLATE = """
 Solve the following math problem efficiently and clearly.  The last line of your response should be of the following format: 'Therefore, the final answer is: $\\boxed{{ANSWER}}$. I hope it is correct' (without quotes) where ANSWER is just the final number or expression that solves the problem. Think step by step before answering.
@@ -72,23 +72,11 @@ mem: float = 0.8
                     mem_fraction_static=mem
                     )
     
-    dataset = load_dataset("math-ai/amc23", split="test")
-    requests = generate_requests(dataset, "question", MATH_QUERY_TEMPLATE)
-    requests = requests * trials
+    with open("examples/amc23.jsonl", "r", encoding="utf-8") as f:
+        requests = [json.loads(line) for line in f]
     
-    texts = [
-        x["conversations"] for x in requests
-    ]
-    
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    prompts = [
-        tokenizer.apply_chat_template(
-        text,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=True
-    ) for text in texts
-    ]
+    requests = requests[:2]
+    prompts = [req["prompt"] for req in requests]
 
     sampling_params = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "max_new_tokens": 8192}
     
