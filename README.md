@@ -11,18 +11,22 @@ Vortex: A Flexible and Efficient Sparse Attention Framework
 </h3>
 
 <p align="center">
-  <a href="https://github.com/Infini-AI-Lab/vortex_torch"><b>Documentation</b></a> 
+  <a href="https://github.com/Infini-AI-Lab/vortex_torch"><b>Documentation</b></a>
+  &nbsp;&nbsp;|&nbsp;&nbsp;
+  <a href="https://infini-ai-lab.github.io/ai-environment-architect/"><b>Blog 1</b></a>
 </p>
+
 
 Vortex is a lightweight, modular framework for building **custom sparse attention algorithms** for LLM inference.  
 It exists to make it easy for researchers and engineers to **prototype**, **extend**, and **deploy** advanced sparsity patterns on modern inference backends such as SGLang—without modifying core model code.
 
 Vortex allows you to express novel sparse attention concisely while relying on an optimized execution engine.
 
-<video controls width="600">
-  <source src="assets/demov2.0.mp4" type="video/mp4">
-  Your browser does not support the video tag.
-</video>
+<figure>
+  <img src="assets/demo.gif" alt="Demo" />
+  <figcaption align="center"><em>OpenHands generate a sparse attention algorithm (up to 2.7X speedup in this example).</em></figcaption>
+</figure>
+
 
 ---
 
