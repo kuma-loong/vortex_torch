@@ -24,7 +24,7 @@ Vortex allows you to express novel sparse attention concisely while relying on a
 ## ✨ Key Features
 
 - **Easy Programming**  
-  Program sparse attention with pytorch-like frontend and view all the tensors as `batch_size = 1`. No worrying about batching, caching & paged attention.
+  Program sparse attention with a PyTorch-like frontend. No worrying about batching, caching & paged attention.
 
 - **High Performance**  
   Built to work with FlashInfer & CUDA Graph & Radix Attention for efficient LLM inference.
