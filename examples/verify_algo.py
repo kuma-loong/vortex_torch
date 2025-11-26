@@ -75,7 +75,7 @@ mem: float = 0.8
     with open("examples/amc23.jsonl", "r", encoding="utf-8") as f:
         requests = [json.loads(line) for line in f]
     
-    requests = requests[:2]
+    requests = requests * trials
     prompts = [req["prompt"] for req in requests]
 
     sampling_params = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "max_new_tokens": 8192}
