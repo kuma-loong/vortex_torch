@@ -149,20 +149,4 @@ If `vortex_module_path` is not provided, Vortex will automatically search in
 
 👉 https://infini-ai-lab.github.io/vortex_torch/
 
----
 
-## Citation
-
-If you find Vortex useful or relevant to your project and research, please kindly cite our project:
-
-```bibtex
-@software{chen2025vortex,
-  title        = {Vortex: A Flexible and Efficient Sparse Attention Framework},
-  author       = {Chen, Zhuoming and Yang, Zhou and Chen, Beidi},
-  year         = {2025},
-  publisher    = {Infini AI Lab},
-  url          = {https://github.com/Infini-AI-Lab/vortex_torch},
-  version      = {v0.2}
-}
-
-```
