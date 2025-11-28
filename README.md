@@ -12,8 +12,6 @@ Vortex: A Flexible and Efficient Sparse Attention Framework
 
 <p align="center">
   <a href="https://github.com/Infini-AI-Lab/vortex_torch"><b>Documentation</b></a>
-  &nbsp;&nbsp;|&nbsp;&nbsp;
-  <a href="https://infini-ai-lab.github.io/ai-environment-architect/"><b>Blog 1</b></a>
 </p>
 
 
