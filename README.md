@@ -137,8 +137,7 @@ llm = sgl.Engine(
 )
 ```
 
-If `vortex_module_path` is not provided, Vortex will automatically search in  
-`vortex_torch.flow.algorithms`.
+If `vortex_module_path` is not provided, Vortex will automatically search in `vortex_torch.flow.algorithms`.
 
 ---
 
