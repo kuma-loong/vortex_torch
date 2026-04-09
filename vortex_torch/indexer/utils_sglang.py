@@ -1,6 +1,7 @@
 import torch
 from vortex_torch_C import (
 sglang_plan_decode, 
+sglang_plan_decode_v2, 
 sglang_plan_prefill, 
 sglang_plan_decode_fa3,
 sglang_plan_prefill_fa3, 
@@ -18,7 +19,7 @@ req_to_token: torch.Tensor,
 req_indices: torch.Tensor,
 ctx: Context
 ):
-    sglang_plan_decode(
+    sglang_plan_decode_v2(
         cached_seq_lens,
         ctx.dense_kv_indptr,
         ctx.dense_kv_indices,
@@ -33,12 +34,12 @@ ctx: Context
         ctx.winfo_num_workloads,
         ctx.winfo_chunk_size,
         ctx.page_size,
+        ctx.block_size,
         ctx.num_kv_heads,
         ctx.topk_val,
-        ctx.page_reserved_bos,
-        ctx.page_reserved_eos,
-        ctx.max_chunk_size,
-        ctx.min_chunk_size
+        ctx.block_reserved_bos,
+        ctx.block_reserved_eos,
+        ctx.workload_chunk_size
     )
     
     ctx.set_batch_size(cached_seq_lens.shape[0])

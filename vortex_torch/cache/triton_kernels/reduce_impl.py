@@ -11,6 +11,8 @@ x_D0: tl.constexpr,
 x_D1: tl.constexpr,
 NUM_KV_HEAD: tl.constexpr,
 PAGE_SIZE: tl.constexpr,
+BLOCK_SIZE: tl.constexpr,
+NUM_BLOCKS_PER_PAGE: tl.constexpr,
 REDUCE_TYPE: tl.constexpr,  # 0:Mean, 1:Max, 2:Min, 3:L2Norm
 DIM: tl.constexpr           # 1: over rows (axis=0) -> len x_D1; 2: over cols (axis=1) -> len x_D0
 ):  
@@ -20,45 +22,46 @@ DIM: tl.constexpr           # 1: over rows (axis=0) -> len x_D1; 2: over cols (a
 
     token_position = tl.load(loc + token_id)
 
-    if (token_position + 1) % PAGE_SIZE != 0:
+    if (token_position + 1) % BLOCK_SIZE != 0:
         return
 
     page_id  = (token_position // PAGE_SIZE) * NUM_KV_HEAD + head_id
-    x_offset = page_id * x_D0 * x_D1
+    block_id = page_id * NUM_BLOCKS_PER_PAGE + (token_position % PAGE_SIZE) // BLOCK_SIZE 
+    x_offset = block_id * x_D0 * x_D1
 
     rows = tl.arange(0, x_D0)[:, None]     # [x_D0, 1]
     cols = tl.arange(0, x_D1)[None, :]     # [1, x_D1]
     src_ptr = x + x_offset + rows * x_D1 + cols
-    page_block = tl.load(src_ptr)
+    block_tensor = tl.load(src_ptr)
 
     if DIM == 1:
         # reduce over rows -> axis=0 -> length x_D1
         if REDUCE_TYPE == 0:       # Mean
-            reduce_vec = (tl.sum(page_block, axis=0) / x_D0).to(tl.bfloat16)
+            reduce_vec = (tl.sum(block_tensor, axis=0) / x_D0).to(tl.bfloat16)
         elif REDUCE_TYPE == 1:     # Max
-            reduce_vec = tl.max(page_block, axis=0).to(tl.bfloat16)
+            reduce_vec = tl.max(block_tensor, axis=0).to(tl.bfloat16)
         elif REDUCE_TYPE == 2:     # Min
-            reduce_vec = tl.min(page_block, axis=0).to(tl.bfloat16)
+            reduce_vec = tl.min(block_tensor, axis=0).to(tl.bfloat16)
         else:                      # L2Norm
-            s = tl.sum(page_block * page_block, axis=0).to(tl.float32)
+            s = tl.sum(block_tensor * block_tensor, axis=0).to(tl.float32)
             reduce_vec = tl.sqrt(s).to(tl.bfloat16)
 
-        dst_ptr = output + page_id * x_D1 + tl.arange(0, x_D1)
+        dst_ptr = output + block_id * x_D1 + tl.arange(0, x_D1)
         tl.store(dst_ptr, reduce_vec)
-
+        
     else:
         # DIM == 2: reduce over cols -> axis=1 -> length x_D0
         if REDUCE_TYPE == 0:       # Mean
-            reduce_vec = (tl.sum(page_block, axis=1) / x_D1).to(tl.bfloat16)
+            reduce_vec = (tl.sum(block_tensor, axis=1) / x_D1).to(tl.bfloat16)
         elif REDUCE_TYPE == 1:     # Max
-            reduce_vec = tl.max(page_block, axis=1).to(tl.bfloat16)
+            reduce_vec = tl.max(block_tensor, axis=1).to(tl.bfloat16)
         elif REDUCE_TYPE == 2:     # Min
-            reduce_vec = tl.min(page_block, axis=1).to(tl.bfloat16)
+            reduce_vec = tl.min(block_tensor, axis=1).to(tl.bfloat16)
         else:                      # L2Norm
-            s = tl.sum(page_block * page_block, axis=1).to(tl.float32)
+            s = tl.sum(block_tensor * block_tensor, axis=1).to(tl.float32)
             reduce_vec = tl.sqrt(s).to(tl.bfloat16)
 
-        dst_ptr = output + page_id * x_D0 + tl.arange(0, x_D0)
+        dst_ptr = output + block_id * x_D0 + tl.arange(0, x_D0)
         tl.store(dst_ptr, reduce_vec)
 
 
@@ -84,6 +87,8 @@ reduce_type: ReduceType,
         x_D1=x.shape[2],
         NUM_KV_HEAD=NUM_KV_HEAD,
         PAGE_SIZE=ctx.page_size,
+        BLOCK_SIZE=ctx.block_size,
+        NUM_BLOCKS_PER_PAGE=ctx.num_blocks_per_page,
         REDUCE_TYPE=reduce_type.value,
         DIM=dim
     )

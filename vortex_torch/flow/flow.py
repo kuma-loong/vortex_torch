@@ -284,7 +284,7 @@ class vFlow(ABC):
     @abstractmethod
     def create_cache(
         self,
-        page_size: int,
+        block_size: int,
         head_dim: int,
     ) -> Dict[str, Tuple[Tuple[int, int]]]:
         r"""
@@ -330,7 +330,7 @@ class vFlow(ABC):
     # ------------------------------------------------------------------ #
     def get_cache_meta_info(
         self,
-        page_size: int,
+        block_size: int,
         head_dim: int,
     ) -> Dict[str, Tuple[Tuple[int, int]]]:
         r"""
@@ -366,14 +366,18 @@ class vFlow(ABC):
             If :meth:`create_cache` tries to define entries for the
             reserved keys ``"k"`` or ``"v"``.
         """
-        cache_meta_info = self.create_cache(page_size, head_dim)
+        cache_meta_info = self.create_cache(block_size, head_dim)
         assert "k" not in cache_meta_info.keys()
         assert "v" not in cache_meta_info.keys()
-        cache_meta_info["k"] = (page_size, head_dim)
-        cache_meta_info["v"] = (page_size, head_dim)
+        cache_meta_info["k"] = (block_size, head_dim)
+        cache_meta_info["v"] = (block_size, head_dim)
         return cache_meta_info
 
-    def get_token_ratio(self, page_size: int, head_dim: int) -> float:
+    def get_token_ratio(
+        self, 
+        block_size: int,
+        head_dim: int
+        ) -> float:
         r"""
         Compute the relative cache size in "tokens" compared to a k/v page.
 
@@ -413,12 +417,13 @@ class vFlow(ABC):
             ``"v"`` entries).
         """
         token_ratio = 0.0
-        for (_, cache_shape) in self.get_cache_meta_info(page_size, head_dim).items():
-            token_ratio += (cache_shape[0] * cache_shape[1]) / (page_size * head_dim)
+        for (_, cache_shape) in self.get_cache_meta_info(block_size, head_dim).items():
+            token_ratio += (cache_shape[0] * cache_shape[1]) / (block_size * head_dim)
         return token_ratio
 
     def run_indexer_virtual(self, group_size: int, page_size: int, head_dim: int):
-        
+
+        assert False, "This method is for internal use only and should not be called directly."
         from ..indexer import Context as IContext
         from ..abs import as_vtensor, FORMAT
         

@@ -228,8 +228,8 @@ class topK(vOp):
             o,
             ctx.batch_size * ctx.num_kv_heads,
             ctx.topk_val,
-            ctx.page_reserved_bos,
-            ctx.page_reserved_eos,
-            ctx.max_num_pages_per_request,
+            ctx.block_reserved_bos,
+            ctx.block_reserved_eos,
+            ctx.max_num_blocks_per_request,
         )
         return o

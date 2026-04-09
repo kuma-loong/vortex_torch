@@ -204,7 +204,7 @@ class BlockSparseAttention(vFlow):
         """
         self.reduction(cache["k"], cache["centroids"], loc=loc, ctx=ctx)
 
-    def create_cache(self, page_size: int, head_dim: int):
+    def create_cache(self, block_size: int, head_dim: int):
         r"""
         Declare inner shapes for custom cache tensors.
 
@@ -328,7 +328,7 @@ class GQABlockSparseAttention(vFlow):
         """
         self.reduction(cache["k"], cache["centroids"], loc=loc, ctx=ctx)
 
-    def create_cache(self, page_size: int, head_dim: int):
+    def create_cache(self, block_size: int, head_dim: int):
         r"""
         Declare inner shapes for custom cache tensors.
 
@@ -470,7 +470,7 @@ class GQAQuestSparseAttention(vFlow):
         self.reduction_max(cache["k"], cache["max"], loc=loc, ctx=ctx)
         self.reduction_min(cache["k"], cache["min"], loc=loc, ctx=ctx)
 
-    def create_cache(self, page_size: int, head_dim: int):
+    def create_cache(self, block_size: int, head_dim: int):
         r"""
         Declare inner shapes for custom cache tensors.
 

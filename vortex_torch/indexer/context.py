@@ -16,13 +16,13 @@ class Context(ContextBase):
         # winfo
         "winfo_q_indices", "winfo_kv_offsets", "winfo_kv_lens", "winfo_num_workloads", "winfo_chunk_size", "max_num_workloads",
         # chunk limits
-        "max_chunk_size", "min_chunk_size",
+        "workload_chunk_size",
         # head / shape
         "group_size", "num_kv_heads", "num_qo_heads", "head_dim",
         # hardware / paging
-        "num_sms", "page_size", "max_num_pages", "max_num_pages_per_request",
+        "num_sms", "page_size", "max_num_pages", "max_num_pages_per_request", "block_size", "max_num_blocks", "max_num_blocks_per_request", "num_blocks_per_page",
         # misc
-        "indexer_dtype", "topk_val", "page_reserved_bos", "page_reserved_eos",
+        "indexer_dtype", "topk_val", "block_reserved_bos", "block_reserved_eos",
         
         # auxilary memory in graph
         "_aux_total_bytes",
@@ -48,8 +48,7 @@ class Context(ContextBase):
     max_num_workloads: int           #: Maximum number of workloads allowed.
 
     # --- chunk limits ---
-    max_chunk_size: int              #: Maximum allowed chunk size.
-    min_chunk_size: int              #: Minimum allowed chunk size.
+    workload_chunk_size: int              #: allowed chunk size.
 
     # --- head / shape configuration ---
     group_size: int                  #: Group size for grouped attention.
@@ -60,14 +59,18 @@ class Context(ContextBase):
     # --- hardware / paging ---
     num_sms: int                     #: Number of streaming multiprocessors (SMs).
     page_size: int                   #: Page size used for memory paging.
+    block_size: int                   #: Page size used for memory paging.
     max_num_pages: int               #: Total available pages.
     max_num_pages_per_request: int   #: Page limit per individual request.
+    max_num_blocks: int               #: Total available pages.
+    max_num_blocks_per_request: int   #: Page limit per individual request.
+    num_blocks_per_page: int        #: Number of blocks contained in a single page.
 
     # --- miscellaneous ---
     indexer_dtype: torch.dtype       #: Dtype used by indexer operations.
     topk_val: int                    #: Top-K value used in pruning or selection.
-    page_reserved_bos: int           #: Reserved page count for BOS (begin-of-sequence).
-    page_reserved_eos: int           #: Reserved page count for EOS (end-of-sequence).
+    block_reserved_bos: int           #: Reserved page count for BOS (begin-of-sequence).
+    block_reserved_eos: int           #: Reserved page count for EOS (end-of-sequence).
 
     # --- auxiliary ---
     _aux_total_bytes: int            #: Accumulated auxiliary memory in bytes.
@@ -120,8 +123,7 @@ class Context(ContextBase):
         self.sparse_kv_indptr = parent.kv_indptr_decode[1]
         self.kv_last_page_len = parent.kv_last_page_len_decode
 
-        self.max_chunk_size = sa.vortex_lb_max_chunk_size
-        self.min_chunk_size = sa.vortex_lb_min_chunk_size
+        self.workload_chunk_size = sa.vortex_workload_chunk_size
 
         self.group_size = parent.group_size
         self.num_kv_heads = parent.num_kv_heads
@@ -130,11 +132,16 @@ class Context(ContextBase):
 
         self.num_sms = torch.cuda.get_device_properties(0).multi_processor_count
         self.page_size = sa.page_size
-
+        self.block_size = sa.vortex_block_size
+        self.num_blocks_per_page = self.page_size // self.block_size
+        assert self.page_size % self.block_size == 0, "Page size must be a multiple of block size."
+        #TODO(dreaming-panda): Relax the chunk size == blocks per page constraint by adding intra-page offsets in the kernels.
+        assert self.workload_chunk_size == self.num_blocks_per_page, "Workload chunk size must equal the number of blocks per page for simplicity."
         # Capacity model (adjust as needed)
         self.max_num_pages = max_pages_per_req * max_bs * self.num_kv_heads
         self.max_num_pages_per_request = max_pages_per_req
-
+        self.max_num_blocks = self.max_num_pages * self.num_blocks_per_page
+        self.max_num_blocks_per_request = self.max_num_pages_per_request * self.num_blocks_per_page
         self.topk_val = sa.vortex_topk_val
         dtype_str = getattr(sa, "vortex_indexer_dtype", "float32")
         if isinstance(dtype_str, str):
@@ -142,11 +149,11 @@ class Context(ContextBase):
         else:
             self.indexer_dtype = dtype_str
         
-        self.page_reserved_bos = sa.vortex_page_reserved_bos
-        self.page_reserved_eos = sa.vortex_page_reserved_eos
+        self.block_reserved_bos = sa.vortex_block_reserved_bos
+        self.block_reserved_eos = sa.vortex_block_reserved_eos
 
         self.max_num_workloads = (
-            (self.max_num_pages // max(1, sa.vortex_lb_min_chunk_size)) + max_bs * self.num_kv_heads
+            (self.max_num_blocks // max(1, self.workload_chunk_size)) + max_bs * self.num_kv_heads
         )
 
         device = getattr(model_runner, "device", "cpu")

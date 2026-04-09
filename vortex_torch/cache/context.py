@@ -11,8 +11,8 @@ class Context(ContextBase):
     
     __slots__ = ContextBase.__slots__ + (
         
-        #page infomation
-        "max_new_tokens_per_batch", "page_size", "total_num_pages",
+        #page & block infomation
+        "max_new_tokens_per_batch", "page_size", "total_num_pages", "block_size", "num_blocks_per_page", "total_num_blocks",
         
         #model infomation
         "head_dim", "head_num",
@@ -51,12 +51,15 @@ class Context(ContextBase):
 
         sa = model_runner.server_args
         self.page_size = parent.page_size
+        self.block_size = parent.block_size
+        assert self.page_size % self.block_size == 0, "Page size must be a multiple of block size for block-sparse attention"
+        self.num_blocks_per_page = self.page_size // self.block_size
+        self.total_num_blocks = self.num_blocks_per_page * parent.num_pages
         self.total_num_pages = parent.num_pages
         self.max_new_tokens_per_batch = max(sa.max_prefill_tokens, model_runner.req_to_token_pool.size)
         self.head_num = parent.head_num
         self.head_dim = parent.head_dim
         self._created = True
-        
         return self
     
 

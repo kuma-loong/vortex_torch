@@ -133,7 +133,7 @@ class GeMV(vOp):
         self.impl, self.output_format = self._impl_map[key]
 
         # Allocate output buffer on x.device/x.dtype
-        S_out = ctx.max_num_pages          # logical "S_pack" per runtime
+        S_out = ctx.max_num_blocks        # logical "S_pack" per runtime
         self.output_buffer = torch.empty(
             (S_out, 1, 1),
             device=x.device,
