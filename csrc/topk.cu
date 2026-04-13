@@ -164,7 +164,18 @@ const int64_t     max_num_pages
             reserved_eos
         );
     } else if (max_num_pages <= 1024){
-        TopKOutput_BF16_Kernel<256, 4><<<nblks, 256, 0, stream>>>(
+        TopKOutput_BF16_Kernel<128, 8><<<nblks, 128, 0, stream>>>(
+            reinterpret_cast<__nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+            dense_kv_indptr.data_ptr<int>(),
+            sparse_kv_indptr.data_ptr<int>(),
+            dense_kv_indices.data_ptr<int>(),
+            sparse_kv_indices.data_ptr<int>(),
+            topk_val,
+            reserved_bos,
+            reserved_eos
+        );
+    } else if (max_num_pages <= 1536){
+        TopKOutput_BF16_Kernel<128, 12><<<nblks, 128, 0, stream>>>(
             reinterpret_cast<__nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
             dense_kv_indptr.data_ptr<int>(),
             sparse_kv_indptr.data_ptr<int>(),
@@ -175,7 +186,40 @@ const int64_t     max_num_pages
             reserved_eos
         );
     } else if (max_num_pages <= 2048){
-        TopKOutput_BF16_Kernel<256, 8><<<nblks, 256, 0, stream>>>(
+        TopKOutput_BF16_Kernel<128, 16><<<nblks, 128, 0, stream>>>(
+            reinterpret_cast<__nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+            dense_kv_indptr.data_ptr<int>(),
+            sparse_kv_indptr.data_ptr<int>(),
+            dense_kv_indices.data_ptr<int>(),
+            sparse_kv_indices.data_ptr<int>(),
+            topk_val,
+            reserved_bos,
+            reserved_eos
+        );
+    } else if (max_num_pages <= 2560){
+        TopKOutput_BF16_Kernel<256, 10><<<nblks, 256, 0, stream>>>(
+            reinterpret_cast<__nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+            dense_kv_indptr.data_ptr<int>(),
+            sparse_kv_indptr.data_ptr<int>(),
+            dense_kv_indices.data_ptr<int>(),
+            sparse_kv_indices.data_ptr<int>(),
+            topk_val,
+            reserved_bos,
+            reserved_eos
+        );
+    } else if (max_num_pages <= 3072){
+        TopKOutput_BF16_Kernel<256, 12><<<nblks, 256, 0, stream>>>(
+            reinterpret_cast<__nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+            dense_kv_indptr.data_ptr<int>(),
+            sparse_kv_indptr.data_ptr<int>(),
+            dense_kv_indices.data_ptr<int>(),
+            sparse_kv_indices.data_ptr<int>(),
+            topk_val,
+            reserved_bos,
+            reserved_eos
+        );
+    } else if (max_num_pages <= 3584){
+        TopKOutput_BF16_Kernel<256, 14><<<nblks, 256, 0, stream>>>(
             reinterpret_cast<__nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
             dense_kv_indptr.data_ptr<int>(),
             sparse_kv_indptr.data_ptr<int>(),
@@ -186,7 +230,7 @@ const int64_t     max_num_pages
             reserved_eos
         );
     } else if (max_num_pages <= 4096){
-        TopKOutput_BF16_Kernel<512, 8><<<nblks, 512, 0, stream>>>(
+        TopKOutput_BF16_Kernel<256, 16><<<nblks, 256, 0, stream>>>(
             reinterpret_cast<__nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
             dense_kv_indptr.data_ptr<int>(),
             sparse_kv_indptr.data_ptr<int>(),

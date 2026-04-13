@@ -54,7 +54,7 @@ from .transpose import Transpose
 from .elementwise_binary import Maximum, Minimum, Multiply, Add
 from .elementwise import Relu, Sigmoid, Silu, Add_Mul, Abs
 from .save_load import Save, Load
-from . import utils_sglang
+from . import utils_sglang, compiler
 from .context import Context, get_ctx
 __all__ = [ 
     "GeMM", "GeMV",
@@ -67,6 +67,7 @@ __all__ = [
     "Save", "Load",
     "utils_sglang",
     "Context",
-    "get_ctx"
+    "get_ctx",
+    "compiler",
 ]
 

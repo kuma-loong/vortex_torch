@@ -3,7 +3,7 @@ from typing import Tuple, Dict, Callable, Optional
 from .context import Context
 from ..abs import vTensor, as_vtensor, FORMAT, vOp
 from .triton_kernels.elementwise_binary_impl import elementwise_binary_bpr, elementwise_binary_rrr, elementwise_binary_rpr
-from ..utils import ElementwiseBinaryOpType
+from ..utils import ElementwiseBinaryOpType, Schedule
 
 class Elementwise_Binary(vOp):
     r"""
@@ -45,10 +45,10 @@ class Elementwise_Binary(vOp):
 
     # Implementation dispatch table: keyed by (x_format, y_format).
     # Value: (callable_impl, resolved_output_format)
-    _impl_map: Dict[Tuple[FORMAT, FORMAT], Tuple[Callable, FORMAT]] = {
-        (FORMAT.RAGGED,  FORMAT.RAGGED): (elementwise_binary_rrr, FORMAT.RAGGED),
-        (FORMAT.BATCHED, FORMAT.PAGED):  (elementwise_binary_bpr, FORMAT.RAGGED),
-        (FORMAT.RAGGED,  FORMAT.PAGED):  (elementwise_binary_rpr, FORMAT.RAGGED),
+    _impl_map: Dict[Tuple[FORMAT, FORMAT], FORMAT] = {
+        (FORMAT.RAGGED,  FORMAT.RAGGED): (FORMAT.RAGGED),
+        (FORMAT.BATCHED, FORMAT.PAGED):  (FORMAT.RAGGED),
+        (FORMAT.RAGGED,  FORMAT.PAGED):  (FORMAT.RAGGED),
         # Add more pairs as needed.
     }
 
@@ -60,7 +60,7 @@ class Elementwise_Binary(vOp):
         self.beta = beta
         self.output_format: Optional[FORMAT] = None
         self.output_buffer: Optional[torch.Tensor] = None
-
+        self.schedule = Schedule.W
     # ---------------- profile ----------------
     def profile(self, x: vTensor, y: vTensor, ctx: Context) -> vTensor:
         r"""
@@ -132,7 +132,7 @@ class Elementwise_Binary(vOp):
             f"{prefix}no implementation for (x_fmt={x_fmt}, y_fmt={y_fmt}). "
             f"Available: {list(self._impl_map.keys())}"
         )
-        self.impl, self.output_format = self._impl_map[key]
+        self.output_format = self._impl_map[key]
 
         # Device consistency
         assert x.device == y.device, (
@@ -145,22 +145,22 @@ class Elementwise_Binary(vOp):
         D_out = max(x.shape[2], y.shape[2])
 
         # Allocate output buffer on x.device with x.dtype
-        S = ctx.max_num_pages
-        self.output_buffer = torch.empty(
-            (S, C_out, D_out),
+        # S = ctx.max_num_pages
+        self.output_buffer = as_vtensor(torch.empty(
+            (0, C_out, D_out),
             device=x.device,
             dtype=x.dtype,
+        ), self.output_format, tensor_id=len(ctx.tensor_list)  # Assign a new tensor_id based on current tensor count
         )
-        ctx.add_aux_memory(self.output_buffer)
+        # Track auxiliary memory and graph structure in the context
+        ctx.tensor_list.append(self.output_buffer)  # Track the output buffer in the context
+        ctx.output_tensor_to_op_list.append(len(ctx.op_list))  # Map the output tensor to this operation
+        ctx.op_list.append(self)  # Track this operation in the context
+        ctx.op_to_input_tensor_list.append([x.tensor_id, y.tensor_id])  # Map this op to its input tensors
+        ctx.op_to_output_tensor_list.append([self.output_buffer.tensor_id])  # Map this op to its output tensor
+
+        return self.output_buffer
         
-        for t in [x, y]:
-            if t._format == FORMAT.PAGED:
-                ctx.add_aux_flops(
-                    t.shape[1] * t.shape[2]
-                )
-        
-        # Return vTensor view with dispatched output format
-        return as_vtensor(self.output_buffer, self.output_format)
 
     # ---------------- execute ----------------
     def execute(self, x: torch.Tensor, y: torch.Tensor, ctx: Context) -> torch.Tensor:
@@ -196,16 +196,17 @@ class Elementwise_Binary(vOp):
             If :meth:`profile` has not been called (no implementation or buffer),
             or if there is a device mismatch between inputs and output.
         """
-        prefix = self._prefix()
-        assert self.impl is not None, f"{prefix}execute called before profile() (impl is None)"
-        assert self.output_buffer is not None, f"{prefix}output buffer is None; did profile() run?"
-        assert x.device == y.device == self.output_buffer.device, (
-            f"{prefix}device mismatch: "
-            f"x={x.device}, y={y.device}, o={self.output_buffer.device}"
-        )
+        assert False, "Elementwise_Binary.execute should not be called directly; it is meant to be invoked by the generated Triton kernel. If you see this error, it likely means the kernel was not generated or called correctly."
+        # prefix = self._prefix()
+        # assert self.impl is not None, f"{prefix}execute called before profile() (impl is None)"
+        # assert self.output_buffer is not None, f"{prefix}output buffer is None; did profile() run?"
+        # assert x.device == y.device == self.output_buffer.device, (
+        #     f"{prefix}device mismatch: "
+        #     f"x={x.device}, y={y.device}, o={self.output_buffer.device}"
+        # )
 
-        self.impl(x, y, self.output_buffer, self.op_type, self.alpha, self.beta, ctx)
-        return self.output_buffer
+        # self.impl(x, y, self.output_buffer, self.op_type, self.alpha, self.beta, ctx)
+        # return self.output_buffer
 
 
 class Maximum(Elementwise_Binary):

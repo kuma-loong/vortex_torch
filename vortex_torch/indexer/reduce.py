@@ -3,7 +3,7 @@ from typing import Tuple, Dict, Callable, Optional
 from .context import Context
 from ..abs import vTensor, as_vtensor, FORMAT, vOp
 from .triton_kernels.reduce_impl import reduce_rr
-from ..utils import ReduceType
+from ..utils import ReduceType, Schedule
 
 class Reduce(vOp):
     r"""
@@ -69,8 +69,9 @@ class Reduce(vOp):
 
     # Implementation dispatch table: keyed only by x_format.
     # Value: (callable_impl, resolved_output_format)
-    _impl_map: Dict[FORMAT, Tuple[Callable, FORMAT]] = {
-        FORMAT.RAGGED: (reduce_rr, FORMAT.RAGGED),
+    _impl_map: Dict[FORMAT, FORMAT] = {
+        FORMAT.RAGGED: (FORMAT.RAGGED),
+        FORMAT.BATCHED: (FORMAT.BATCHED),
         # Add more entries if you support other formats, e.g.:
         # FORMAT.PAGED: (reduce_pp, FORMAT.PAGED),
     }
@@ -82,7 +83,7 @@ class Reduce(vOp):
         self.impl: Optional[Callable] = None
         self.output_format: Optional[FORMAT] = None
         self.output_buffer: Optional[torch.Tensor] = None
-
+        self.schedule = Schedule.W
         # Validate reduction dimension at construction
         prefix = self._prefix()
         assert self.dim in (1, 2), f"{prefix}__init__: dim must be 1 or 2, got dim={self.dim}"
@@ -140,34 +141,32 @@ class Reduce(vOp):
             f"{prefix}no implementation for x_fmt={x_fmt}. "
             f"Available keys: {list(self._impl_map.keys())}"
         )
-        self.impl, self.output_format = self._impl_map[x_fmt]
+        self.output_format = self._impl_map[x_fmt]
 
         # Compute output logical shape according to `dim`
         # The leading dimension N is taken from the runtime context,
         # not from x.shape[0], to remain consistent with other ops.
-        N = ctx.max_num_pages
         D0, D1 = x.shape[1], x.shape[2]
         out_D0 = 1 if self.dim == 1 else D0   # D_0 collapsed when reducing over dim=1
         out_D1 = 1 if self.dim == 2 else D1   # D_1 collapsed when reducing over dim=2
 
         # Allocate output buffer on x.device with x.dtype
-        self.output_buffer = torch.empty(
-            (N, out_D0, out_D1),
+        self.output_buffer = as_vtensor(torch.empty(
+            (0, out_D0, out_D1),
             device=x.device,
             dtype=x.dtype,
+        ), self.output_format, tensor_id=len(ctx.tensor_list)  # Assign a new tensor_id based on current tensor count
         )
 
-        # Account auxiliary memory
-        ctx.add_aux_memory(self.output_buffer)
-
-        for t in [x]:
-            if t._format == FORMAT.PAGED:
-                ctx.add_aux_flops(
-                    t.shape[1] * t.shape[2]
-                )
-                
+        # Track auxiliary memory and graph structure in the context
+        ctx.tensor_list.append(self.output_buffer)  # Track the output buffer in the context
+        ctx.output_tensor_to_op_list.append(len(ctx.op_list))  # Map the output tensor to this operation
+        ctx.op_list.append(self)  # Track this operation in the context
+        ctx.op_to_input_tensor_list.append([x.tensor_id])  # Map this op to its input tensors
+        ctx.op_to_output_tensor_list.append([self.output_buffer.tensor_id])  # Map this op to its output tensor
+        
         # Return vTensor view carrying the dispatched output format
-        return as_vtensor(self.output_buffer, self.output_format)
+        return self.output_buffer
 
     # ---------------- execute ----------------
     def execute(self, x: torch.Tensor, ctx: Context) -> torch.Tensor:
@@ -203,13 +202,15 @@ class Reduce(vOp):
             If :meth:`profile` has not been called (no implementation or
             output buffer).
         """
-        prefix = self._prefix()
-        assert self.impl is not None, f"{prefix}execute called before profile() (impl is None)"
-        assert self.output_buffer is not None, f"{prefix}output buffer is None; did profile() run?"
 
-        # Expected signature: impl(x, output, dim, reduce_type, ctx)
-        self.impl(x, self.output_buffer, self.dim, self.reduce_type, ctx)
-        return self.output_buffer
+        assert False
+        # prefix = self._prefix()
+        # assert self.impl is not None, f"{prefix}execute called before profile() (impl is None)"
+        # assert self.output_buffer is not None, f"{prefix}output buffer is None; did profile() run?"
+
+        # # Expected signature: impl(x, output, dim, reduce_type, ctx)
+        # self.impl(x, self.output_buffer, self.dim, self.reduce_type, ctx)
+        # return self.output_buffer
 
 
     

@@ -48,6 +48,7 @@ class Save(vOp):
     }
 
     def __init__(self):
+        assert False, "Save operator is currently disabled pending implementation of the save_rp kernel. Please implement the kernel and update the _impl_map to enable this functionality."
         super().__init__()
         self.impl: Optional[Callable] = None
         self.output_format: Optional[FORMAT] = None
@@ -219,6 +220,7 @@ class Load(vOp):
     }
 
     def __init__(self):
+        assert False, "Load operator is currently disabled pending implementation of the load_pr kernel. Please implement the kernel and update the _impl_map to enable this functionality."
         super().__init__()
         self.impl: Optional[Callable] = None
         self.output_format: Optional[FORMAT] = None

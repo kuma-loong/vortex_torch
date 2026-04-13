@@ -2,7 +2,7 @@ import torch
 from typing import Dict
 
 from .flow import vFlow
-from ..indexer import topK, GeMV, Softmax, Max, Sum, GeMM, Maximum, Multiply, Add, L2Norm, Save, Load
+from ..indexer import topK, GeMV, Softmax, Max, Sum, GeMM, Maximum, Multiply, Add, L2Norm, Save, Load, Mean
 from ..cache import Mean as CMean, Max as CMax, Min as CMin, L2Norm as CL2Norm
 from ..abs import ContextBase
 from .registry import register
@@ -105,7 +105,8 @@ class BlockSparseAttention(vFlow):
     def __init__(self):
         super().__init__()
         # Indexer-side ops
-        self.gemv = GeMV()
+        self.gemm = GeMM()
+        self.mean = Mean(dim=1)
         self.output_func = topK()
 
         # Cache-side ops
@@ -165,8 +166,8 @@ class BlockSparseAttention(vFlow):
            and write the corresponding indices into ``o`` in the packed
            sparse layout.
         """
-        q_mean = q.mean(dim=1, keepdim=True)
-        score = self.gemv(q_mean, cache["centroids"], ctx=ctx)
+        q_mean = self.mean(q, ctx=ctx)
+        score = self.gemm(q_mean, cache["centroids"], ctx=ctx)
         self.output_func(score, o, ctx=ctx)
 
     def forward_cache(
@@ -306,8 +307,8 @@ class GQABlockSparseAttention(vFlow):
            ``[S_sparse, 1, 1]``.
         """
         score = self.gemm(q, cache["centroids"], ctx=ctx)
-        self.softmax(score, ctx=ctx)
-        aggr_score = self.max_op(score, ctx=ctx)
+        normalized_score = self.softmax(score, ctx=ctx)
+        aggr_score = self.max_op(normalized_score, ctx=ctx)
         self.output_func(aggr_score, o, ctx=ctx)
 
     def forward_cache(

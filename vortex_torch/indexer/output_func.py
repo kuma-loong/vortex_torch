@@ -1,9 +1,9 @@
 import torch
 from typing import Dict, Callable, Optional
-from ..abs import vOp
+from ..abs import vOp, vTensor, FORMAT
 from vortex_torch_C import topk_output
 from .context import Context
-from ..abs import vTensor, FORMAT
+from ..utils import Schedule
 
 class topK(vOp):
     r"""
@@ -82,6 +82,7 @@ class topK(vOp):
     def __init__(self):
         super().__init__()
         self.impl: Optional[Callable] = None
+        self.schedule = Schedule.S
 
     # ---------------- profile ----------------
     def profile(self, x: vTensor, o: vTensor, ctx: Context) -> None:
@@ -161,6 +162,12 @@ class topK(vOp):
             f"{prefix}x and o must be on the same device "
             f"(x.device={x.device}, o.device={o.device})"
         )
+
+        # Track auxiliary memory and graph structure in the context
+        ctx.output_tensor_to_op_list[o.tensor_id] = len(ctx.op_list)   # Map the output tensor to this operation
+        ctx.op_list.append(self)  # Track this operation in the context
+        ctx.op_to_input_tensor_list.append([x.tensor_id])  # Map this op to its input tensors
+        ctx.op_to_output_tensor_list.append([o.tensor_id])  # Map this op to its output tensor
 
     # ---------------- execute ----------------
     def execute(self, x: torch.Tensor, o: torch.Tensor, ctx: Context) -> torch.Tensor:

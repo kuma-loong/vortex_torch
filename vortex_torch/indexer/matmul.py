@@ -2,7 +2,7 @@ import torch
 from typing import Tuple, Dict, Callable, Optional
 from .context import Context
 from ..abs import vTensor, as_vtensor, FORMAT, vOp
-
+from ..utils import Schedule
 from .triton_kernels.mv_impl import mv_bpr
 from .triton_kernels.matmul_impl import mm_bpr, mm_rrr, mm_rpr
 
@@ -81,8 +81,8 @@ class GeMV(vOp):
 
     # Implementation dispatch table: keyed by (x_format, y_format).
     # Value: (callable_impl, resolved_output_format)
-    _impl_map: Dict[Tuple[FORMAT, FORMAT], Tuple[Callable, FORMAT]] = {
-        (FORMAT.BATCHED, FORMAT.PAGED): (mv_bpr, FORMAT.RAGGED),
+    _impl_map: Dict[Tuple[FORMAT, FORMAT], FORMAT] = {
+        (FORMAT.BATCHED, FORMAT.PAGED): FORMAT.RAGGED,
         # Extend with more pairs as needed.
     }
 
@@ -91,7 +91,7 @@ class GeMV(vOp):
         self.impl: Optional[Callable] = None
         self.output_format: Optional[FORMAT] = None
         self.output_buffer: Optional[torch.Tensor] = None
-
+        self.schedule = Schedule.W
     # ---------------- profile ----------------
     def profile(self, x: vTensor, y: vTensor, ctx: Context) -> vTensor:
         r"""
@@ -130,24 +130,26 @@ class GeMV(vOp):
             f"{prefix}no implementation for (x_fmt={x_fmt}, y_fmt={y_fmt}). "
             f"Available: {list(self._impl_map.keys())}"
         )
-        self.impl, self.output_format = self._impl_map[key]
-
+        # self.impl, self.output_format = self._impl_map[key]
+        self.output_format = self._impl_map[key]
         # Allocate output buffer on x.device/x.dtype
-        S_out = ctx.max_num_blocks        # logical "S_pack" per runtime
-        self.output_buffer = torch.empty(
-            (S_out, 1, 1),
+        #S_out = ctx.max_num_blocks        # logical "S_pack" per runtime
+        self.output_buffer = as_vtensor(torch.empty(
+            (0, 1, 1),
             device=x.device,
             dtype=x.dtype,
+        ), self.output_format, tensor_id=len(ctx.tensor_list)  # Assign a new tensor_id based on current tensor count
         )
-        ctx.add_aux_memory(self.output_buffer)
-        
-        for t in [x, y]:
-            if t._format == FORMAT.PAGED:
-                ctx.add_aux_flops(
-                    t.shape[1] * t.shape[2]
-                )
-                
-        return as_vtensor(self.output_buffer, self.output_format)
+
+        # Track auxiliary memory and graph structure in the context
+        ctx.tensor_list.append(self.output_buffer)  # Track the output buffer in the context
+        ctx.output_tensor_to_op_list.append(len(ctx.op_list))  # Map the output tensor to this operation
+        ctx.op_list.append(self)  # Track this operation in the context
+        ctx.op_to_input_tensor_list.append([x.tensor_id, y.tensor_id])  # Map this op to its input tensors
+        ctx.op_to_output_tensor_list.append([self.output_buffer.tensor_id])  # Map this op to its output tensor
+
+        return self.output_buffer
+       
 
     # ---------------- execute ----------------
     def execute(self, x: torch.Tensor, y: torch.Tensor, ctx: Context) -> torch.Tensor:
@@ -177,16 +179,17 @@ class GeMV(vOp):
             The output tensor stored in ``self.output_buffer`` with shape
             ``[S_pack, 1, 1]``.
         """
-        prefix = self._prefix()
-        assert self.impl is not None, f"{prefix}execute called before profile() (impl is None)"
-        assert self.output_buffer is not None, f"{prefix}output buffer is None; did profile() run?"
-        assert x.device == y.device == self.output_buffer.device, (
-            f"{prefix}device mismatch: "
-            f"x={x.device}, y={y.device}, o={self.output_buffer.device}"
-        )
+        assert False, "GeMV.execute is not implemented yet. Please implement the kernel and then enable this code."
+        # prefix = self._prefix()
+        # assert self.impl is not None, f"{prefix}execute called before profile() (impl is None)"
+        # assert self.output_buffer is not None, f"{prefix}output buffer is None; did profile() run?"
+        # assert x.device == y.device == self.output_buffer.device, (
+        #     f"{prefix}device mismatch: "
+        #     f"x={x.device}, y={y.device}, o={self.output_buffer.device}"
+        # )
 
-        self.impl(x, y, self.output_buffer, ctx)
-        return self.output_buffer
+        # self.impl(x, y, self.output_buffer, ctx)
+        # return self.output_buffer
 
 
 
@@ -247,10 +250,10 @@ class GeMM(vOp):
 
     # Implementation dispatch table: keyed by (x_format, y_format).
     # Value: (callable_impl, resolved_output_format)
-    _impl_map: Dict[Tuple[FORMAT, FORMAT], Tuple[Callable, FORMAT]] = {
-        (FORMAT.BATCHED, FORMAT.PAGED): (mm_bpr, FORMAT.RAGGED),
-        (FORMAT.RAGGED, FORMAT.RAGGED): (mm_rrr, FORMAT.RAGGED),
-        (FORMAT.RAGGED, FORMAT.PAGED):  (mm_rpr, FORMAT.RAGGED),
+    _impl_map: Dict[Tuple[FORMAT, FORMAT], FORMAT] = {
+        (FORMAT.BATCHED, FORMAT.PAGED): (FORMAT.RAGGED),
+        (FORMAT.RAGGED, FORMAT.RAGGED): (FORMAT.RAGGED),
+        (FORMAT.RAGGED, FORMAT.PAGED):  (FORMAT.RAGGED),
         # Extend with more pairs as needed.
     }
 
@@ -259,6 +262,7 @@ class GeMM(vOp):
         self.impl: Optional[Callable] = None
         self.output_format: Optional[FORMAT] = None
         self.output_buffer: Optional[torch.Tensor] = None
+        self.schedule = Schedule.W
 
     # ---------------- profile ----------------
     def profile(self, x: vTensor, y: vTensor, ctx: Context) -> vTensor:
@@ -329,27 +333,27 @@ class GeMM(vOp):
             f"{prefix}no implementation for (x_fmt={x_fmt}, y_fmt={y_fmt}). "
             f"Available: {list(self._impl_map.keys())}"
         )
-        self.impl, self.output_format = self._impl_map[key]
+        self.output_format = self._impl_map[key]
 
         # Output logical sizes: Ny x Nx
         Ny, Nx = y.shape[1], x.shape[1]
-        B_out = ctx.max_num_pages  # logical S
 
         # Allocate output buffer on x.device/x.dtype
-        self.output_buffer = torch.empty(
-            (B_out, Ny, Nx),
+        self.output_buffer = as_vtensor(torch.empty(
+            (0, Ny, Nx),
             device=x.device,
             dtype=x.dtype,
+        ), self.output_format, tensor_id=len(ctx.tensor_list)  # Assign a new tensor_id based on current tensor count
         )
-        ctx.add_aux_memory(self.output_buffer)
-        
-        for t in [x, y]:
-            if t._format == FORMAT.PAGED:
-                ctx.add_aux_flops(
-                    t.shape[1] * t.shape[2]
-                )
-                
-        return as_vtensor(self.output_buffer, self.output_format)
+
+        # Track auxiliary memory and graph structure in the context
+        ctx.tensor_list.append(self.output_buffer)  # Track the output buffer in the context
+        ctx.output_tensor_to_op_list.append(len(ctx.op_list))  # Map the output tensor to this operation
+        ctx.op_list.append(self)  # Track this operation in the context
+        ctx.op_to_input_tensor_list.append([x.tensor_id, y.tensor_id])  # Map this op to its input tensors
+        ctx.op_to_output_tensor_list.append([self.output_buffer.tensor_id])  # Map this op to its output tensor
+
+        return self.output_buffer
 
     # ---------------- execute ----------------
     def execute(self, x: torch.Tensor, y: torch.Tensor, ctx: Context) -> torch.Tensor:
@@ -387,13 +391,14 @@ class GeMM(vOp):
             buffer), or if there is a device mismatch between ``x``, ``y``
             and the output buffer.
         """
-        prefix = self._prefix()
-        assert self.impl is not None, f"{prefix}execute called before profile() (impl is None)"
-        assert self.output_buffer is not None, f"{prefix}output buffer is None; did profile() run?"
-        assert x.device == y.device == self.output_buffer.device, (
-            f"{prefix}device mismatch: "
-            f"x={x.device}, y={y.device}, o={self.output_buffer.device}"
-        )
+        assert False, "GeMM.execute is not implemented yet. Please implement the kernel and then enable this code."
+        # prefix = self._prefix()
+        # assert self.impl is not None, f"{prefix}execute called before profile() (impl is None)"
+        # assert self.output_buffer is not None, f"{prefix}output buffer is None; did profile() run?"
+        # assert x.device == y.device == self.output_buffer.device, (
+        #     f"{prefix}device mismatch: "
+        #     f"x={x.device}, y={y.device}, o={self.output_buffer.device}"
+        # )
 
-        self.impl(x, y, self.output_buffer, ctx)
-        return self.output_buffer
+        # self.impl(x, y, self.output_buffer, ctx)
+        # return self.output_buffer

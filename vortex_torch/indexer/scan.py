@@ -1,9 +1,10 @@
 import torch
 from typing import Tuple, Dict, Callable, Optional
 from .context import Context
-from ..abs import vTensor, FORMAT, vOp
+from ..abs import vTensor, FORMAT, vOp, as_vtensor
 from .triton_kernels.softmax_impl import softmax_inplace_r
 from .triton_kernels.normalize_impl import normalize_inplace_r
+from ..utils import Schedule
 
 class Softmax(vOp):
     r"""
@@ -82,8 +83,8 @@ class Softmax(vOp):
 
     # Implementation dispatch table: keyed by x_format.
     # Value: (callable_impl, resolved_output_format)
-    _impl_map: Dict[FORMAT, Tuple[Callable, FORMAT]] = {
-        FORMAT.RAGGED: (softmax_inplace_r, FORMAT.RAGGED),
+    _impl_map: Dict[FORMAT, FORMAT] = {
+        FORMAT.RAGGED: (FORMAT.RAGGED),
         # Extend with other formats if you add more kernels, e.g.:
         # FORMAT.PAGED: (softmax_inplace_p, FORMAT.PAGED),
     }
@@ -94,7 +95,7 @@ class Softmax(vOp):
         self.scale = scale
         self.impl: Optional[Callable] = None
         self.output_format: Optional[FORMAT] = None
-
+        self.schedule = Schedule.S
         # Validate dim at construction
         prefix = self._prefix()
         assert self.dim in (0,), f"{prefix}__init__: dim must be 0, got dim={self.dim}"
@@ -148,16 +149,22 @@ class Softmax(vOp):
             f"{prefix}no implementation for x_fmt={x_fmt}. "
             f"Available keys: {list(self._impl_map.keys())}"
         )
-        self.impl, self.output_format = self._impl_map[x_fmt]
+        self.output_format = self._impl_map[x_fmt]
 
-        for t in [x]:
-            if t._format == FORMAT.PAGED:
-                ctx.add_aux_flops(
-                    t.shape[1] * t.shape[2]
-                )
-                
-        # In-place: return the same vTensor view
-        return x
+        self.output_buffer = as_vtensor(torch.empty(
+            (0, x.shape[1], x.shape[2]),
+            device=x.device,
+            dtype=x.dtype,
+        ), self.output_format, tensor_id=len(ctx.tensor_list)  # Assign a new tensor_id based on current tensor count
+        )
+        # Track auxiliary memory and graph structure in the context
+        ctx.tensor_list.append(self.output_buffer)  # Track the output buffer in the context
+        ctx.output_tensor_to_op_list.append(len(ctx.op_list))  # Map the output tensor to this operation
+        ctx.op_list.append(self)  # Track this operation in the context
+        ctx.op_to_input_tensor_list.append([x.tensor_id])  # Map this op to its input tensors
+        ctx.op_to_output_tensor_list.append([self.output_buffer.tensor_id])  # Map this op to its output tensor
+
+        return self.output_buffer
 
     # ---------------- execute ----------------
     def execute(self, x: torch.Tensor, ctx: Context) -> torch.Tensor:
@@ -189,12 +196,13 @@ class Softmax(vOp):
             If :meth:`profile` has not been called and no implementation is
             available.
         """
-        prefix = self._prefix()
-        assert self.impl is not None, f"{prefix}execute called before profile() (impl is None)"
+        assert False, "Softmax execution is currently disabled pending implementation of the softmax_inplace_r kernel. Please implement the kernel and update the _impl_map to enable this functionality."
+        # prefix = self._prefix()
+        # assert self.impl is not None, f"{prefix}execute called before profile() (impl is None)"
 
-        # Expected signature: impl(x, dim, scale, ctx)
-        self.impl(x, self.dim, self.scale, ctx)
-        return x
+        # # Expected signature: impl(x, dim, scale, ctx)
+        # self.impl(x, self.dim, self.scale, ctx)
+        # return x
 
 
     
@@ -273,13 +281,14 @@ class Normalize(vOp):
 
     # Implementation dispatch table: keyed by x_format.
     # Value: (callable_impl, resolved_output_format)
-    _impl_map: Dict[FORMAT, Tuple[Callable, FORMAT]] = {
-        FORMAT.RAGGED: (normalize_inplace_r, FORMAT.RAGGED),
+    _impl_map: Dict[FORMAT, FORMAT] = {
+        FORMAT.RAGGED: (FORMAT.RAGGED),
         # Extend with other formats if you add more kernels, e.g.:
         # FORMAT.PAGED: (normalize_inplace_p, FORMAT.PAGED),
     }
 
     def __init__(self, dim: int = 0):
+        assert False, "Normalize operator is currently disabled pending implementation of the normalize_inplace_r kernel. Please implement the kernel and update the _impl_map to enable this functionality."
         super().__init__()
         self.dim = dim
         self.impl: Optional[Callable] = None
@@ -339,16 +348,22 @@ class Normalize(vOp):
             f"{prefix}no implementation for x_fmt={x_fmt}. "
             f"Available keys: {list(self._impl_map.keys())}"
         )
-        self.impl, self.output_format = self._impl_map[x_fmt]
+        self.output_format = self._impl_map[x_fmt]
 
-        for t in [x]:
-            if t._format == FORMAT.PAGED:
-                ctx.add_aux_flops(
-                    t.shape[1] * t.shape[2]
-                )
-                
-        # In-place: return the same vTensor view
-        return x
+        self.output_buffer = as_vtensor(torch.empty(
+            (0, x.shape[1], x.shape[2]),
+            device=x.device,
+            dtype=x.dtype,
+        ), self.output_format, tensor_id=len(ctx.tensor_list)  # Assign a new tensor_id based on current tensor count
+        )
+        # Track auxiliary memory and graph structure in the context
+        ctx.tensor_list.append(self.output_buffer)  # Track the output buffer in the context
+        ctx.output_tensor_to_op_list.append(len(ctx.op_list))  # Map the output tensor to this operation
+        ctx.op_list.append(self)  # Track this operation in the context
+        ctx.op_to_input_tensor_list.append([x.tensor_id])  # Map this op to its input tensors
+        ctx.op_to_output_tensor_list.append([self.output_buffer.tensor_id])  # Map this op to its output tensor
+
+        return self.output_buffer
 
     # ---------------- execute ----------------
     def execute(self, x: torch.Tensor, ctx: Context) -> torch.Tensor:
@@ -380,9 +395,10 @@ class Normalize(vOp):
             If :meth:`profile` has not been called and no implementation is
             available.
         """
-        prefix = self._prefix()
-        assert self.impl is not None, f"{prefix}execute called before profile() (impl is None)"
+        assert False, "Normalize execution is currently disabled pending implementation of the normalize_inplace_r kernel. Please implement the kernel and update the _impl_map to enable this functionality."
+        # prefix = self._prefix()
+        # assert self.impl is not None, f"{prefix}execute called before profile() (impl is None)"
 
-        # Expected signature: impl(x, dim, ctx)
-        self.impl(x, self.dim, ctx)
-        return x
+        # # Expected signature: impl(x, dim, ctx)
+        # self.impl(x, self.dim, ctx)
+        # return x

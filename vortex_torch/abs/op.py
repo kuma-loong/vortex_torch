@@ -2,7 +2,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 from .context_base import ContextBase
-from ..utils import Mode
+from ..utils import Mode, Schedule
 
 
 class vOp(ABC):
@@ -21,6 +21,7 @@ class vOp(ABC):
     
     def __init__(self) -> None:
         super().__init__()
+        self.schedule = Schedule.S  #: Schedule type (e.g. W or S) that may be used by implementations.
 
     @abstractmethod
     def profile(self, *args: Any, ctx: ContextBase = None, **kwargs: Any) -> Any:

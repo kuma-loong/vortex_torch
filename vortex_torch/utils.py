@@ -9,6 +9,10 @@ class Mode(Enum):
     profile = 0
     execute = 1
 
+class Schedule(Enum):
+    W = 0
+    S = 1
+    
 class ReduceType(Enum):
     Mean = 0
     Max = 1
@@ -16,7 +20,6 @@ class ReduceType(Enum):
     L2Norm = 3
     Sum = 4
     
-
 class ElementwiseBinaryOpType(Enum):
     Maximum = 0
     Minimum = 1
@@ -30,3 +33,12 @@ class ElementwiseOpType(Enum):
     Silu = 2
     Abs = 3
     Add_Mul = 4
+
+INDENT = "    "
+def indent_block(text: str, level: int = 1) -> str:
+    """
+    Indent a multi-line text block by the given indentation level.
+    """
+    prefix = INDENT * level
+    lines = text.splitlines()
+    return "\n".join(prefix + line if line.strip() else line for line in lines)

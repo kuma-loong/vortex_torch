@@ -12,7 +12,7 @@ o,  # [*, 1 or D0, 1 or D1]
 winfo_offsets,     # int32
 winfo_lens,        # int32
 winfo_num_workloads, # int32*
-max_chunk_size: tl.constexpr,
+W: tl.constexpr,
 x_D0: tl.constexpr,
 x_D1: tl.constexpr,
 DIM: tl.constexpr,
@@ -30,7 +30,7 @@ REDUCE_TYPE: tl.constexpr
     start = pid * per + tl.minimum(pid, r)
     end   = start + per + (pid < r)
 
-    idx_ptr = tl.arange(0, max_chunk_size)
+    idx_ptr = tl.arange(0, W)
     dim0 = tl.arange(0, x_D0)
     dim1 = tl.arange(0, x_D1)
     
@@ -64,7 +64,7 @@ REDUCE_TYPE: tl.constexpr
                 x_i_reduce = tl.sum(x_i, axis=1)
 
             else:
-                x_i_reduce = tl.zeros((max_chunk_size, x_D1), dtype=tl.bfloat16)
+                x_i_reduce = tl.zeros((W, x_D1), dtype=tl.bfloat16)
             
             x_i_reduce = x_i_reduce.to(tl.bfloat16)
             o_i_ptr = o + x_off * x_D1 + idx_ptr[:, None] * x_D1 + dim1[None,:]
@@ -88,7 +88,7 @@ REDUCE_TYPE: tl.constexpr
                 x_i_reduce = tl.sum(x_i, axis=2)
 
             else:
-                x_i_reduce = tl.zeros((max_chunk_size, x_D1), dtype=tl.float32)
+                x_i_reduce = tl.zeros((W, x_D1), dtype=tl.float32)
 
             x_i_reduce = x_i_reduce.to(tl.bfloat16)
             o_i_ptr = o + x_off * x_D0 + idx_ptr[:, None] * x_D0 + dim0[None,:]
@@ -110,7 +110,7 @@ ctx: Context
         ctx.winfo_kv_offsets,
         ctx.winfo_kv_lens,
         ctx.winfo_num_workloads,
-        ctx.max_chunk_size,
+        ctx.workload_chunk_size,
         x.shape[-2], 
         x.shape[-1], 
         dim, 

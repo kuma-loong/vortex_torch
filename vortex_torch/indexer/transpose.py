@@ -56,6 +56,7 @@ class Transpose(vOp):
     }
 
     def __init__(self):
+        assert False, "Transpose operator is currently disabled pending implementation of the transpose_rr kernel. Please implement the kernel and update the _impl_map to enable this functionality."
         super().__init__()
         self.impl: Optional[Callable] = None
         self.output_format: Optional[FORMAT] = None

@@ -3,7 +3,7 @@ from typing import Any, Final, Union
 import torch
 from ..abs import ContextBase
 from ..utils import UNSET, Mode
-
+import uuid
 
 class Context(ContextBase):
     """
@@ -20,7 +20,7 @@ class Context(ContextBase):
         # head / shape
         "group_size", "num_kv_heads", "num_qo_heads", "head_dim",
         # hardware / paging
-        "num_sms", "page_size", "max_num_pages", "max_num_pages_per_request", "block_size", "max_num_blocks", "max_num_blocks_per_request", "num_blocks_per_page",
+        "num_sms", "page_size", "max_num_pages", "max_num_pages_per_request", "block_size", "max_num_blocks", "max_num_blocks_per_request", "num_blocks_per_page", "num_pages_per_workload",
         # misc
         "indexer_dtype", "topk_val", "block_reserved_bos", "block_reserved_eos",
         
@@ -28,8 +28,14 @@ class Context(ContextBase):
         "_aux_total_bytes",
         
         # auxilary flops in graph
-        "_aux_total_flops"
-    )
+        "_aux_total_flops",
+
+        "tensor_list", "op_list", "output_tensor_to_op_list", "op_to_input_tensor_list", "op_to_output_tensor_list",
+
+        "sparse_attention_name", "impl_backend", "tensor_id_to_tensor_name_map", "compilation_header_lines", "auxilary_func_def_lines",
+
+        "compilation_cache_dir",
+        )
     
     # --- index tensors ---
     dense_kv_indices: torch.Tensor  #: Dense KV index tensor for mapping keys/values.
@@ -65,6 +71,7 @@ class Context(ContextBase):
     max_num_blocks: int               #: Total available pages.
     max_num_blocks_per_request: int   #: Page limit per individual request.
     num_blocks_per_page: int        #: Number of blocks contained in a single page.
+    num_pages_per_workload: int      #: Number of pages processed per workload (derived from chunk size).
 
     # --- miscellaneous ---
     indexer_dtype: torch.dtype       #: Dtype used by indexer operations.
@@ -75,7 +82,17 @@ class Context(ContextBase):
     # --- auxiliary ---
     _aux_total_bytes: int            #: Accumulated auxiliary memory in bytes.
     _aux_total_flops: int            #: Accumulated auxiliary flops.
-    
+    tensor_list: list                #: List of tensors used in the graph.
+    op_list: list                    #: List of operations in the graph.
+    output_tensor_to_op_list: list    #: Mapping from output tensors to their producing operations.
+    op_to_input_tensor_list: list     #: Mapping from operations to their input tensors.
+    op_to_output_tensor_list: list    #: Mapping from operations to their output tensors.
+    sparse_attention_name: str          #: Name of the sparse attention implementation to use.
+    impl_backend: str       #: Implementation backend to use for code generation.
+    tensor_id_to_tensor_name_map: dict #: Mapping from tensor IDs to human-readable names for debugging.
+    compilation_header_lines: list       #: Header string to prepend to generated code during compilation.
+    auxilary_func_def_lines: list       #: List of auxiliary function definitions to include in the generated code.
+    compilation_cache_dir: str          #: Directory path for caching compiled kernels.
     def __init__(self) -> None:
         # Start as an empty shell (no big allocations).
         for name in self.__slots__:
@@ -135,13 +152,13 @@ class Context(ContextBase):
         self.block_size = sa.vortex_block_size
         self.num_blocks_per_page = self.page_size // self.block_size
         assert self.page_size % self.block_size == 0, "Page size must be a multiple of block size."
-        #TODO(dreaming-panda): Relax the chunk size == blocks per page constraint by adding intra-page offsets in the kernels.
-        assert self.workload_chunk_size == self.num_blocks_per_page, "Workload chunk size must equal the number of blocks per page for simplicity."
+        assert self.workload_chunk_size % self.num_blocks_per_page == 0, "Workload chunk size must be a multiple of blocks per page."
         # Capacity model (adjust as needed)
         self.max_num_pages = max_pages_per_req * max_bs * self.num_kv_heads
         self.max_num_pages_per_request = max_pages_per_req
         self.max_num_blocks = self.max_num_pages * self.num_blocks_per_page
         self.max_num_blocks_per_request = self.max_num_pages_per_request * self.num_blocks_per_page
+        self.num_pages_per_workload = self.workload_chunk_size // self.num_blocks_per_page
         self.topk_val = sa.vortex_topk_val
         dtype_str = getattr(sa, "vortex_indexer_dtype", "float32")
         if isinstance(dtype_str, str):
@@ -163,6 +180,17 @@ class Context(ContextBase):
         self.winfo_num_workloads = torch.zeros((1,), dtype=torch.int32, device=device)
         self.winfo_chunk_size = torch.zeros((1,), dtype=torch.int32, device=device)
 
+        self.tensor_list = []
+        self.op_list = []
+        self.output_tensor_to_op_list = []
+        self.op_to_input_tensor_list = []
+        self.op_to_output_tensor_list = []
+        self.tensor_id_to_tensor_name_map = {}
+        self.compilation_header_lines = []
+        self.auxilary_func_def_lines = []
+        self.compilation_cache_dir = sa.vortex_compilation_cache_dir
+        self.sparse_attention_name = parent.sparse_attention.__class__.__name__.lower() + f"_{uuid.uuid4().hex[:8]}"  # unique name for this attention instance 
+        self.impl_backend = "triton"  # default to triton; can be overridden by user
         self._created = True
         return self
 

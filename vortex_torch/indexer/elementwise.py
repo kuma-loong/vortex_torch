@@ -3,7 +3,7 @@ from typing import Tuple, Dict, Callable, Optional
 from .context import Context
 from ..abs import vTensor, as_vtensor, FORMAT, vOp
 from .triton_kernels.elementwise_impl import elementwise_rr
-from ..utils import ElementwiseOpType
+from ..utils import ElementwiseOpType, Schedule
 
 class Elementwise(vOp):
     """
@@ -41,13 +41,14 @@ class Elementwise(vOp):
 
     # Implementation dispatch table: keyed only by x_format.
     # Value: (callable_impl, resolved_output_format)
-    _impl_map: Dict[FORMAT, Tuple[Callable, FORMAT]] = {
-        FORMAT.RAGGED: (elementwise_rr, FORMAT.RAGGED),
+    _impl_map: Dict[FORMAT, FORMAT] = {
+        FORMAT.RAGGED: (FORMAT.RAGGED),
         # Add more entries if you support other formats:
         # FORMAT.PAGED: (elementwise_pp, FORMAT.PAGED),
     }
 
     def __init__(self, alpha: float = 1.0, beta: float = 1.0):
+        assert False, "Elementwise operator is currently disabled pending implementation of the elementwise_rr kernel. Please implement the kernel and update the _impl_map to enable this functionality."
         super().__init__()
         self.impl: Optional[Callable] = None
         self.op_type: Optional[ElementwiseOpType] = None

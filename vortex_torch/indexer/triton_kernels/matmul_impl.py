@@ -93,6 +93,162 @@ D: tl.constexpr,
         tl.store(o + offs_o, o_i, mask=valid[:, None, None])
 
 
+@triton.jit
+def group_mm_bpr_kernel(
+    x,                      # bf16, logical shape [B, G, D]
+    y,                      # bf16, logical shape [S, C, D]
+    o,                      # bf16, logical shape [*, C, G], stored as flat buffer
+    indices,                # int32
+    winfo_x_indices,        # int32
+    winfo_y_offsets,        # int32
+    winfo_y_lens,           # int32
+    winfo_num_workloads,    # int32*
+    BG:tl.constexpr,                     # = B * G, flattened row count for x2d
+    SC:tl.constexpr,                     # = S * C, flattened row count for y2d
+    W: tl.constexpr,
+    G: tl.constexpr,
+    C: tl.constexpr,
+    D: tl.constexpr,
+):
+    # ------------------------------------------------------------
+    # Program-level partitioning of workloads
+    # ------------------------------------------------------------
+    pid = tl.program_id(0)
+    num_progs = tl.num_programs(0)
+
+    n_workloads = tl.load(winfo_num_workloads)
+
+    per = n_workloads // num_progs
+    r = n_workloads % num_progs
+    start = pid * per + tl.minimum(pid, r)
+    end = start + per + (pid < r)
+
+    # ------------------------------------------------------------
+    # Useful index vectors
+    # ------------------------------------------------------------
+    idx_ptr = tl.arange(0, W)
+    c_ptr = tl.arange(0, C)
+    g_ptr = tl.arange(0, G)
+
+    # ------------------------------------------------------------
+    # Persistent cache for x[x_idx, :, :] with shape [G, D]
+    # We store it in fp32 for accumulation
+    # ------------------------------------------------------------
+    current_x_idx = tl.full((), -1, dtype=tl.int32)
+    x_i = tl.zeros((G, D), dtype=tl.float32)
+
+    for i in range(start, end):
+        # --------------------------------------------------------
+        # 1) Load x tile if x index changed
+        # --------------------------------------------------------
+        x_idx_i32 = tl.load(winfo_x_indices + i).to(tl.int32)
+
+        if x_idx_i32 != current_x_idx:
+            # Flatten x from [B, G, D] to [B*G, D]
+            # Row offset for x[x_idx, :, :] is x_idx * G
+            x_row_start = x_idx_i32 * G
+
+            x_block_ptr = tl.make_block_ptr(
+                base=x,
+                shape=(BG, D),                 # flattened 2D view of x
+                strides=(D, 1),               # row-major: each row has D elements
+                offsets=(x_row_start, 0),     # start at row x_idx * G
+                block_shape=(G, D),           # load the full [G, D] tile
+                order=(1, 0),
+            )
+
+            x_i = tl.load(
+                x_block_ptr,
+                boundary_check=(0, 1),
+                padding_option="zero",
+            ).to(tl.float32)
+
+            current_x_idx = x_idx_i32
+
+        # --------------------------------------------------------
+        # 2) Load workload metadata
+        # --------------------------------------------------------
+        y_len = tl.load(winfo_y_lens + i)
+        y_off = tl.load(winfo_y_offsets + i)
+        valid = idx_ptr < y_len
+
+        # --------------------------------------------------------
+        # 3) Load the first y index of this workload
+        # We assume the W rows are contiguous:
+        #   y_row = indices[y_off] + w
+        # --------------------------------------------------------
+        y_idx_i32 = tl.load(indices + y_off).to(tl.int32)
+
+        # --------------------------------------------------------
+        # 4) Load y tile using block_ptr
+        #
+        # Flatten y from [S, C, D] to [S*C, D].
+        # For a given y row s, the flattened row range is:
+        #   [s*C, s*C + C)
+        #
+        # So W consecutive y rows correspond to W*C consecutive
+        # rows in the flattened 2D view.
+        # --------------------------------------------------------
+        rows_total: tl.constexpr = W * C
+        y_row_start = y_idx_i32 * C
+
+        y_block_ptr = tl.make_block_ptr(
+            base=y,
+            shape=(SC, D),                    # flattened 2D view of y
+            strides=(D, 1),                   # row-major
+            offsets=(y_row_start, 0),         # start at row y_idx * C
+            block_shape=(rows_total, D),      # load [W*C, D]
+            order=(1, 0),
+        )
+
+        y_rc = tl.load(
+            y_block_ptr,
+            boundary_check=(0, 1),
+            padding_option="zero",
+        ).to(tl.float32)                      # shape: [W*C, D]
+
+        # --------------------------------------------------------
+        # 5) Mask out rows beyond y_len
+        #
+        # valid is [W], but y_rc is [W*C, D].
+        # Expand valid across the C dimension so that all C rows
+        # belonging to an invalid workload row are zeroed out.
+        # --------------------------------------------------------
+        valid_rc = tl.reshape(
+            tl.broadcast_to(valid[:, None], (W, C)),
+            (rows_total,)
+        )
+        y_rc = tl.where(valid_rc[:, None], y_rc, 0.0)
+
+        # --------------------------------------------------------
+        # 6) Compute:
+        #   [W*C, D] x [D, G] -> [W*C, G]
+        #
+        # x_i is [G, D], so we use broadcasted multiply + sum over D
+        # --------------------------------------------------------
+        prod_ = y_rc[:, None, :] * x_i[None, :, :]   # [W*C, G, D]
+        acc = tl.sum(prod_, axis=2)                  # [W*C, G]
+
+        # --------------------------------------------------------
+        # 7) Reshape back to [W, C, G]
+        # --------------------------------------------------------
+        o_i = tl.reshape(acc, (W, C, G)).to(tl.bfloat16)
+
+        # --------------------------------------------------------
+        # 8) Store results
+        #
+        # Output is logically [row, C, G], flattened in row-major:
+        #   offset = row * (C*G) + c * G + g
+        # where row starts at y_off
+        # --------------------------------------------------------
+        offs_o = (
+            ((y_off + idx_ptr[:, None, None]) * (C * G)) +
+            (c_ptr[None, :, None] * G) +
+            g_ptr[None, None, :]
+        ).to(tl.int32)
+
+        tl.store(o + offs_o, o_i, mask=valid[:, None, None])
+
 
 def mm_bpr(
 x: torch.Tensor,
@@ -101,14 +257,16 @@ o: torch.Tensor,
 ctx: Context
 ):  
     
-    mm_bpr_kernel[(ctx.num_sms,)](
+    group_mm_bpr_kernel[(ctx.num_sms,)](
         x, y, o, 
         ctx.dense_kv_indices,
         ctx.winfo_q_indices,
         ctx.winfo_kv_offsets,
         ctx.winfo_kv_lens,
         ctx.winfo_num_workloads,
-        ctx.max_chunk_size,
+        x.shape[0] * x.shape[-2],
+        y.shape[0] * y.shape[-2],
+        ctx.workload_chunk_size,
         x.shape[-2], y.shape[-2], x.shape[-1], num_warps=32, num_stages=1
     )
 
@@ -337,7 +495,7 @@ o_D1: tl.constexpr
                 o_dim0[None,:,None] * o_D1 + \
                 o_dim1[None, None, :]
         
-        
+        tl.cat()
         tl.store(o_i_ptr, o_i, mask=valid[:, None, None])
         
 
