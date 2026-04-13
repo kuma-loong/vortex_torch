@@ -12,11 +12,11 @@ def generate_gemm_impl(graph: Graph, op_id: int, ctx: Context) -> str:
 
     if t_i0._format == FORMAT.BATCHED and t_i1.shape[1] == 1:
         impl_lines = [
-            f"tensor_{output_tensor_id}_block = tl.sum(tensor_{input_tensor_id0}_block * tensor_{input_tensor_id1}_block, axis=2)[:,None,:]"
+            f"tensor_{output_tensor_id}_block = tl.sum((tensor_{input_tensor_id0}_block * tensor_{input_tensor_id1}_block), axis=2)[:,None,:]"
         ]
     else:
         impl_lines = [
-            f"tensor_{output_tensor_id}_block = tl.sum(tensor_{input_tensor_id0}_block[:,None,:,:] * tensor_{input_tensor_id1}_block[:,:,None,:], axis=3)"
+            f"tensor_{output_tensor_id}_block = tl.sum((tensor_{input_tensor_id0}_block[:,None,:,:] * tensor_{input_tensor_id1}_block[:,:,None,:]), axis=3)"
         ]
 
     impl_str = "\n".join(impl_lines)

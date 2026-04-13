@@ -2,7 +2,7 @@
 set -e
 
 sparse_algos=(
-full_attention
+block_sparse_attention
 )
 
 for algo in "${sparse_algos[@]}"; do
@@ -10,8 +10,8 @@ for algo in "${sparse_algos[@]}"; do
   python examples/verify_algo.py \
     --trials 8 \
     --topk-val 29 \
-    --page-size 128 \
-    --workload-chunk-size 16 \
+    --page-size 64 \
+    --workload-chunk-size 128 \
     --block-size 16 \
     --vortex-module-name "${algo}" \
     --model-name Qwen/Qwen3-1.7B \

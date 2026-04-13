@@ -26,11 +26,11 @@ def generate_reduce_impl(graph: Graph, op_id: int, ctx: Context) -> str:
         ]
     elif op.reduce_type == ReduceType.L2Norm:
         impl_lines = [
-            f"tensor_{output_tensor_id}_block = tl.sqrt(tl.sum(tensor_{input_tensor_id}_block * tensor_{input_tensor_id}_block, keep_dims=True, axis={op.dim}))",
+            f"tensor_{output_tensor_id}_block = tl.sqrt(tl.sum((tensor_{input_tensor_id}_block * tensor_{input_tensor_id}_block).to(tl.float32), keep_dims=True, axis={op.dim}))",
         ]
     elif op.reduce_type == ReduceType.Mean:
         impl_lines = [
-            f"tensor_{output_tensor_id}_block = tl.sum(tensor_{input_tensor_id}_block, keep_dims=True, axis={op.dim}) / {t_i.shape[op.dim]}",
+            f"tensor_{output_tensor_id}_block = tl.sum(tensor_{input_tensor_id}_block, keep_dims=True, axis={op.dim}) * ({1.0 / t_i.shape[op.dim]})",
         ]
     impl_str = "\n".join(impl_lines)
     return impl_str

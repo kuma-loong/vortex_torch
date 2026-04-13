@@ -1,6 +1,6 @@
 import torch
 import triton
-from vortex_torch_C import topk_output_sglang, topk_output
+from vortex_torch_C import topk_output_v2, topk_output
 from tqdm import tqdm
 SEQ_LENS = [1024, 1536, 2048, 4096]
 BATCH_SIZES = [16, 32, 64, 128, 256, 512]
@@ -87,7 +87,7 @@ def run_v2(
     reserve_eos,
     seq_len,
 ):
-    topk_output_sglang(
+    topk_output_v2(
         scores,
         dense_kv_indptr,
         sparse_kv_indptr,
