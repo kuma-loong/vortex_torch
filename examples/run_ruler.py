@@ -19,7 +19,7 @@ def main():
                     vortex_max_seq_lens=8192,
                     mem_fraction_static=0.8,
                     vortex_workload_chunk_size=32,
-                    vortex_compilation_cache_dir="/home/zhuominc/TurboServe/vortex_torch/vortex_compilation_cache",
+                    vortex_compilation_cache_dir="~/.vortex_compilation_cache",
                     )
     
     with open("examples/validation.jsonl", "r", encoding="utf-8") as f:

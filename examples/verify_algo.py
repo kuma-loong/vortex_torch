@@ -217,7 +217,7 @@ if __name__ == "__main__":
         max_input_length=args.max_input_length,
         vortex_module_name=args.vortex_module_name,
         model_name=args.model_name,
-        sparse_attention=not(args.full_attention),
+        sparse_attention=(args.vortex_module_name != "full_attention"),
         mem=args.mem,
         data_path=args.data_path
     )
