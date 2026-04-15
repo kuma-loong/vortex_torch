@@ -12,7 +12,8 @@ from lighteval.models.model_output import ModelResponse
 from datasets import load_dataset, Dataset, concatenate_datasets
 import argparse
 import json
-
+import os
+from datetime import datetime
 def verify_algos(
 trials: int = 2,
 topk_val: int = 29,
@@ -231,8 +232,9 @@ if __name__ == "__main__":
         data_path=args.data_path,
         tp_size=args.tp_size,
     )
-    output_path = f"results/verify_algos_{args.vortex_module_name}_{args.trials}trials_{args.model_name.replace('/', '_')}_tp{args.tp_size}.json"
-    
+    current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    output_path = f"results/verify_algos_{args.vortex_module_name}_{args.trials}trials_{args.model_name.replace('/', '_')}_tp{args.tp_size}_{current_time}.json"
+    os.makedirs("results", exist_ok=True)
     ## args to summary
     summary["args"] = {
         "trials": args.trials,
