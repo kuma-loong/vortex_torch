@@ -19,11 +19,11 @@ for algo in "${sparse_algos[@]}"; do
         --trials 8 \
         --topk-val 29 \
         --page-size 64 \
-        --workload-chunk-size 32 \
+        --workload-chunk-size 64 \
         --block-size 16 \
         --vortex-module-name "${algo}" \
         --model-name  "${model}" \
-        --mem 0.85 \
+        --mem 0.9 \
         --data-path examples/aime24.jsonl \
         --generation-max-new-tokens 16384 \
         --max-input-length 4096

@@ -232,6 +232,23 @@ if __name__ == "__main__":
         tp_size=args.tp_size,
     )
     output_path = f"results/verify_algos_{args.vortex_module_name}_{args.trials}trials_{args.model_name.replace('/', '_')}_tp{args.tp_size}.json"
+    
+    ## args to summary
+    summary["args"] = {
+        "trials": args.trials,
+        "topk_val": args.topk_val,
+        "block_size": args.block_size,
+        "page_size": args.page_size,
+        "workload_chunk_size": args.workload_chunk_size,
+        "generation_max_new_tokens": args.generation_max_new_tokens,
+        "max_input_length": args.max_input_length,
+        "vortex_module_name": args.vortex_module_name,
+        "model_name": args.model_name,
+        "sparse_attention": (args.vortex_module_name != "full_attention"),
+        "mem": args.mem,
+        "data_path": args.data_path,
+        "tp_size": args.tp_size,
+    }
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=4)
     
