@@ -25,14 +25,16 @@ vortex_module_name: str = "gqa_block_sparse_attention",
 model_name: str = "Qwen/Qwen3-1.7B",
 sparse_attention: bool = True,
 mem: float = 0.8,
-data_path: str = "examples/amc23.jsonl"
+data_path: str = "examples/amc23.jsonl",
+tp_size: int = 1,
 ):  
 
     llm = sgl.Engine(model_path=model_name, 
                     disable_cuda_graph=False,
                     vortex_block_size=block_size,
                     page_size=page_size,
-                    vortex_topk_val=topk_val,   
+                    vortex_topk_val=topk_val,
+                    tp_size=tp_size,
                     disable_overlap_schedule=True,
                     attention_backend="flashinfer",
                     enable_vortex_sparsity=sparse_attention,
@@ -202,6 +204,13 @@ def parse_args():
         help="Path to the evaluation data (default: examples/amc23.jsonl).",
     )
 
+    parser.add_argument(
+        "--tp-size",
+        type=int,
+        default=1,
+        help="Tensor parallel size for Sglang (default: 1).",
+    )
+
     return parser.parse_args()
 
 if __name__ == "__main__":
@@ -219,8 +228,10 @@ if __name__ == "__main__":
         model_name=args.model_name,
         sparse_attention=(args.vortex_module_name != "full_attention"),
         mem=args.mem,
-        data_path=args.data_path
+        data_path=args.data_path,
+        tp_size=args.tp_size,
     )
-    print(summary)
-
-    exit(0)
+    output_path = f"results/verify_algos_{args.vortex_module_name}_{args.trials}trials_{args.model_name.replace('/', '_')}_tp{args.tp_size}.json"
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=4)
+    

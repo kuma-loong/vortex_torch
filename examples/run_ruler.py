@@ -5,21 +5,21 @@ from transformers import AutoTokenizer
 def main():
     model_name = "Qwen/Qwen3-1.7B"
     llm = sgl.Engine(model_path=model_name, 
-                    disable_cuda_graph=False,
-                    page_size=128,
+                    disable_cuda_graph=True,
+                    page_size=64,
                     vortex_block_size=16,
-                    vortex_topk_val=30,   
+                    vortex_topk_val=29,   
                     disable_overlap_schedule=True,
                     attention_backend="flashinfer",
                     enable_vortex_sparsity=True,
                     vortex_block_reserved_bos=1,
-                    vortex_block_reserved_eos=1,
+                    vortex_block_reserved_eos=2,
                     vortex_layers_skip=list(range(1)),
-                    vortex_module_name="gqa_quest_sparse_attention",
+                    vortex_module_name="block_sparse_attention",
                     vortex_max_seq_lens=8192,
                     mem_fraction_static=0.8,
                     vortex_workload_chunk_size=32,
-                    vortex_compilation_cache_dir="~/.vortex_compilation_cache",
+                    vortex_compilation_cache_dir="./vortex_compilation_cache",
                     )
     
     with open("examples/validation.jsonl", "r", encoding="utf-8") as f:

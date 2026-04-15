@@ -5,6 +5,7 @@ from ..context import Context
 import os
 import importlib.util
 import sys
+import torch.distributed as dist
 
 def compile(ctx: Context, cache_pool=None) -> None:
 

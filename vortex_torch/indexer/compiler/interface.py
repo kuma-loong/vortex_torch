@@ -12,7 +12,7 @@ def generate_interface(full_graph: Graph, sub_graphs: list[Graph], ctx: Context)
     cache_dir = os.path.abspath(cache_dir)
     
     if not os.path.exists(cache_dir):
-        os.makedirs(cache_dir)
+        os.makedirs(cache_dir, exist_ok=True)
     dst = os.path.join(
         cache_dir,
         f"{ctx.sparse_attention_name}_compiled_func.py"
