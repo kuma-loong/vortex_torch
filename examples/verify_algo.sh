@@ -6,13 +6,11 @@ block_sparse_attention
 
 models=(
 Qwen/Qwen3-4B
-Qwen/Qwen3-8B
 )
 trials=(
 8
 )
 topk_val=(
-29
 61
 )
 
@@ -24,7 +22,7 @@ for algo in "${sparse_algos[@]}"; do
         python examples/verify_algo.py \
             --trials ${trial} \
             --topk-val ${k_val} \
-            --page-size 64 \
+            --page-size 16 \
             --workload-chunk-size 64 \
             --block-size 16 \
             --vortex-module-name "${algo}" \

@@ -28,12 +28,10 @@ def generate_initialization_str(sub_graph: Graph, ctx:Context) -> str:
         if t._format == FORMAT.BATCHED:
             lines.append(f"# Declare variables for tensor_{local_tensor_id}")
             lines.append(
-                f"tensor_{local_tensor_id}_block = tl.zeros((1, {t.shape[1]}, {t.shape[2]}), dtype=tl.bfloat16)"
+                f"tensor_{local_tensor_id}_block = tl.zeros((1, {t.shape[1]}, {t.shape[2]}), dtype=tl.float32)"
             )
 
-    if lines:
-        lines.append("current_batch_idx = -1")
-
+    
     for local_tensor_id in sub_graph.output_tensor_ids:
         t = sub_graph.tensor_list[local_tensor_id]
         if t._format == FORMAT.RAGGED:     
@@ -47,7 +45,6 @@ def generate_initialization_str(sub_graph: Graph, ctx:Context) -> str:
             t = sub_graph.tensor_list[local_tensor_id]
             if t._format == FORMAT.PAGED:     
                 lines.append(f"tensor_{local_tensor_id}_flat_ptr = tl.arange(0, {ctx.num_blocks_per_page * t.shape[1] * t.shape[2]})")
-                lines.append(f"tensor_{local_tensor_id}_flat_ptr = tl.max_contiguous(tl.multiple_of(tensor_{local_tensor_id}_flat_ptr, {ctx.num_blocks_per_page * t.shape[1] * t.shape[2]}), {ctx.num_blocks_per_page * t.shape[1] * t.shape[2]})")
         for local_tensor_id in sub_graph.output_tensor_ids:
             t = sub_graph.tensor_list[local_tensor_id]
             if t._format == FORMAT.PAGED:     
@@ -82,7 +79,7 @@ def generate_load_tensor_str(sub_graph: Graph, ctx: Context) -> str:
                     f")",
                 ])
             )
-            batched_lines.append(f"tensor_{local_tensor_id}_block = tl.reshape(tl.load(tensor_{local_tensor_id}_block_ptr, boundary_check=(0, 1), padding_option=\"zero\", cache_modifier=\".ca\"), (1, {t.shape[1]}, {t.shape[2]}))")
+            batched_lines.append(f"tensor_{local_tensor_id}_block = tl.reshape(tl.load(tensor_{local_tensor_id}_block_ptr, boundary_check=(0, 1), padding_option=\"zero\", cache_modifier=\".ca\"), (1, {t.shape[1]}, {t.shape[2]})).to(tl.float32)")
         elif t._format == FORMAT.PAGED:
 
             if ctx.num_pages_per_workload == 1:
@@ -101,11 +98,11 @@ def generate_load_tensor_str(sub_graph: Graph, ctx: Context) -> str:
                         f")",
                     ])
                 )
-                paged_lines.append(f"tensor_{local_tensor_id}_block = tl.reshape(tl.load(tensor_{local_tensor_id}_block_ptr, boundary_check=(0, 1), padding_option=\"zero\", cache_modifier=\".cv\"), ({ctx.workload_chunk_size}, {t.shape[1]}, {t.shape[2]}))")
+                paged_lines.append(f"tensor_{local_tensor_id}_block = tl.reshape(tl.load(tensor_{local_tensor_id}_block_ptr, boundary_check=(0, 1), padding_option=\"zero\", cache_modifier=\".cv\"), ({ctx.workload_chunk_size}, {t.shape[1]}, {t.shape[2]})).to(tl.float32)")
             else:
                 paged_lines.append(f"_tensor_{local_tensor_id}_block_ptr = page_indices_i32[:,None] * {t.shape[1] * t.shape[2]} + tensor_{local_tensor_id}_flat_ptr[None,:]")
                 paged_lines.append(f"tensor_{local_tensor_id}_block_ptr = tensor_{local_tensor_id}_ptr + _tensor_{local_tensor_id}_block_ptr")
-                paged_lines.append(f"tensor_{local_tensor_id}_block = tl.reshape(tl.load(tensor_{local_tensor_id}_block_ptr, mask=page_valid[:, None], other=0.0, cache_modifier=\".cv\"), ({ctx.workload_chunk_size}, {t.shape[1]}, {t.shape[2]}))")
+                paged_lines.append(f"tensor_{local_tensor_id}_block = tl.reshape(tl.load(tensor_{local_tensor_id}_block_ptr, mask=page_valid[:, None], other=0.0, cache_modifier=\".cv\"), ({ctx.workload_chunk_size}, {t.shape[1]}, {t.shape[2]})).to(tl.float32)")
             
         elif t._format == FORMAT.RAGGED:
             ragged_lines.append(
@@ -123,14 +120,11 @@ def generate_load_tensor_str(sub_graph: Graph, ctx: Context) -> str:
                     f")",
                 ])
             )
-            ragged_lines.append(f"tensor_{local_tensor_id}_block = tl.reshape(tl.load(tensor_{local_tensor_id}_block_ptr, boundary_check=(0, 1), padding_option=\"zero\",), ({ctx.workload_chunk_size}, {t.shape[1]}, {t.shape[2]}))")
+            ragged_lines.append(f"tensor_{local_tensor_id}_block = tl.reshape(tl.load(tensor_{local_tensor_id}_block_ptr, boundary_check=(0, 1), padding_option=\"zero\",), ({ctx.workload_chunk_size}, {t.shape[1]}, {t.shape[2]})).to(tl.float32)")
 
     if batched_lines:
-        #batched_lines.append("current_batch_idx = new_batch_idx_i32")
         batched_lines = [
             "new_batch_idx_i32 = tl.load(winfo_x_indices + i).to(tl.int32)",
-            #"if new_batch_idx_i32 != current_batch_idx:",
-            #indent_block("\n".join(batched_lines), 1),
             indent_block("\n".join(batched_lines), 0),
         ]
         batched_lines = "\n".join(batched_lines)
@@ -140,7 +134,6 @@ def generate_load_tensor_str(sub_graph: Graph, ctx: Context) -> str:
     addressing_lines = [
         "ragged_idx_i32 = tl.load(winfo_y_offsets + i).to(tl.int32)", 
         "page_idx_i32 = tl.load(indices + ragged_idx_i32).to(tl.int32)" if ctx.num_pages_per_workload == 1 else f"page_indices_i32 = tl.load(indices + ragged_idx_i32 + page_idx_i32_ptr * {ctx.num_blocks_per_page}, mask=page_valid, other=0).to(tl.int32)",
-        "   " if ctx.num_pages_per_workload == 1 else f"page_indices_i32 = tl.multiple_of(page_indices_i32, {ctx.num_blocks_per_page})"
     ]
     addressing_lines = "\n".join(addressing_lines)
 
