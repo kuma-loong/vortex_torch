@@ -5,8 +5,8 @@ from tqdm import tqdm
 SEQ_LENS = [1024, 1536, 2048, 4096]
 BATCH_SIZES = [16, 32, 64, 128, 256, 512]
 
-K = 32
-EVAL_KS = [5, 10, 20, 32]
+K = 61
+EVAL_KS = [5, 10, 20, 32, 48, 61]
 
 RESERVE_BOS = 0
 RESERVE_EOS = 0
@@ -68,7 +68,6 @@ def run_v1(
         sparse_kv_indptr,
         sparse_kv_indices,
         batch_size,
-        k,
         reserve_bos,
         reserve_eos,
         seq_len,
@@ -94,7 +93,6 @@ def run_v2(
         dense_kv_indices,
         sparse_kv_indices,
         batch_size,
-        k,
         reserve_bos,
         reserve_eos,
         seq_len,
@@ -218,6 +216,8 @@ def main():
                 10: [],
                 20: [],
                 32: [],
+                48: [],
+                61: [],
             }
 
             for seed in tqdm(range(NUM_RUNS)):
@@ -242,6 +242,8 @@ def main():
                 "recall@10": sum(agg[10]) / len(agg[10]),
                 "recall@20": sum(agg[20]) / len(agg[20]),
                 "recall@32": sum(agg[32]) / len(agg[32]),
+                "recall@48": sum(agg[48]) / len(agg[48]),
+                "recall@61": sum(agg[61]) / len(agg[61]),
             }
             results[bs][seq_len] = result
 
@@ -253,7 +255,9 @@ def main():
                 f"R@5={result['recall@5']:.6f}, "
                 f"R@10={result['recall@10']:.6f}, "
                 f"R@20={result['recall@20']:.6f}, "
-                f"R@32={result['recall@32']:.6f}"
+                f"R@32={result['recall@32']:.6f}, "
+                f"R@48={result['recall@48']:.6f}, "
+                f"R@61={result['recall@61']:.6f}"
             )
 
     print("\nSummary:")
@@ -268,7 +272,9 @@ def main():
                 f"R@5={r['recall@5']:.6f}, "
                 f"R@10={r['recall@10']:.6f}, "
                 f"R@20={r['recall@20']:.6f}, "
-                f"R@32={r['recall@32']:.6f}"
+                f"R@32={r['recall@32']:.6f}, "
+                f"R@48={r['recall@48']:.6f}, "
+                f"R@61={r['recall@61']:.6f}"
             )
 
 

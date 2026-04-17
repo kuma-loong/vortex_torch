@@ -13,7 +13,7 @@ def generate_topk_impl(graph: Graph, op_id: int, ctx: Context) -> str:
     assert t_o._format == FORMAT.RAGGED, f"Expected ragged output tensor for topk, got {t_o._format}"
     
     impl_lines = [
-        f"topk_output(",
+        f"topk_output_v2(",
         f"{INDENT * 2}tensor_{input_tensor_id},",
         f"{INDENT * 2}ctx.dense_kv_indptr,",
         f"{INDENT * 2}ctx.sparse_kv_indptr,",
