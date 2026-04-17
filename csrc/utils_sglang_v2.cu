@@ -17,14 +17,19 @@ const int num_kv_heads,
 const int page_size,
 const int block_size,
 const int topk_val,
+const float topk_ratio,
 const int block_reserved_bos,
 const int block_reserved_eos
 ){
 
-    const int kv_budget = topk_val + block_reserved_bos + block_reserved_eos;
     const int tx = threadIdx.x;
     const int cached_seq_len = (tx < batch_size) ? cached_seq_lens[tx] : 0;
     const int cached_block_len = (cached_seq_len + block_size - 1) / block_size;
+
+    const int static_kv_budget = topk_val + block_reserved_bos + block_reserved_eos;
+    const int dynamic_kv_budget = int(cached_block_len * topk_ratio);
+    const int kv_budget = max(static_kv_budget, dynamic_kv_budget);
+
     using BlockScanInt2 = cub::BlockScan<int2, 1024>;
 
     __shared__ union {
@@ -67,6 +72,7 @@ template <int ITEM_PER_THREAD>
 __launch_bounds__(1024, 1)
 __global__ void Sgl_Decode_Plan_Workload_V2_Kernel(
 const int*  __restrict__ dense_kv_indptr,
+const int*  __restrict__ sparse_kv_indptr,
 int*  __restrict__ winfo_q_indices,
 int*  __restrict__ winfo_kv_offsets,
 int*  __restrict__ winfo_kv_lens,
@@ -74,7 +80,7 @@ int*  __restrict__ winfo_num_workloads,
 int*  __restrict__ winfo_chunk_size,
 const int workload_chunk_size,
 const int eff_batch_size,
-const int topk_val,
+// const int topk_val,
 const int block_reserved_bos,
 const int block_reserved_eos
 ){  
@@ -95,10 +101,22 @@ const int block_reserved_eos
     #pragma unroll
     for (int i = 0; i < ITEM_PER_THREAD; ++i){
 
-        int16_t w = ((tx_offset + i) < eff_batch_size) ? 
-            (dense_kv_indptr[tx_offset+i+1] - dense_kv_indptr[tx_offset+i] - block_reserved_eos): 0;
+
+        // int16_t w = ((tx_offset + i) < eff_batch_size) ? 
+        //     (dense_kv_indptr[tx_offset+i+1] - dense_kv_indptr[tx_offset+i] - block_reserved_eos): 0;
     
-        block_count[i] = (w > topk_val + block_reserved_bos) ? w : 0;
+        // block_count[i] = (w > topk_val + block_reserved_bos) ? w : 0;
+        int16_t w = 0;
+        if((tx_offset + i) < eff_batch_size){
+            int16_t dense_seqlen_i = dense_kv_indptr[tx_offset+i+1] - dense_kv_indptr[tx_offset+i];
+            int16_t sparse_seqlen_i = sparse_kv_indptr[tx_offset+i+1] - sparse_kv_indptr[tx_offset+i];
+            if(dense_seqlen_i > sparse_seqlen_i){
+                w = dense_seqlen_i - block_reserved_eos;
+            } else {
+                w = 0;
+            }
+        }
+        block_count[i] = w;
         chunked_block_count_prefix_sum[i + 1] =  int((block_count[i] + workload_chunk_size - 1) / workload_chunk_size);
     }
 
@@ -142,12 +160,10 @@ const int    req_to_token_stride,
 const int    page_size,
 const int    block_size,
 const int    num_kv_heads,
-const int    topk_val,
 const int    block_reserved_bos,
 const int    block_reserved_eos
 ){
 
-    const int kv_budget = topk_val + block_reserved_bos + block_reserved_eos;
     const int nblk = blockDim.x;
     const int bx = blockIdx.x;
     const int by = blockIdx.y;
@@ -163,7 +179,8 @@ const int    block_reserved_eos
 
     int* dense_output = dense_kv_indices + dense_kv_indptr[bx * num_kv_heads + by];
     int* sparse_output = sparse_kv_indices + sparse_kv_indptr[bx * num_kv_heads + by];
-
+    const int kv_budget = sparse_kv_indptr[bx * num_kv_heads + by + 1] - sparse_kv_indptr[bx * num_kv_heads + by];
+    // const int kv_budget = topk_val + block_reserved_bos + block_reserved_eos;
     int pos = tx;
     while(pos < block_len){
             int data = token_indices[pos * block_size];
@@ -215,6 +232,7 @@ const int64_t       page_size,
 const int64_t       block_size,
 const int64_t       num_kv_heads,
 const int64_t       topk_val,
+const float         topk_ratio,
 const int64_t       block_reserved_bos,
 const int64_t       block_reserved_eos,
 const int64_t       workload_chunk_size
@@ -239,6 +257,7 @@ const int64_t       workload_chunk_size
     TORCH_CHECK(page_size % block_size == 0, "page_size must be divisible by block_size");
     TORCH_CHECK(num_kv_heads >= 1);
     TORCH_CHECK(topk_val >= 1);
+    TORCH_CHECK(topk_ratio >= 0.0f && topk_ratio <= 1.0f);
     TORCH_CHECK(block_reserved_bos >= 0);
     TORCH_CHECK(block_reserved_eos >= 1);
     TORCH_CHECK(min_chunk_size >= 1);
@@ -258,6 +277,7 @@ const int64_t       workload_chunk_size
         page_size,
         block_size,
         topk_val,
+        topk_ratio,
         block_reserved_bos,
         block_reserved_eos
     );
@@ -265,6 +285,7 @@ const int64_t       workload_chunk_size
     if (eff_batch_size <= 1024){
     Sgl_Decode_Plan_Workload_V2_Kernel<1><<<1, 1024, 0, stream>>>(
         dense_kv_indptr.data_ptr<int>(),
+        sparse_kv_indptr.data_ptr<int>(),
         winfo_q_indices.data_ptr<int>(),
         winfo_kv_offsets.data_ptr<int>(),
         winfo_kv_lens.data_ptr<int>(),
@@ -272,13 +293,13 @@ const int64_t       workload_chunk_size
         winfo_chunk_size.data_ptr<int>(),
         workload_chunk_size,
         eff_batch_size,
-        topk_val,
         block_reserved_bos,
         block_reserved_eos
     );
     } else if (eff_batch_size <= 2048){
     Sgl_Decode_Plan_Workload_V2_Kernel<2><<<1, 1024, 0, stream>>>(
         dense_kv_indptr.data_ptr<int>(),
+        sparse_kv_indptr.data_ptr<int>(),
         winfo_q_indices.data_ptr<int>(),
         winfo_kv_offsets.data_ptr<int>(),
         winfo_kv_lens.data_ptr<int>(),
@@ -286,13 +307,13 @@ const int64_t       workload_chunk_size
         winfo_chunk_size.data_ptr<int>(),
         workload_chunk_size,
         eff_batch_size,
-        topk_val,
         block_reserved_bos,
         block_reserved_eos
     );
     } else if (eff_batch_size <= 4096){
     Sgl_Decode_Plan_Workload_V2_Kernel<4><<<1, 1024, 0, stream>>>(
         dense_kv_indptr.data_ptr<int>(),
+        sparse_kv_indptr.data_ptr<int>(),
         winfo_q_indices.data_ptr<int>(),
         winfo_kv_offsets.data_ptr<int>(),
         winfo_kv_lens.data_ptr<int>(),
@@ -300,13 +321,13 @@ const int64_t       workload_chunk_size
         winfo_chunk_size.data_ptr<int>(),
         workload_chunk_size,
         eff_batch_size,
-        topk_val,
         block_reserved_bos,
         block_reserved_eos
     );
     }  else if (eff_batch_size <= 8192){
     Sgl_Decode_Plan_Workload_V2_Kernel<8><<<1, 1024, 0, stream>>>(
         dense_kv_indptr.data_ptr<int>(),
+        sparse_kv_indptr.data_ptr<int>(),
         winfo_q_indices.data_ptr<int>(),
         winfo_kv_offsets.data_ptr<int>(),
         winfo_kv_lens.data_ptr<int>(),
@@ -314,7 +335,6 @@ const int64_t       workload_chunk_size
         winfo_chunk_size.data_ptr<int>(),
         workload_chunk_size,
         eff_batch_size,
-        topk_val,
         block_reserved_bos,
         block_reserved_eos
     );
@@ -338,7 +358,6 @@ const int64_t       workload_chunk_size
         page_size,
         block_size,
         num_kv_heads,
-        topk_val,
         block_reserved_bos,
         block_reserved_eos
     );

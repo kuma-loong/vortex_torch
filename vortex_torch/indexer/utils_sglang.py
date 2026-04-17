@@ -37,6 +37,7 @@ ctx: Context
         ctx.block_size,
         ctx.num_kv_heads,
         ctx.topk_val,
+        ctx.topk_ratio,
         ctx.block_reserved_bos,
         ctx.block_reserved_eos,
         ctx.workload_chunk_size

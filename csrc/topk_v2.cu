@@ -626,7 +626,6 @@
      const int*    __restrict__ sparse_kv_indptr,
      const int*    __restrict__ dense_kv_indices,
      int*          __restrict__ sparse_kv_indices,
-     const int     topk_val,
      const int     page_reserved_bos,
      const int     page_reserved_eos)
  {
@@ -634,6 +633,7 @@
  
      const int start = dense_kv_indptr[bx] + page_reserved_bos;
      const int end   = dense_kv_indptr[bx + 1] - page_reserved_eos;
+     const int topk_val = sparse_kv_indptr[bx + 1] - sparse_kv_indptr[bx] - page_reserved_bos - page_reserved_eos;
      const int nblk  = end - start;
      if (nblk <= topk_val) return;
  
@@ -779,15 +779,11 @@
      const at::Tensor& dense_kv_indices,
      at::Tensor&       sparse_kv_indices,
      const int64_t     eff_batch_size,
-     const int64_t     topk_val,
      const int64_t     reserved_bos,
      const int64_t     reserved_eos,
      const int64_t     max_num_pages)
  {
-     TORCH_CHECK(topk_val <= VORTEX_MAX_TOPK,
-                 "topk_output: topk_val (", topk_val,
-                 ") exceeds VORTEX_MAX_TOPK (", VORTEX_MAX_TOPK, ")");
- 
+    
      dim3 nblks(eff_batch_size);
      dim3 nthreads(kThreadsPerBlock);
      cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
@@ -800,7 +796,6 @@
              sparse_kv_indptr.data_ptr<int>(),
              dense_kv_indices.data_ptr<int>(),
              sparse_kv_indices.data_ptr<int>(),
-             topk_val,
              reserved_bos,
              reserved_eos);
      } else if (x.scalar_type() == at::ScalarType::Float) {
@@ -811,7 +806,6 @@
              sparse_kv_indptr.data_ptr<int>(),
              dense_kv_indices.data_ptr<int>(),
              sparse_kv_indices.data_ptr<int>(),
-             topk_val,
              reserved_bos,
              reserved_eos);
      } else {

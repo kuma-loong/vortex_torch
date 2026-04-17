@@ -60,7 +60,6 @@ const int*           __restrict__ dense_kv_indptr,
 const int*           __restrict__ sparse_kv_indptr,
 const int*           __restrict__ dense_kv_indices,
 int*                 __restrict__ sparse_kv_indices,
-const int            topk_val,
 const int            page_reserved_bos,
 const int            page_reserved_eos)
 {
@@ -69,6 +68,7 @@ const int            page_reserved_eos)
 
     const int start = dense_kv_indptr[bx] + page_reserved_bos;
     const int end   = dense_kv_indptr[bx + 1] - page_reserved_eos;
+    const int topk_val = (sparse_kv_indptr[bx + 1] - sparse_kv_indptr[bx]) - page_reserved_bos - page_reserved_eos;
     const int nblk  = end - start;
     if (nblk <= topk_val) return;
 
@@ -121,7 +121,6 @@ const at::Tensor& sparse_kv_indptr,
 const at::Tensor& dense_kv_indices,
 at::Tensor&       sparse_kv_indices,
 const int64_t     eff_batch_size,
-const int64_t     topk_val,
 const int64_t     reserved_bos,
 const int64_t     reserved_eos,
 const int64_t     max_num_pages
@@ -137,7 +136,6 @@ const int64_t     max_num_pages
             sparse_kv_indptr.data_ptr<int>(),
             dense_kv_indices.data_ptr<int>(),
             sparse_kv_indices.data_ptr<int>(),
-            topk_val,
             reserved_bos,
             reserved_eos
         );
@@ -148,7 +146,6 @@ const int64_t     max_num_pages
             sparse_kv_indptr.data_ptr<int>(),
             dense_kv_indices.data_ptr<int>(),
             sparse_kv_indices.data_ptr<int>(),
-            topk_val,
             reserved_bos,
             reserved_eos
         );
@@ -159,7 +156,6 @@ const int64_t     max_num_pages
             sparse_kv_indptr.data_ptr<int>(),
             dense_kv_indices.data_ptr<int>(),
             sparse_kv_indices.data_ptr<int>(),
-            topk_val,
             reserved_bos,
             reserved_eos
         );
@@ -170,7 +166,6 @@ const int64_t     max_num_pages
             sparse_kv_indptr.data_ptr<int>(),
             dense_kv_indices.data_ptr<int>(),
             sparse_kv_indices.data_ptr<int>(),
-            topk_val,
             reserved_bos,
             reserved_eos
         );
@@ -181,7 +176,6 @@ const int64_t     max_num_pages
             sparse_kv_indptr.data_ptr<int>(),
             dense_kv_indices.data_ptr<int>(),
             sparse_kv_indices.data_ptr<int>(),
-            topk_val,
             reserved_bos,
             reserved_eos
         );
@@ -192,7 +186,6 @@ const int64_t     max_num_pages
             sparse_kv_indptr.data_ptr<int>(),
             dense_kv_indices.data_ptr<int>(),
             sparse_kv_indices.data_ptr<int>(),
-            topk_val,
             reserved_bos,
             reserved_eos
         );
@@ -203,7 +196,6 @@ const int64_t     max_num_pages
             sparse_kv_indptr.data_ptr<int>(),
             dense_kv_indices.data_ptr<int>(),
             sparse_kv_indices.data_ptr<int>(),
-            topk_val,
             reserved_bos,
             reserved_eos
         );
@@ -214,7 +206,6 @@ const int64_t     max_num_pages
             sparse_kv_indptr.data_ptr<int>(),
             dense_kv_indices.data_ptr<int>(),
             sparse_kv_indices.data_ptr<int>(),
-            topk_val,
             reserved_bos,
             reserved_eos
         );
@@ -225,7 +216,6 @@ const int64_t     max_num_pages
             sparse_kv_indptr.data_ptr<int>(),
             dense_kv_indices.data_ptr<int>(),
             sparse_kv_indices.data_ptr<int>(),
-            topk_val,
             reserved_bos,
             reserved_eos
         );
@@ -236,7 +226,6 @@ const int64_t     max_num_pages
             sparse_kv_indptr.data_ptr<int>(),
             dense_kv_indices.data_ptr<int>(),
             sparse_kv_indices.data_ptr<int>(),
-            topk_val,
             reserved_bos,
             reserved_eos
         );

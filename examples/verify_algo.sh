@@ -8,7 +8,7 @@ models=(
 Qwen/Qwen3-4B
 )
 trials=(
-8
+32
 )
 topk_val=(
 61
@@ -25,6 +25,7 @@ for algo in "${sparse_algos[@]}"; do
             --page-size 16 \
             --workload-chunk-size 64 \
             --block-size 16 \
+            --topk-ratio 0.0 \
             --vortex-module-name "${algo}" \
             --model-name  "${model}" \
             --mem 0.9 \

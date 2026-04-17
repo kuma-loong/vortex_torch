@@ -17,6 +17,7 @@ from datetime import datetime
 def verify_algos(
 trials: int = 2,
 topk_val: int = 29,
+topk_ratio: float = 0.0625,
 block_size: int = 16,
 page_size: int = 256,
 workload_chunk_size: int = 32,
@@ -41,6 +42,7 @@ tp_size: int = 1,
                     enable_vortex_sparsity=sparse_attention,
                     vortex_block_reserved_bos=1,
                     vortex_block_reserved_eos=2,
+                    vortex_topk_ratio=topk_ratio,
                     vortex_layers_skip=list(range(1)),
                     vortex_module_name=vortex_module_name,
                     vortex_max_seq_lens=max_input_length + generation_max_new_tokens,
@@ -137,6 +139,13 @@ def parse_args():
     )
     
     parser.add_argument(
+        "--topk-ratio",
+        type=float,
+        default=0.0625,
+        help="Top-k ratio to use in the algorithm (default: 0.0625).",
+    )
+
+    parser.add_argument(
         "--block-size",
         type=int,
         default=16,
@@ -220,6 +229,7 @@ if __name__ == "__main__":
     summary = verify_algos(
         trials=args.trials,
         topk_val=args.topk_val,
+        topk_ratio=args.topk_ratio,
         block_size=args.block_size,
         page_size=args.page_size,
         workload_chunk_size=args.workload_chunk_size,
@@ -239,6 +249,7 @@ if __name__ == "__main__":
     summary["args"] = {
         "trials": args.trials,
         "topk_val": args.topk_val,
+        "topk_ratio": args.topk_ratio,
         "block_size": args.block_size,
         "page_size": args.page_size,
         "workload_chunk_size": args.workload_chunk_size,

@@ -22,7 +22,7 @@ class Context(ContextBase):
         # hardware / paging
         "num_sms", "page_size", "max_num_pages", "max_num_pages_per_request", "block_size", "max_num_blocks", "max_num_blocks_per_request", "num_blocks_per_page", "num_pages_per_workload",
         # misc
-        "indexer_dtype", "topk_val", "block_reserved_bos", "block_reserved_eos",
+        "indexer_dtype", "topk_val", "topk_ratio", "block_reserved_bos", "block_reserved_eos", 
         
         # auxilary memory in graph
         "_aux_total_bytes",
@@ -76,6 +76,7 @@ class Context(ContextBase):
     # --- miscellaneous ---
     indexer_dtype: torch.dtype       #: Dtype used by indexer operations.
     topk_val: int                    #: Top-K value used in pruning or selection.
+    topk_ratio: float                #: Top-K ratio used in pruning or selection.
     block_reserved_bos: int           #: Reserved page count for BOS (begin-of-sequence).
     block_reserved_eos: int           #: Reserved page count for EOS (end-of-sequence).
 
@@ -160,6 +161,7 @@ class Context(ContextBase):
         self.max_num_blocks_per_request = self.max_num_pages_per_request * self.num_blocks_per_page
         self.num_pages_per_workload = self.workload_chunk_size // self.num_blocks_per_page
         self.topk_val = sa.vortex_topk_val
+        self.topk_ratio = sa.vortex_topk_ratio
         dtype_str = getattr(sa, "vortex_indexer_dtype", "float32")
         if isinstance(dtype_str, str):
             self.indexer_dtype = getattr(torch, dtype_str, torch.float32)

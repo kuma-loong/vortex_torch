@@ -13,7 +13,6 @@ def generate_topk_impl(graph: Graph, op_id: int, ctx: Context) -> str:
     assert t_o._format == FORMAT.RAGGED, f"Expected ragged output tensor for topk, got {t_o._format}"
     
     impl_lines = [
-       # f"if ctx.batch_size * ctx.num_kv_heads >= 256 and ctx.max_num_blocks_per_request <= 1536:",
         f"topk_output(",
         f"{INDENT * 2}tensor_{input_tensor_id},",
         f"{INDENT * 2}ctx.dense_kv_indptr,",
@@ -21,24 +20,10 @@ def generate_topk_impl(graph: Graph, op_id: int, ctx: Context) -> str:
         f"{INDENT * 2}ctx.dense_kv_indices,",
         f"{INDENT * 2}tensor_{output_tensor_id},",
         f"{INDENT * 2}ctx.batch_size * ctx.num_kv_heads,",
-        f"{INDENT * 2}ctx.topk_val,",
         f"{INDENT * 2}ctx.block_reserved_bos,",
         f"{INDENT * 2}ctx.block_reserved_eos,",
         f"{INDENT * 2}ctx.max_num_blocks_per_request,",
         f")",
-        # f"else:",
-        # f"{INDENT}topk_output_v2(",
-        # f"{INDENT * 2}tensor_{input_tensor_id},",
-        # f"{INDENT * 2}ctx.dense_kv_indptr,",
-        # f"{INDENT * 2}ctx.sparse_kv_indptr,",
-        # f"{INDENT * 2}ctx.dense_kv_indices,",
-        # f"{INDENT * 2}tensor_{output_tensor_id},",
-        # f"{INDENT * 2}ctx.batch_size * ctx.num_kv_heads,",
-        # f"{INDENT * 2}ctx.topk_val,",
-        # f"{INDENT * 2}ctx.block_reserved_bos,",
-        # f"{INDENT * 2}ctx.block_reserved_eos,",
-        # f"{INDENT * 2}ctx.max_num_blocks_per_request,",
-        # f"{INDENT})",
     ]
     impl_str = "\n".join(impl_lines)
     return impl_str

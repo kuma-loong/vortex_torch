@@ -8,7 +8,7 @@ def main():
                     disable_cuda_graph=False,
                     page_size=16,
                     vortex_block_size=16,
-                    vortex_topk_val=29,   
+                    vortex_topk_val=29,
                     disable_overlap_schedule=True,
                     attention_backend="flashinfer",
                     enable_vortex_sparsity=True,
