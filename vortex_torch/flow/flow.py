@@ -165,6 +165,14 @@ class vFlow(ABC):
     def __init__(self):
         super().__init__()
 
+        self.block_size = None
+        self.head_dim = None
+        self.kv_cache_dtype = None
+        self.q_data_type = None
+        self.intermediate_dtype = None
+        self.cache_meta_info = None
+        self.token_ratio = None
+
     # ------------------------------------------------------------------ #
     # abstract API to be implemented by concrete flows
     # ------------------------------------------------------------------ #
@@ -329,138 +337,68 @@ class vFlow(ABC):
     # helper API used by the runtime to allocate / account cache
     # ------------------------------------------------------------------ #
     def get_cache_meta_info(
-        self,
-        block_size: int,
-        head_dim: int,
-    ) -> Dict[str, Tuple[Tuple[int, int]]]:
-        r"""
-        Get full cache inner-shape metadata, including ``"k"`` and ``"v"``.
-
-        This wraps :meth:`create_cache` and injects standard inner shapes
-        for key/value tensors. The resulting dictionary includes:
-
-        - all user-defined entries from :meth:`create_cache`, and
-        - two additional entries:
-
-          - ``"k"`` : ``(page_size, head_dim)``
-          - ``"v"`` : ``(page_size, head_dim)``
-
-        Parameters
-        ----------
-        page_size : int
-            Number of tokens per page.
-
-        head_dim : int
-            Head dimension.
-
-        Returns
-        -------
-        Dict[str, Tuple[int, int]]
-            Mapping from cache tensor names to inner shapes ``(r, c)``.
-            The runtime will later prepend either a batch axis ``B`` or a
-            packed-page axis ``S`` when materializing the tensors.
-
-        Raises
-        ------
-        AssertionError
-            If :meth:`create_cache` tries to define entries for the
-            reserved keys ``"k"`` or ``"v"``.
-        """
-        cache_meta_info = self.create_cache(block_size, head_dim)
-        assert "k" not in cache_meta_info.keys()
-        assert "v" not in cache_meta_info.keys()
-        cache_meta_info["k"] = (block_size, head_dim)
-        cache_meta_info["v"] = (block_size, head_dim)
-        return cache_meta_info
+        self
+    ) -> Dict[str, Tuple[Tuple[int, int], torch.dtype]]:
+        
+        return self.cache_meta_info
 
     def get_token_ratio(
         self, 
-        block_size: int,
-        head_dim: int
         ) -> float:
+        
+        return self.token_ratio
+
+    def initialize(self, 
+        block_size: int, 
+        head_dim: int, 
+        kv_cache_dtype: torch.dtype, 
+        q_data_type: torch.dtype, 
+        intermediate_dtype: torch.dtype = torch.bfloat16
+        ):
         r"""
-        Compute the relative cache size in "tokens" compared to a k/v page.
+        Optional initialization method called by the runtime after cache
+        tensors are allocated.
 
-        Using :meth:`get_cache_meta_info`, this computes a simple ratio
-        that measures how many *equivalent tokens* the entire cache
-        consumes per head, relative to a baseline page of shape
-        ``(page_size, head_dim)``.
-
-        Let :math:`\mathcal{C}` be the set of cache tensors with inner
-        shapes :math:`(r_{\text{key}}, c_{\text{key}})`. This method
-        returns
-
-        .. math::
-
-            \text{token_ratio}
-            = \sum_{\text{key} \in \mathcal{C}}
-              \frac{r_{\text{key}} \cdot c_{\text{key}}}
-                   {\text{page_size} \cdot \text{head_dim}}.
-
-        The leading dimension (:math:`B` or :math:`S`) is
-        not included in this ratio on purpose; it is a per-page
-        normalization.
+        This can be used to set up any internal state or invariants needed
+        by the flow. By default this is a no-op, but concrete flows can
+        override it if needed.
 
         Parameters
         ----------
-        page_size : int
-            Number of tokens per page.
-
+        block_size : int
+            Number of tokens per block.
         head_dim : int
             Head dimension.
-
-        Returns
-        -------
-        float
-            Total cache size expressed in units of
-            ``page_size * head_dim`` (including the standard ``"k"`` and
-            ``"v"`` entries).
+        kv_cache_dtype : torch.dtype
+            Data type for key/value caches.
+        q_data_type : torch.dtype
+            Data type for query tensor.
+        intermediate_dtype : torch.dtype
+            Data type for intermediate tensors. This is optional and defaults to :class:`torch.bfloat16`.
         """
-        token_ratio = 0.0
-        for (_, cache_shape) in self.get_cache_meta_info(block_size, head_dim).items():
-            token_ratio += (cache_shape[0] * cache_shape[1]) / (block_size * head_dim)
-        return token_ratio
+        
+        self.block_size = block_size
+        self.head_dim = head_dim
+        self.kv_cache_dtype = kv_cache_dtype
+        self.q_data_type = q_data_type
+        self.intermediate_dtype = intermediate_dtype
+        self.token_ratio = 0.0
+        raw_cache_meta_info = self.create_cache(block_size, head_dim)
+        assert "k" not in raw_cache_meta_info, "create_cache must not declare 'k' key"
+        assert "v" not in raw_cache_meta_info, "create_cache must not declare 'v' key"
+        
+        raw_cache_meta_info["k"] = (block_size, head_dim)
+        raw_cache_meta_info["v"] = (block_size, head_dim)
 
-    def run_indexer_virtual(self, group_size: int, page_size: int, head_dim: int):
-
-        assert False, "This method is for internal use only and should not be called directly."
-        from ..indexer import Context as IContext
-        from ..abs import as_vtensor, FORMAT
+        total_bytes = 0
+        # convert to a format that maps key -> ((r, c), dtype) for easier access during indexing and cache updates
+        self.cache_meta_info = {}
+        for key, (r, c) in raw_cache_meta_info.items():
+            if key in ["k", "v"]:
+                dtype = self.kv_cache_dtype
+            else:
+                dtype = self.intermediate_dtype  # default dtype for auxiliary tensors; can be customized as needed
+            total_bytes += r * c * torch._utils._element_size(dtype)
+            self.cache_meta_info[key] = ((r, c), dtype)
         
-        ctx = IContext()
-        
-        ctx.group_size = group_size
-        ctx.num_kv_heads = 1
-        ctx.num_qo_heads = group_size
-        ctx.head_dim = head_dim
-        ctx.page_size = page_size
-        ctx.max_num_pages = 0
-        ctx.max_num_pages_per_request = 0
-        
-        device = "cuda"
-        dtype = torch.bfloat16
-        
-        with torch.no_grad():
-                # Dummy placeholders: used only for kernel / graph warm-up
-                q_dummy = as_vtensor(torch.empty((1, group_size, head_dim), device=device, dtype=dtype), FORMAT.BATCHED)
-                o_dummy = as_vtensor(torch.empty((0, 1, 1), device=device, dtype=dtype), FORMAT.RAGGED)
-                cache_meta_info = self.get_cache_meta_info(page_size, head_dim)
-                
-                cache_dummy = {
-                        cache_name:  as_vtensor(torch.zeros(
-                                (0, cache_shape[0], cache_shape[1]),
-                                dtype=dtype,
-                                device=device,
-                            ), FORMAT.PAGED)
-                        
-                        for (cache_name, cache_shape) in cache_meta_info.items()
-                    }
-                
-                self.forward_indexer(q_dummy, o_dummy, cache_dummy, ctx=ctx)
-
-        del q_dummy
-        del o_dummy
-        del cache_dummy
-    
-        return ctx._aux_total_flops
-    
+        self.token_ratio = total_bytes / (block_size * head_dim * torch._utils._element_size(self.kv_cache_dtype))
