@@ -4,13 +4,22 @@ import sglang as sgl
 from transformers import AutoTokenizer
 def main():
     model_name = "Qwen/Qwen3-4B"
+
+    default_policy = r"""
+const int static_kv_budget = topk_val + block_reserved_bos + block_reserved_eos;
+const int dynamic_kv_budget = int(cached_block_len * topk_ratio);
+return max(static_kv_budget, dynamic_kv_budget);
+"""
+
     llm = sgl.Engine(model_path=model_name, 
                     disable_cuda_graph=False,
                     page_size=16,
                     vortex_block_size=16,
                     vortex_topk_val=29,
                     disable_overlap_schedule=True,
+                    kv_cache_dtype="fp8_e4m3",
                     attention_backend="flashinfer",
+                    vortex_schedule_policy=default_policy,
                     enable_vortex_sparsity=True,
                     vortex_block_reserved_bos=1,
                     vortex_block_reserved_eos=2,

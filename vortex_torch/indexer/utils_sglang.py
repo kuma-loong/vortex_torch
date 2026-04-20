@@ -1,7 +1,6 @@
 import torch
 from vortex_torch_C import (
 sglang_plan_decode, 
-sglang_plan_decode_v2, 
 sglang_plan_prefill, 
 sglang_plan_decode_fa3,
 sglang_plan_prefill_fa3, 
@@ -11,39 +10,49 @@ Chunkwise_HN2NH_Transpose_FA3
 )
 from typing import Tuple
 from .context import Context
+from .planner_sglang import get_sglang_plan_decode_v2_module
 
+def get_decode_planner(policy: str = None):
 
-def plan_decode(
-cached_seq_lens: torch.Tensor,
-req_to_token: torch.Tensor,
-req_indices: torch.Tensor,
-ctx: Context
-):
-    sglang_plan_decode_v2(
-        cached_seq_lens,
-        ctx.dense_kv_indptr,
-        ctx.dense_kv_indices,
-        ctx.sparse_kv_indptr,
-        ctx.sparse_kv_indices,
-        ctx.kv_last_page_len,
-        req_to_token,
-        req_indices,
-        ctx.winfo_q_indices,
-        ctx.winfo_kv_offsets,
-        ctx.winfo_kv_lens,
-        ctx.winfo_num_workloads,
-        ctx.winfo_chunk_size,
-        ctx.page_size,
-        ctx.block_size,
-        ctx.num_kv_heads,
-        ctx.topk_val,
-        ctx.topk_ratio,
-        ctx.block_reserved_bos,
-        ctx.block_reserved_eos,
-        ctx.workload_chunk_size
+    module = get_sglang_plan_decode_v2_module(
+        policy_body=policy,
+        verbose=True,
+        fallback_to_default=True,
     )
+    def plan_decode(
+        cached_seq_lens: torch.Tensor,
+        req_to_token: torch.Tensor,
+        req_indices: torch.Tensor,
+        ctx: Context
+    ):
+        module.sglang_plan_decode_v2(
+            cached_seq_lens,
+            ctx.dense_kv_indptr,
+            ctx.dense_kv_indices,
+            ctx.sparse_kv_indptr,
+            ctx.sparse_kv_indices,
+            ctx.kv_last_page_len,
+            req_to_token,
+            req_indices,
+            ctx.winfo_q_indices,
+            ctx.winfo_kv_offsets,
+            ctx.winfo_kv_lens,
+            ctx.winfo_num_workloads,
+            ctx.winfo_chunk_size,
+            ctx.page_size,
+            ctx.block_size,
+            ctx.num_kv_heads,
+            ctx.topk_val,
+            ctx.topk_ratio,
+            ctx.block_reserved_bos,
+            ctx.block_reserved_eos,
+            ctx.workload_chunk_size
+        )
+        
+        ctx.set_batch_size(cached_seq_lens.shape[0])
     
-    ctx.set_batch_size(cached_seq_lens.shape[0])
+    return plan_decode
+
 
 
 def plan_prefill(

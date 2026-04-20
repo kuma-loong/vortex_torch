@@ -35,6 +35,12 @@ class ElementwiseOpType(Enum):
     Abs = 3
     Add_Mul = 4
 
+
+class QuantizationType(Enum):
+    BF16 = 0
+    FP8_E5M2 = 1
+    FP8_E4M3 = 2
+
 INDENT = "    "
 def indent_block(text: str, level: int = 1) -> str:
     """

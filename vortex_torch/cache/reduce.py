@@ -3,7 +3,7 @@ from ..abs import vOp
 from .context import Context
 from .triton_kernels.reduce_impl import reduce_pp, reduce_rp, reduce_pr, reduce_rr
 from ..abs import vTensor, FORMAT, as_vtensor
-from ..utils import ReduceType
+from ..utils import ReduceType, QuantizationType
 from typing import Tuple, Dict, Callable, Optional
 
 
@@ -127,6 +127,7 @@ class Reduce(vOp):
         super().__init__()
         self.dim = dim
         self.reduce_type: Optional[ReduceType] = None
+        self.quantization_type: Optional[QuantizationType] = None
         self.impl: Optional[Callable] = None
         self.output_format: Optional[FORMAT] = None
         self.output_buffer: Optional[torch.Tensor] = None
@@ -291,6 +292,15 @@ class Reduce(vOp):
             f"(x.device={x.device}, output.device={output.device})"
         )
 
+        if x.dtype == torch.bfloat16:
+            self.quantization_type = QuantizationType.BF16
+        elif x.dtype == torch.float8_e5m2:
+            self.quantization_type = QuantizationType.FP8_E5M2
+        elif x.dtype == torch.float8_e4m3fn:
+            self.quantization_type = QuantizationType.FP8_E4M3
+        else:
+            raise ValueError(f"{prefix}unsupported dtype {x.dtype} for reduction")
+
         return output
 
     # --------------------------------------------------------------------- #
@@ -346,7 +356,7 @@ class Reduce(vOp):
             output = self.output_buffer
 
         # Launch the kernel/implementation: impl(x, output, loc, ctx, dim, reduce_type)
-        self.impl(x, output, loc, ctx, self.dim, self.reduce_type)
+        self.impl(x, output, loc, ctx, self.dim, self.reduce_type, self.quantization_type)
         return output
 
     

@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 from ..context import Context
-from ...utils import ReduceType
+from ...utils import ReduceType, QuantizationType
 
 @triton.jit
 def reduce_pp_kernel(
@@ -14,7 +14,8 @@ PAGE_SIZE: tl.constexpr,
 BLOCK_SIZE: tl.constexpr,
 NUM_BLOCKS_PER_PAGE: tl.constexpr,
 REDUCE_TYPE: tl.constexpr,  # 0:Mean, 1:Max, 2:Min, 3:L2Norm
-DIM: tl.constexpr           # 1: over rows (axis=0) -> len x_D1; 2: over cols (axis=1) -> len x_D0
+DIM: tl.constexpr,           # 1: over rows (axis=0) -> len x_D1; 2: over cols (axis=1) -> len x_D0
+QUANT_TYPE: tl.constexpr # 0: bf16, 1: fp8_e5m2, 2: fp8_e4m3
 ):  
     
     token_id = tl.program_id(0)
@@ -33,6 +34,15 @@ DIM: tl.constexpr           # 1: over rows (axis=0) -> len x_D1; 2: over cols (a
     cols = tl.arange(0, x_D1)[None, :]     # [1, x_D1]
     src_ptr = x + x_offset + rows * x_D1 + cols
     block_tensor = tl.load(src_ptr)
+
+    if QUANT_TYPE == 0:  # bf16
+        block_tensor = block_tensor.to(tl.float32)
+    elif QUANT_TYPE == 1:  # fp8_e5m2
+        block_tensor = block_tensor.to(tl.float8e5, bitcast=True).to(tl.float32)
+    elif QUANT_TYPE == 2:  # fp8_e4m3
+        block_tensor = block_tensor.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+
+    
 
     if DIM == 1:
         # reduce over rows -> axis=0 -> length x_D1
@@ -74,11 +84,15 @@ loc: torch.LongTensor,
 ctx: Context,
 dim: int,
 reduce_type: ReduceType,
+quantization_type: QuantizationType,
 ):
+    
     
     NNZ = loc.shape[0]
     NUM_KV_HEAD = ctx.head_num
-    
+    if quantization_type != QuantizationType.BF16:
+        x = x.view(torch.uint8) # reinterpret the input as uint8 for non-bf16 quantization types
+
     reduce_pp_kernel[(NNZ, NUM_KV_HEAD)](
         x=x,
         output=output,
@@ -90,7 +104,8 @@ reduce_type: ReduceType,
         BLOCK_SIZE=ctx.block_size,
         NUM_BLOCKS_PER_PAGE=ctx.num_blocks_per_page,
         REDUCE_TYPE=reduce_type.value,
-        DIM=dim
+        DIM=dim,
+        QUANT_TYPE=quantization_type.value
     )
 
 
@@ -211,8 +226,11 @@ loc: torch.LongTensor,
 ctx: Context,
 dim: int,
 reduce_type: ReduceType,
+quantization_type: QuantizationType,
 ):
     
+    assert quantization_type == QuantizationType.BF16, "Currently only BF16 quantization is supported in reduce_rp kernel"
+
     NNZ = loc.shape[0]
     NUM_KV_HEAD = ctx.head_num
     
@@ -349,8 +367,11 @@ loc: torch.LongTensor,
 ctx: Context,
 dim: int,
 reduce_type: ReduceType,
+quantization_type: QuantizationType
 ):
     
+    assert quantization_type == QuantizationType.BF16, "Currently only BF16 quantization is supported in reduce_pr kernel"
+
     NNZ = loc.shape[0]
     NUM_KV_HEAD = ctx.head_num
     
@@ -469,8 +490,11 @@ loc: torch.LongTensor,
 ctx: Context,
 dim: int,
 reduce_type: ReduceType,
+quantization_type: QuantizationType,
 ):
     
+    assert quantization_type == QuantizationType.BF16, "Currently only BF16 quantization is supported in reduce_rr kernel"
+
     NNZ = loc.shape[0]
     NUM_KV_HEAD = ctx.head_num
     

@@ -49,6 +49,7 @@ tp_size: int = 1,
                     mem_fraction_static=mem,
                     vortex_workload_chunk_size=max(page_size // block_size, workload_chunk_size),
                     vortex_compilation_cache_dir="~/.vortex_compilation_cache",
+                    context_length=40960,
                     )
     
     with open(data_path, "r", encoding="utf-8") as f:
@@ -243,8 +244,8 @@ if __name__ == "__main__":
         tp_size=args.tp_size,
     )
     current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    output_path = f"results/verify_algos_{args.vortex_module_name}_{args.trials}trials_{args.model_name.replace('/', '_')}_tp{args.tp_size}_{current_time}.json"
-    os.makedirs("results", exist_ok=True)
+    output_path = f"summary_ratio/{args.model_name.replace('/', '_')}_{args.vortex_module_name}_{args.trials}trials_tp{args.tp_size}_{current_time}.json"
+    os.makedirs("summary_ratio", exist_ok=True)
     ## args to summary
     summary["args"] = {
         "trials": args.trials,
