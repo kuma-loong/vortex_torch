@@ -90,7 +90,7 @@ nvcc_flags = [
 
 setup(
     name="vortex_torch",
-    version="0.2.5",
+    version="0.3.0",
     packages=find_packages(),
     python_requires=">=3.10",
     install_requires=[
