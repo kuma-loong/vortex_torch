@@ -3,6 +3,7 @@ from .context import Context
 from ..abs import vOp
 from .triton_kernels.matmul_impl import gemm_ppp, gemm_rrp, gemm_ppr, gemm_rrr
 from ..abs import vTensor, FORMAT, as_vtensor
+from ..utils import Schedule
 from typing import Tuple, Dict, Callable, Optional
 
 
@@ -105,6 +106,9 @@ class GeMM(vOp):
         self.impl: Optional[Callable] = None
         self.output_format: Optional[FORMAT] = None
         self.output_buffer: Optional[torch.Tensor] = None
+        # Cache GeMM fuses into the per-block kernel — see
+        # ``cache.compiler.triton_impl.kernel_gen``.
+        self.schedule = Schedule.W
 
     def _infer_impl_ragged(
         self, x_fmt: FORMAT, y_fmt: FORMAT
@@ -241,7 +245,19 @@ class GeMM(vOp):
                 dtype=x.dtype,
             )
             ctx.add_aux_memory(self.output_buffer)
-            return as_vtensor(self.output_buffer, self.output_format)
+
+            # Register in the cache graph.
+            output_vtensor = as_vtensor(
+                self.output_buffer,
+                self.output_format,
+                tensor_id=len(ctx.tensor_list),
+            )
+            ctx.tensor_list.append(output_vtensor)
+            ctx.output_tensor_to_op_list.append(len(ctx.op_list))
+            ctx.op_list.append(self)
+            ctx.op_to_input_tensor_list.append([x.tensor_id, y.tensor_id])
+            ctx.op_to_output_tensor_list.append([output_vtensor.tensor_id])
+            return output_vtensor
 
         # Case B: output provided -> validate and select exact impl
         assert isinstance(output, vTensor), f"{prefix}output must be vTensor, got {type(output)}"
@@ -267,6 +283,12 @@ class GeMM(vOp):
             f"{prefix}x, y, and output must be on the same device "
             f"(x.device={x.device}, y.device={y.device}, output.device={output.device})"
         )
+
+        # Register in the cache graph (caller-provided output path).
+        ctx.output_tensor_to_op_list[output.tensor_id] = len(ctx.op_list)
+        ctx.op_list.append(self)
+        ctx.op_to_input_tensor_list.append([x.tensor_id, y.tensor_id])
+        ctx.op_to_output_tensor_list.append([output.tensor_id])
 
         return output
 

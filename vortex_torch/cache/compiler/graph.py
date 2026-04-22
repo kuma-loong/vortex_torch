@@ -1,3 +1,13 @@
+"""Graph construction for the cache compiler.
+
+Mirrors :mod:`vortex_torch.indexer.compiler.graph`. The construction logic
+here is generic — it operates on the producer/consumer DAG implied by
+``ctx.op_to_input_tensor_list`` / ``ctx.op_to_output_tensor_list`` and
+fuses ``Schedule.W`` ops where possible. Cache-specific concerns
+(scheduling model, kernel layout, end-of-page triggers) live in
+:mod:`vortex_torch.cache.compiler.triton_impl`.
+"""
+
 import torch
 from typing import List, Dict, Set, DefaultDict, Tuple, Optional, Callable
 from collections import defaultdict, deque
@@ -59,7 +69,6 @@ class SubgraphDAG:
         self._uf = uf
 
     def _build_sg_successors(self) -> DefaultDict[int, Set[int]]:
-        """Rebuild subgraph-level successor map from current UF state."""
         succ: DefaultDict[int, Set[int]] = defaultdict(set)
         for op_id in self._op_dag.nodes:
             sg = self._uf.find(op_id)
@@ -81,7 +90,6 @@ class SubgraphDAG:
         an input), call :meth:`can_merge_bidir` instead.
         """
         succ = self._build_sg_successors()
-        # Remove the direct edge for the check
         succ[sg_a].discard(sg_b)
 
         visited: Set[int] = {sg_b}
@@ -90,11 +98,11 @@ class SubgraphDAG:
             node = queue.popleft()
             for nxt in succ[node]:
                 if nxt == sg_a:
-                    return False  # back-path exists -> would create cycle
+                    return False
                 if nxt not in visited:
                     visited.add(nxt)
                     queue.append(nxt)
-        return True  # safe
+        return True
 
     def can_merge_bidir(self, sg_a: int, sg_b: int) -> bool:
         """Can ``sg_a`` and ``sg_b`` be fused with no direction assumed?
@@ -196,10 +204,6 @@ def _build_local_graph(
     global_input_tensor_ids: List[int],
     global_output_tensor_ids: List[int],
 ) -> Graph:
-    """
-    Build a self-contained local Graph from a subset of global op ids.
-    All structural ids inside the returned Graph are remapped to local ids.
-    """
     global_op_to_output_tensor_ids: List[List[int]] = [
         _as_tensor_id_list(x) for x in global_op_to_output_tensor_list
     ]
@@ -270,18 +274,14 @@ def _build_op_dag(
     output_tensor_to_op_list,
     op_to_input_tensor_list: List[List[int]],
     op_to_output_tensor_list,
-    final_output_tensor_id: int,
+    final_output_tensor_ids: List[int],
 ) -> Tuple[OpDAG, Set[int]]:
     """
-    Build an OpDAG containing only the ops reachable from the final output.
-    Nodes are stored in topological order (dependencies before dependents).
+    Build an OpDAG containing only the ops reachable from any of the
+    final output tensors. The cache pipeline can have multiple terminal
+    outputs (e.g., one per cache field), unlike the indexer which has a
+    single ``final_output_tensor_id == 1``.
     """
-    final_producer = output_tensor_to_op_list[final_output_tensor_id]
-    if final_producer is None:
-        raise RuntimeError(
-            f"final_output_tensor_id={final_output_tensor_id} has no producer op"
-        )
-
     visited: Set[int] = set()
     topo_order: List[int] = []
 
@@ -295,7 +295,13 @@ def _build_op_dag(
                 dfs(producer)
         topo_order.append(op_id)
 
-    dfs(final_producer)
+    for tid in final_output_tensor_ids:
+        producer = output_tensor_to_op_list[tid]
+        if producer is None:
+            raise RuntimeError(
+                f"final_output_tensor_id={tid} has no producer op"
+            )
+        dfs(producer)
 
     reachable: Set[int] = set(topo_order)
 
@@ -321,13 +327,11 @@ def _fuse_w_ops(op_dag: OpDAG, op_list: List[vOp]) -> UnionFind:
     Fuse any pair of W-scheduled ops whose merge does not introduce a
     cycle in the subgraph DAG.
 
-    Unlike an edge-only fuser, we do **not** require a direct W→W
+    Unlike the edge-only variant, we do **not** require a direct W→W
     producer/consumer edge between the two ops. Siblings that share an
-    input (e.g. two reductions over the same KV field) can be fused into
-    a single kernel as long as they don't also sit on opposite ends of a
-    path through another subgraph.
-
-    Returns the UnionFind representing the final subgraph assignments.
+    input (e.g. two reductions of the same cache field) can be fused
+    into a single kernel as long as they don't also sit on opposite
+    ends of a path through another subgraph.
     """
     uf = UnionFind()
     for op_id in op_dag.nodes:
@@ -385,7 +389,7 @@ def _build_all_graphs(
     op_to_input_tensor_list: List[List[int]],
     op_to_output_tensor_list,
     tensor_to_consumers: DefaultDict[int, List[int]],
-    final_output_tensor_id: int,
+    final_output_tensor_ids: List[int],
 ) -> Tuple[Graph, List[Graph]]:
     """Convert the fused subgraph groups back into Graph objects."""
 
@@ -393,6 +397,7 @@ def _build_all_graphs(
         _as_tensor_id_list(x) for x in op_to_output_tensor_list
     ]
     topo_op_ids = op_dag.nodes
+    final_output_set = set(final_output_tensor_ids)
 
     # --- Full graph ---
     full_input_set: Set[int] = set()
@@ -410,7 +415,7 @@ def _build_all_graphs(
         global_op_to_output_tensor_list=op_to_output_tensor_list,
         selected_global_op_ids=topo_op_ids,
         global_input_tensor_ids=sorted(full_input_set),
-        global_output_tensor_ids=[final_output_tensor_id],
+        global_output_tensor_ids=list(final_output_tensor_ids),
     )
 
     # --- Collect & topo-sort subgraphs ---
@@ -449,7 +454,6 @@ def _build_all_graphs(
     if len(topo_sg_ids) != len(sg_key_order):
         raise RuntimeError("Cycle detected in subgraph DAG")
 
-    # Map ops to their final topo-sorted subgraph index
     op_to_subgraph_id: Dict[int, int] = {}
     for new_id, old_id in enumerate(topo_sg_ids):
         for op_id in sg_key_to_op_ids[sg_key_order[old_id]]:
@@ -473,7 +477,7 @@ def _build_all_graphs(
 
         for op_id in sg_op_ids:
             for out_tid in op_to_output_tensor_ids[op_id]:
-                if out_tid == final_output_tensor_id:
+                if out_tid in final_output_set:
                     output_set.add(out_tid)
                     continue
                 for consumer in tensor_to_consumers.get(out_tid, []):
@@ -499,39 +503,52 @@ def _build_all_graphs(
 # Main entry point
 # =====================================================================
 
-def contruct_graph(ctx: Context) -> Tuple[Graph, List[Graph]]:
+def contruct_graph(
+    ctx: Context,
+    final_output_tensor_ids: Optional[List[int]] = None,
+) -> Tuple[Graph, List[Graph]]:
+    """
+    Build the full graph and the list of fused subgraphs from ``ctx``.
 
+    ``final_output_tensor_ids`` defaults to **every tensor that has a
+    producer but no consumers** — this matches typical cache pipelines
+    where multiple summary tensors (mean / max / norm / ...) are written
+    independently to different cache fields.
+    """
     tensor_list: List[vTensor] = ctx.tensor_list
     op_list: List[vOp] = ctx.op_list
     output_tensor_to_op_list = ctx.output_tensor_to_op_list
     op_to_input_tensor_list: List[List[int]] = ctx.op_to_input_tensor_list
     op_to_output_tensor_list = ctx.op_to_output_tensor_list
 
-    final_output_tensor_id = 1
+    # --- consumer lookup (used both to derive the default outputs and to
+    # decide which tensors cross subgraph boundaries) ---
+    tensor_to_consumers: DefaultDict[int, List[int]] = defaultdict(list)
+    for consumer_op_id, input_tids in enumerate(op_to_input_tensor_list):
+        for tid in input_tids:
+            tensor_to_consumers[tid].append(consumer_op_id)
 
-    # ---------------------------------------------------------------
-    # Phase 1: Convert to op-level DAG (ops as nodes, tensor edges)
-    # ---------------------------------------------------------------
+    if final_output_tensor_ids is None:
+        final_output_tensor_ids = [
+            tid for tid, producer in enumerate(output_tensor_to_op_list)
+            if producer is not None and not tensor_to_consumers.get(tid)
+        ]
+        if not final_output_tensor_ids:
+            raise RuntimeError(
+                "No final output tensors found. Either explicitly pass "
+                "final_output_tensor_ids, or ensure at least one tensor in "
+                "ctx.tensor_list has a producer but no consumers."
+            )
+
     op_dag, reachable_ops = _build_op_dag(
         op_list=op_list,
         output_tensor_to_op_list=output_tensor_to_op_list,
         op_to_input_tensor_list=op_to_input_tensor_list,
         op_to_output_tensor_list=op_to_output_tensor_list,
-        final_output_tensor_id=final_output_tensor_id,
+        final_output_tensor_ids=final_output_tensor_ids,
     )
 
-    # ---------------------------------------------------------------
-    # Phase 2: Fuse W-connected ops (cycle-safe merges only)
-    # ---------------------------------------------------------------
     uf = _fuse_w_ops(op_dag, op_list)
-
-    # ---------------------------------------------------------------
-    # Phase 3: Convert back to Graph objects (full + subgraphs)
-    # ---------------------------------------------------------------
-    tensor_to_consumers: DefaultDict[int, List[int]] = defaultdict(list)
-    for consumer_op_id, input_tids in enumerate(op_to_input_tensor_list):
-        for tid in input_tids:
-            tensor_to_consumers[tid].append(consumer_op_id)
 
     full_graph, subgraphs = _build_all_graphs(
         op_dag=op_dag,
@@ -543,7 +560,7 @@ def contruct_graph(ctx: Context) -> Tuple[Graph, List[Graph]]:
         op_to_input_tensor_list=op_to_input_tensor_list,
         op_to_output_tensor_list=op_to_output_tensor_list,
         tensor_to_consumers=tensor_to_consumers,
-        final_output_tensor_id=final_output_tensor_id,
+        final_output_tensor_ids=final_output_tensor_ids,
     )
 
     return full_graph, subgraphs

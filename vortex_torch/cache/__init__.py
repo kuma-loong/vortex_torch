@@ -24,12 +24,14 @@ These building blocks are typically used inside vFlow cache update
 pipelines (e.g., to maintain centroids, envelopes, or other summaries).
 """
 
-from .context import Context
+from .context import Context, ctx, get_ctx
 from .reduce import Mean, Max, Min, L2Norm
 from .matmul import GeMM
 from .elementwise import Relu, Silu, Sigmoid, Abs, Add_Mul
 from .elementwise_binary import Maximum, Minimum, Multiply, Add
+from .fill import Fill
 from .triton_kernels import set_kv_buffer_launcher, set_kv_buffer_fp8_e4m3_launcher, set_kv_buffer_fp8_e5m2_launcher
+from . import compiler
 
 
 __all__ = [
@@ -40,6 +42,8 @@ __all__ = [
     "GeMM",
     "Relu", "Silu", "Sigmoid", "Abs", "Add_Mul",
     "Maximum", "Minimum", "Multiply", "Add",
-    "Context"
+    "Fill",
+    "Context", "ctx", "get_ctx",
+    "compiler",
 ]
 

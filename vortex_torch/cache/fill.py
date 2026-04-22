@@ -3,6 +3,7 @@ from ..abs import vOp
 from .context import Context
 from .triton_kernels.fill_impl import fill_p
 from ..abs import vTensor, FORMAT
+from ..utils import Schedule
 from typing import Dict, Callable, Optional
 
 class Fill(vOp):
@@ -77,6 +78,9 @@ class Fill(vOp):
         super().__init__()
         self.alpha = alpha
         self.impl: Optional[Callable] = None
+        # Cache fill fuses into the per-block kernel — see
+        # ``cache.compiler.triton_impl.kernel_gen``.
+        self.schedule = Schedule.W
 
     # ---------------- profile ----------------
     def profile(self, x: vTensor, loc: torch.Tensor, ctx: Context) -> vTensor:
@@ -131,6 +135,14 @@ class Fill(vOp):
             f"Available keys: {list(self._impl_map.keys())}"
         )
         self.impl = self._impl_map[x_fmt]
+
+        # Register in the cache graph as a pure producer of ``x``. ``Fill``
+        # has no graph inputs — it overwrites ``x`` with a constant — so we
+        # claim ``x``'s producer slot (mirrors ``indexer.save_load.Save``).
+        ctx.output_tensor_to_op_list[x.tensor_id] = len(ctx.op_list)
+        ctx.op_list.append(self)
+        ctx.op_to_input_tensor_list.append([])
+        ctx.op_to_output_tensor_list.append([x.tensor_id])
 
         # In-place: return the same vTensor view
         return x

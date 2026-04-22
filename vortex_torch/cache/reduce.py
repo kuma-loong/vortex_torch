@@ -3,7 +3,7 @@ from ..abs import vOp
 from .context import Context
 from .triton_kernels.reduce_impl import reduce_pp, reduce_rp, reduce_pr, reduce_rr
 from ..abs import vTensor, FORMAT, as_vtensor
-from ..utils import ReduceType, QuantizationType
+from ..utils import ReduceType, QuantizationType, Schedule
 from typing import Tuple, Dict, Callable, Optional
 
 
@@ -131,6 +131,9 @@ class Reduce(vOp):
         self.impl: Optional[Callable] = None
         self.output_format: Optional[FORMAT] = None
         self.output_buffer: Optional[torch.Tensor] = None
+        # Cache reductions fuse into the per-block kernel — see
+        # ``cache.compiler.triton_impl.kernel_gen``.
+        self.schedule = Schedule.W
         # Validate reduction dimension at construction time.
         cls = self.__class__.__name__
         assert self.dim in (1, 2), f"{cls}.__init__: dim must be 1 or 2, got dim={self.dim}"
@@ -265,7 +268,19 @@ class Reduce(vOp):
                 dtype=torch.bfloat16,
             )
             ctx.add_aux_memory(self.output_buffer)
-            return as_vtensor(self.output_buffer, self.output_format)
+
+            # Register in the cache graph (mirrors ``Elementwise.profile``).
+            output_vtensor = as_vtensor(
+                self.output_buffer,
+                self.output_format,
+                tensor_id=len(ctx.tensor_list),
+            )
+            ctx.tensor_list.append(output_vtensor)
+            ctx.output_tensor_to_op_list.append(len(ctx.op_list))
+            ctx.op_list.append(self)
+            ctx.op_to_input_tensor_list.append([x.tensor_id])
+            ctx.op_to_output_tensor_list.append([output_vtensor.tensor_id])
+            return output_vtensor
 
         # Case B: output provided -> validate and pick exact impl by (x_fmt, o_fmt)
         assert isinstance(output, vTensor), f"{prefix}output must be vTensor, got {type(output)}"
@@ -310,6 +325,14 @@ class Reduce(vOp):
         )
 
         self.quantization_type = self._resolve_quantization(x)
+
+        # Register in the cache graph. Caller-provided ``output`` must already
+        # have a valid ``tensor_id`` in ``ctx.tensor_list``; we claim it as
+        # this op's produced tensor (override producer slot).
+        ctx.output_tensor_to_op_list[output.tensor_id] = len(ctx.op_list)
+        ctx.op_list.append(self)
+        ctx.op_to_input_tensor_list.append([x.tensor_id])
+        ctx.op_to_output_tensor_list.append([output.tensor_id])
 
         return output
 

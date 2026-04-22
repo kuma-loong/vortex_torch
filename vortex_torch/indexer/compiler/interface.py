@@ -109,6 +109,11 @@ def generate_entry_point(full_graph: Graph, sub_graphs: list[Graph], ctx: Contex
            memory_initiazation_lines.append(f"self.tensor_{t.tensor_id} = torch.empty(({ctx.max_num_blocks}, {t.shape[1]}, {t.shape[2]}), dtype=torch.{t.dtype}, device='{t.device}')") 
            tensor_id_to_tensor_name_map[t.tensor_id] = f"self.tensor_{t.tensor_id}"
     
+    # Python forbids empty function bodies — fall back to ``pass`` when
+    # a subgraph pipeline has no intermediate RAGGED tensors to allocate,
+    # or when there are no subgraphs to dispatch to.
+    if not memory_initiazation_lines:
+        memory_initiazation_lines = ["pass"]
     memory_initiazation_str = indent_block("\n".join(memory_initiazation_lines), 2)
     entry_point_arg_list = [
         "q",
@@ -117,10 +122,12 @@ def generate_entry_point(full_graph: Graph, sub_graphs: list[Graph], ctx: Contex
         "ctx",
     ]
     entry_point_arg_str = ",".join(entry_point_arg_list)
-    
+
     for sub_graph_id, sub_graph in enumerate(sub_graphs):
         impl_lines = generate_subgraph_entry_point(sub_graph, sub_graph_id, ctx, tensor_id_to_tensor_name_map)
         entry_point_impl_lines.append(impl_lines)
+    if not entry_point_impl_lines:
+        entry_point_impl_lines = ["pass"]
     entry_point_impl_str = indent_block("\n\n".join(entry_point_impl_lines), 2)
     entry_cls_str = f"""
 class {ctx.sparse_attention_name}_CompiledFunc:

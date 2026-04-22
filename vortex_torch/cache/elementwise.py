@@ -3,7 +3,7 @@ from ..abs import vOp
 from .context import Context
 from .triton_kernels.elementwise_impl import elementwise_pp, elementwise_rp, elementwise_pr, elementwise_rr
 from ..abs import vTensor, FORMAT, as_vtensor
-from ..utils import ElementwiseOpType
+from ..utils import ElementwiseOpType, Schedule
 from typing import Tuple, Dict, Callable, Optional
 
 class Elementwise(vOp):
@@ -104,6 +104,9 @@ class Elementwise(vOp):
         self.impl: Optional[Callable] = None
         self.output_format: Optional[FORMAT] = None
         self.output_buffer: Optional[torch.Tensor] = None
+        # Cache elementwise ops fuse with neighbours into a single
+        # token-driven kernel — see ``cache.compiler.triton_impl.kernel_gen``.
+        self.schedule = Schedule.W
 
     # ------------------------------ helpers ------------------------------ #
     def _infer_impl_ragged(self, x_fmt: FORMAT) -> Tuple[Callable, FORMAT]:
@@ -229,7 +232,20 @@ class Elementwise(vOp):
                 dtype=x.dtype,
             )
             ctx.add_aux_memory(self.output_buffer)
-            return as_vtensor(self.output_buffer, self.output_format)
+
+            # Wrap with a fresh tensor_id and register in the cache graph,
+            # mirroring the indexer-side ``profile`` convention.
+            output_vtensor = as_vtensor(
+                self.output_buffer,
+                self.output_format,
+                tensor_id=len(ctx.tensor_list),
+            )
+            ctx.tensor_list.append(output_vtensor)
+            ctx.output_tensor_to_op_list.append(len(ctx.op_list))
+            ctx.op_list.append(self)
+            ctx.op_to_input_tensor_list.append([x.tensor_id])
+            ctx.op_to_output_tensor_list.append([output_vtensor.tensor_id])
+            return output_vtensor
 
         # Case B: output provided -> validate and select exact impl
         assert isinstance(output, vTensor), f"{prefix}output must be vTensor, got {type(output)}"
@@ -256,6 +272,15 @@ class Elementwise(vOp):
             f"{prefix}x and output must be on the same device "
             f"(x.device={x.device}, output.device={output.device})"
         )
+
+        # Register in the cache graph. ``output`` is provided by the caller
+        # and assumed to already have a valid ``tensor_id`` and to live in
+        # ``ctx.tensor_list``. We claim it as this op's produced tensor
+        # (override producer), mirroring ``indexer.save_load.Save``.
+        ctx.output_tensor_to_op_list[output.tensor_id] = len(ctx.op_list)
+        ctx.op_list.append(self)
+        ctx.op_to_input_tensor_list.append([x.tensor_id])
+        ctx.op_to_output_tensor_list.append([output.tensor_id])
 
         return output
 

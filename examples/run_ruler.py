@@ -24,7 +24,7 @@ return max(static_kv_budget, dynamic_kv_budget);
                     vortex_block_reserved_bos=1,
                     vortex_block_reserved_eos=2,
                     vortex_layers_skip=list(range(1)),
-                    vortex_module_name="gqa_quest_sparse_attention",
+                    vortex_module_name="block_sparse_attention",
                     vortex_max_seq_lens=8192,
                     mem_fraction_static=0.8,
                     vortex_workload_chunk_size=32,
