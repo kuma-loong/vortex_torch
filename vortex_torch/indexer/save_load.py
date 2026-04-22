@@ -1,8 +1,8 @@
 import torch
-from typing import Tuple, Dict, Callable, Optional
+from typing import Dict, Optional
 from .context import Context
 from ..abs import vTensor, as_vtensor, FORMAT, vOp
-from .triton_kernels.save_load_impl import save_rp, load_pr
+from ..utils import Schedule
 
 class Save(vOp):
     r"""
@@ -29,29 +29,24 @@ class Save(vOp):
 
     Attributes
     ----------
-    _impl_map : Dict[FORMAT, Tuple[Callable, FORMAT]]
-        Dispatch table keyed by ``x_format``. Each entry maps to
-        ``(callable_impl, resolved_output_format)``.
-
-    impl : Optional[Callable]
-        The resolved implementation selected during :meth:`profile`.
+    _impl_map : Dict[FORMAT, FORMAT]
+        Dispatch table keyed by ``x_format``. Each entry maps to the
+        resolved output format.
 
     output_format : Optional[FORMAT]
         The expected output format for ``o`` as determined in :meth:`profile`.
     """
 
-    # Implementation dispatch table: keyed only by x_format.
-    # Value: (callable_impl, resolved_output_format)
-    _impl_map: Dict[FORMAT, Tuple[Callable, FORMAT]] = {
-        FORMAT.RAGGED: (save_rp, FORMAT.PAGED),
+    # Dispatch table keyed by x_format -> resolved output format.
+    _impl_map: Dict[FORMAT, FORMAT] = {
+        FORMAT.RAGGED: FORMAT.PAGED,
         # Add more entries if you support other formats.
     }
 
     def __init__(self):
-        assert False, "Save operator is currently disabled pending implementation of the save_rp kernel. Please implement the kernel and update the _impl_map to enable this functionality."
         super().__init__()
-        self.impl: Optional[Callable] = None
         self.output_format: Optional[FORMAT] = None
+        self.schedule = Schedule.W
 
     # ---------------- profile ----------------
     def profile(self, x: vTensor, o: vTensor, ctx: Context) -> vTensor:
@@ -118,7 +113,7 @@ class Save(vOp):
             f"{prefix}no implementation for x_fmt={x_fmt}. "
             f"Available keys: {list(self._impl_map.keys())}"
         )
-        self.impl, self.output_format = self._impl_map[x_fmt]
+        self.output_format = self._impl_map[x_fmt]
 
         # Output format must match the resolved format from dispatch
         assert o._format == self.output_format, (
@@ -131,47 +126,15 @@ class Save(vOp):
             f"(x.device={x.device}, o.device={o.device})"
         )
 
-        # Save is logically out-of-place, but writes into `o`; return `o` view
+        # Track in the context graph. Save claims `o` as its produced tensor
+        # (mirrors the topK pattern): we override `o`'s producer slot with
+        # this op so that downstream consumers correctly depend on Save.
+        ctx.output_tensor_to_op_list[o.tensor_id] = len(ctx.op_list)
+        ctx.op_list.append(self)
+        ctx.op_to_input_tensor_list.append([x.tensor_id])
+        ctx.op_to_output_tensor_list.append([o.tensor_id])
+
         return o
-
-    # ---------------- execute ----------------
-    def execute(self, x: torch.Tensor, o: torch.Tensor, ctx: Context) -> torch.Tensor:
-        r"""
-        Execute the resolved save operation from ``x`` into ``o``.
-
-        The selected implementation is expected to copy or convert the
-        contents of ``x`` into the preallocated tensor ``o`` without
-        changing its shape or device.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input tensor to be copied/converted.
-
-        o : torch.Tensor
-            Preallocated output tensor that will receive the data.
-
-        ctx : Context
-            Execution context passed through to the implementation.
-
-        Returns
-        -------
-        torch.Tensor
-            The same tensor as ``o``, after the copy/convert operation.
-
-        Raises
-        ------
-        AssertionError
-            If :meth:`profile` has not been called and no implementation
-            is available.
-        """
-        prefix = self._prefix()
-        assert self.impl is not None, f"{prefix}execute called before profile() (impl is None)"
-
-        # Expected signature: impl(x, o, ctx)
-        self.impl(x, o, ctx)
-        return o
-
 
 
 class Load(vOp):
@@ -200,11 +163,9 @@ class Load(vOp):
 
     Attributes
     ----------
-    _impl_map : Dict[FORMAT, Tuple[Callable, FORMAT]]
-        Dispatch table keyed by ``x_format``. Each entry maps to
-        ``(callable_impl, resolved_output_format)``.
-    impl : Optional[Callable]
-        The resolved implementation selected during :meth:`profile`.
+    _impl_map : Dict[FORMAT, FORMAT]
+        Dispatch table keyed by ``x_format``. Each entry maps to the
+        resolved output format.
     output_format : Optional[FORMAT]
         The output tensor format as determined in :meth:`profile`.
     output_buffer : Optional[torch.Tensor]
@@ -212,19 +173,17 @@ class Load(vOp):
         ``[S_out, D_0, D_1]``, where ``S_out`` comes from the runtime context.
     """
 
-    # Implementation dispatch table: keyed only by x_format.
-    # Value: (callable_impl, resolved_output_format)
-    _impl_map: Dict[FORMAT, Tuple[Callable, FORMAT]] = {
-        FORMAT.PAGED: (load_pr, FORMAT.RAGGED),
+    # Dispatch table keyed by x_format -> resolved output format.
+    _impl_map: Dict[FORMAT, FORMAT] = {
+        FORMAT.PAGED: FORMAT.RAGGED,
         # Add more entries if you support other formats.
     }
 
     def __init__(self):
-        assert False, "Load operator is currently disabled pending implementation of the load_pr kernel. Please implement the kernel and update the _impl_map to enable this functionality."
         super().__init__()
-        self.impl: Optional[Callable] = None
         self.output_format: Optional[FORMAT] = None
         self.output_buffer: Optional[torch.Tensor] = None
+        self.schedule = Schedule.W
 
     # ---------------- profile ----------------
     def profile(self, x: vTensor, ctx: Context) -> vTensor:
@@ -276,58 +235,27 @@ class Load(vOp):
             f"{prefix}no implementation for x_fmt={x_fmt}. "
             f"Available keys: {list(self._impl_map.keys())}"
         )
-        self.impl, self.output_format = self._impl_map[x_fmt]
+        self.output_format = self._impl_map[x_fmt]
 
-        # Allocate output buffer [S_out, D0, D1].
-        # S_out comes from runtime context (e.g., number of tokens/pages).
-        S_out = ctx.max_num_pages
+        # Allocate output buffer [S_out, D0, D1] as a vTensor with a fresh
+        # tensor_id, mirroring the Softmax pattern so the compiler graph
+        # can track the new buffer as a node.
         D0, D1 = x.shape[1], x.shape[2]
-        self.output_buffer = torch.empty(
-            (S_out, D0, D1),
-            device=x.device,
-            dtype=x.dtype,
-        )
-        ctx.add_aux_memory(self.output_buffer)
-
-        # Return vTensor view with dispatched output format
-        return as_vtensor(self.output_buffer, self.output_format)
-
-    # ---------------- execute ----------------
-    def execute(self, x: torch.Tensor, ctx: Context) -> torch.Tensor:
-        r"""
-        Run the selected load operation into the internally allocated buffer.
-
-        The selected implementation is expected to copy or convert the
-        contents of ``x`` into the internal buffer stored in
-        :attr:`output_buffer`.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input tensor to be copied/converted, on the same device as the
-            internal output buffer.
-
-        ctx : Context
-            Execution context passed through to the implementation.
-
-        Returns
-        -------
-        torch.Tensor
-            The internally allocated output tensor stored in
-            :attr:`output_buffer`.
-
-        Raises
-        ------
-        AssertionError
-            If :meth:`profile` has not been called (no implementation or
-            internal output buffer available).
-        """
-        prefix = self._prefix()
-        assert self.impl is not None, f"{prefix}execute called before profile() (impl is None)"
-        assert self.output_buffer is not None, (
-            f"{prefix}internal output buffer is None; did profile() run?"
+        self.output_buffer = as_vtensor(
+            torch.empty(
+                (0, D0, D1),
+                device=x.device,
+                dtype=x.dtype,
+            ),
+            self.output_format,
+            tensor_id=len(ctx.tensor_list),
         )
 
-        # Expected signature: impl(x, output, ctx)
-        self.impl(x, self.output_buffer, ctx)
+        # Track in the context graph (same convention as Softmax / Conv1d).
+        ctx.tensor_list.append(self.output_buffer)
+        ctx.output_tensor_to_op_list.append(len(ctx.op_list))
+        ctx.op_list.append(self)
+        ctx.op_to_input_tensor_list.append([x.tensor_id])
+        ctx.op_to_output_tensor_list.append([self.output_buffer.tensor_id])
+
         return self.output_buffer

@@ -136,6 +136,21 @@ class Reduce(vOp):
         assert self.dim in (1, 2), f"{cls}.__init__: dim must be 1 or 2, got dim={self.dim}"
 
     # ------------------------------ helpers ------------------------------ #
+    def _resolve_quantization(self, x: vTensor) -> QuantizationType:
+        r"""Map ``x.dtype`` to the matching :class:`QuantizationType`.
+
+        Centralized so both branches of :meth:`profile` agree on FP8/BF16
+        dispatch and we don't silently leave ``quantization_type`` as ``None``.
+        """
+        prefix = self._prefix()
+        if x.dtype == torch.bfloat16:
+            return QuantizationType.BF16
+        if x.dtype == torch.float8_e5m2:
+            return QuantizationType.FP8_E5M2
+        if x.dtype == torch.float8_e4m3fn:
+            return QuantizationType.FP8_E4M3
+        raise ValueError(f"{prefix}unsupported dtype {x.dtype} for reduction")
+
     def _infer_impl_ragged(self, x_fmt: FORMAT) -> Tuple[Callable, FORMAT]:
         r"""
         Infer an implementation assuming a RAGGED output format.
@@ -240,12 +255,14 @@ class Reduce(vOp):
         # Case A: output not provided -> infer impl (RAGGED) and allocate buffer
         if output is None:
             self.impl, self.output_format = self._infer_impl_ragged(x_fmt)
+            self.quantization_type = self._resolve_quantization(x)
 
             B = ctx.max_new_tokens_per_batch * ctx.head_num
+            # Kernels always write bf16, regardless of the input quantization.
             self.output_buffer = torch.empty(
                 (B, exp_N, exp_D),
                 device=x.device,
-                dtype=x.dtype,
+                dtype=torch.bfloat16,
             )
             ctx.add_aux_memory(self.output_buffer)
             return as_vtensor(self.output_buffer, self.output_format)
@@ -292,14 +309,7 @@ class Reduce(vOp):
             f"(x.device={x.device}, output.device={output.device})"
         )
 
-        if x.dtype == torch.bfloat16:
-            self.quantization_type = QuantizationType.BF16
-        elif x.dtype == torch.float8_e5m2:
-            self.quantization_type = QuantizationType.FP8_E5M2
-        elif x.dtype == torch.float8_e4m3fn:
-            self.quantization_type = QuantizationType.FP8_E4M3
-        else:
-            raise ValueError(f"{prefix}unsupported dtype {x.dtype} for reduction")
+        self.quantization_type = self._resolve_quantization(x)
 
         return output
 

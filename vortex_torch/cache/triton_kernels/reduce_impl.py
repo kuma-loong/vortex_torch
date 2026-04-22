@@ -3,6 +3,8 @@ import triton
 import triton.language as tl
 from ..context import Context
 from ...utils import ReduceType, QuantizationType
+from .utils_impl import _quant_view
+
 
 @triton.jit
 def reduce_pp_kernel(
@@ -90,8 +92,7 @@ quantization_type: QuantizationType,
     
     NNZ = loc.shape[0]
     NUM_KV_HEAD = ctx.head_num
-    if quantization_type != QuantizationType.BF16:
-        x = x.view(torch.uint8) # reinterpret the input as uint8 for non-bf16 quantization types
+    x = _quant_view(x, quantization_type)
 
     reduce_pp_kernel[(NNZ, NUM_KV_HEAD)](
         x=x,
@@ -115,13 +116,17 @@ output: torch.Tensor,
 loc: torch.LongTensor,
 num_kv_heads: int,
 page_size: int,
+block_size: int,
+num_blocks_per_page: int,
 dim: int,
 reduce_type: ReduceType,
+quantization_type: QuantizationType = QuantizationType.BF16,
 ):
-    
+
     NNZ = loc.shape[0]
     NUM_KV_HEAD = num_kv_heads
-    
+    x = _quant_view(x, quantization_type)
+
     reduce_pp_kernel[(NNZ, NUM_KV_HEAD)](
         x=x,
         output=output,
@@ -130,8 +135,11 @@ reduce_type: ReduceType,
         x_D1=x.shape[2],
         NUM_KV_HEAD=NUM_KV_HEAD,
         PAGE_SIZE=page_size,
+        BLOCK_SIZE=block_size,
+        NUM_BLOCKS_PER_PAGE=num_blocks_per_page,
         REDUCE_TYPE=reduce_type.value,
-        DIM=dim
+        DIM=dim,
+        QUANT_TYPE=quantization_type.value,
     )
 
 
@@ -144,7 +152,8 @@ def reduce_rp_kernel(
     NUM_KV_HEAD: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     REDUCE_TYPE: tl.constexpr,       # 0: Mean, 1: Max, 2: Min, 3: L2Norm (not RMS)
-    DIM: tl.constexpr                # 1: reduce over rows -> len x_D1; 2: reduce over cols -> len x_D0
+    DIM: tl.constexpr,               # 1: reduce over rows -> len x_D1; 2: reduce over cols -> len x_D0
+    QUANT_TYPE: tl.constexpr,        # 0: bf16, 1: fp8_e5m2, 2: fp8_e4m3
 ):
     
     # Program IDs:
@@ -178,21 +187,25 @@ def reduce_rp_kernel(
     # Assumes the page is full; add masks here if you have partial tiles.
     page_block = tl.load(src_ptr)
 
+    # Cast to fp32 (with bitcast for FP8) so reductions accumulate in fp32.
+    if QUANT_TYPE == 0:        # bf16
+        page_block = page_block.to(tl.float32)
+    elif QUANT_TYPE == 1:      # fp8_e5m2
+        page_block = page_block.to(tl.float8e5, bitcast=True).to(tl.float32)
+    elif QUANT_TYPE == 2:      # fp8_e4m3
+        page_block = page_block.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+
     # Reduction:
     if DIM == 1:
         # Reduce over rows (axis=0) -> output vector length x_D1 (per-column reduce).
-        if REDUCE_TYPE == 0:  # Mean
-            # NOTE: precision-sensitive workloads may want fp32 accumulation:
-            # s = tl.sum(page_block.to(tl.float32), axis=0)
-            # reduce_vec = (s / x_D0).to(tl.bfloat16)
+        if REDUCE_TYPE == 0:    # Mean
             reduce_vec = (tl.sum(page_block, axis=0) / x_D0).to(tl.bfloat16)
         elif REDUCE_TYPE == 1:  # Max
             reduce_vec = tl.max(page_block, axis=0).to(tl.bfloat16)
         elif REDUCE_TYPE == 2:  # Min
             reduce_vec = tl.min(page_block, axis=0).to(tl.bfloat16)
         else:                   # L2Norm (sqrt(sum(x*x))); NOT RMS
-            # For RMS, use: tl.sqrt(tl.sum(page_block*page_block, axis=0) / x_D0)
-            s = tl.sum(page_block * page_block, axis=0).to(tl.float32)
+            s = tl.sum(page_block * page_block, axis=0)
             reduce_vec = tl.sqrt(s).to(tl.bfloat16)
 
         # Write to output: layout [num_pages, x_D1] for DIM==1.
@@ -201,22 +214,20 @@ def reduce_rp_kernel(
 
     else:
         # DIM == 2: Reduce over cols (axis=1) -> output vector length x_D0 (per-row reduce).
-        if REDUCE_TYPE == 0:  # Mean
-            # s = tl.sum(page_block.to(tl.float32), axis=1)
-            # reduce_vec = (s / x_D1).to(tl.bfloat16)
+        if REDUCE_TYPE == 0:    # Mean
             reduce_vec = (tl.sum(page_block, axis=1) / x_D1).to(tl.bfloat16)
         elif REDUCE_TYPE == 1:  # Max
             reduce_vec = tl.max(page_block, axis=1).to(tl.bfloat16)
         elif REDUCE_TYPE == 2:  # Min
             reduce_vec = tl.min(page_block, axis=1).to(tl.bfloat16)
         else:                   # L2Norm (sqrt(sum(x*x))); NOT RMS
-            s = tl.sum(page_block * page_block, axis=1).to(tl.float32)
+            s = tl.sum(page_block * page_block, axis=1)
             reduce_vec = tl.sqrt(s).to(tl.bfloat16)
 
         # Write to output: layout [num_pages, x_D0] for DIM==2.
         dst_ptr = output + page_id * x_D0 + tl.arange(0, x_D0)
         tl.store(dst_ptr, reduce_vec)
-    
+
 
 
 def reduce_rp(
@@ -228,12 +239,11 @@ dim: int,
 reduce_type: ReduceType,
 quantization_type: QuantizationType,
 ):
-    
-    assert quantization_type == QuantizationType.BF16, "Currently only BF16 quantization is supported in reduce_rp kernel"
 
     NNZ = loc.shape[0]
     NUM_KV_HEAD = ctx.head_num
-    
+    x = _quant_view(x, quantization_type)
+
     reduce_rp_kernel[(NNZ, NUM_KV_HEAD)](
         x=x,
         output=output,
@@ -243,7 +253,8 @@ quantization_type: QuantizationType,
         NUM_KV_HEAD=NUM_KV_HEAD,
         PAGE_SIZE=ctx.page_size,
         REDUCE_TYPE=reduce_type.value,
-        DIM=dim
+        DIM=dim,
+        QUANT_TYPE=quantization_type.value,
     )
 
 
@@ -255,11 +266,13 @@ num_kv_heads: int,
 page_size: int,
 dim: int,
 reduce_type: ReduceType,
+quantization_type: QuantizationType = QuantizationType.BF16,
 ):
-    
+
     NNZ = loc.shape[0]
     NUM_KV_HEAD = num_kv_heads
-    
+    x = _quant_view(x, quantization_type)
+
     reduce_rp_kernel[(NNZ, NUM_KV_HEAD)](
         x=x,
         output=output,
@@ -269,7 +282,8 @@ reduce_type: ReduceType,
         NUM_KV_HEAD=NUM_KV_HEAD,
         PAGE_SIZE=page_size,
         REDUCE_TYPE=reduce_type.value,
-        DIM=dim
+        DIM=dim,
+        QUANT_TYPE=quantization_type.value,
     )
 
 
@@ -281,7 +295,8 @@ x_D1: tl.constexpr,              # cols per page
 NUM_KV_HEAD: tl.constexpr,
 PAGE_SIZE: tl.constexpr,
 REDUCE_TYPE: tl.constexpr,       # 0: Mean, 1: Max, 2: Min, 3: L2Norm (not RMS)
-DIM: tl.constexpr                # 1: reduce over rows -> len x_D1; 2: reduce over cols -> len x_D0
+DIM: tl.constexpr,               # 1: reduce over rows -> len x_D1; 2: reduce over cols -> len x_D0
+QUANT_TYPE: tl.constexpr,        # 0: bf16, 1: fp8_e5m2, 2: fp8_e4m3
 ):
     """
     Layouts:
@@ -322,18 +337,25 @@ DIM: tl.constexpr                # 1: reduce over rows -> len x_D1; 2: reduce ov
     # Load the full page block. Assumes full tiles; add masks if needed.
     page_block = tl.load(src_ptr)
 
+    # Cast to fp32 (with bitcast for FP8) so reductions accumulate in fp32.
+    if QUANT_TYPE == 0:        # bf16
+        page_block = page_block.to(tl.float32)
+    elif QUANT_TYPE == 1:      # fp8_e5m2
+        page_block = page_block.to(tl.float8e5, bitcast=True).to(tl.float32)
+    elif QUANT_TYPE == 2:      # fp8_e4m3
+        page_block = page_block.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+
     # --- Reduction & write-out ---
     if DIM == 1:
         # Reduce over rows (axis=0) -> per-column vector, length = x_D1
         if REDUCE_TYPE == 0:        # Mean
-            # For better accuracy you may upcast: tl.sum(page_block.to(tl.float32), axis=0)
             reduce_vec = (tl.sum(page_block, axis=0) / x_D0).to(tl.bfloat16)
         elif REDUCE_TYPE == 1:      # Max
             reduce_vec = tl.max(page_block, axis=0).to(tl.bfloat16)
         elif REDUCE_TYPE == 2:      # Min
             reduce_vec = tl.min(page_block, axis=0).to(tl.bfloat16)
         else:                       # L2Norm (NOT RMS)
-            s = tl.sum(page_block * page_block, axis=0).to(tl.float32)
+            s = tl.sum(page_block * page_block, axis=0)
             reduce_vec = tl.sqrt(s).to(tl.bfloat16)
 
         # output is token-major: [num_tokens, NUM_KV_HEAD, x_D1]
@@ -350,9 +372,8 @@ DIM: tl.constexpr                # 1: reduce over rows -> len x_D1; 2: reduce ov
         elif REDUCE_TYPE == 2:      # Min
             reduce_vec = tl.min(page_block, axis=1).to(tl.bfloat16)
         else:                       # L2Norm (NOT RMS)
-            s = tl.sum(page_block * page_block, axis=1).to(tl.float32)
+            s = tl.sum(page_block * page_block, axis=1)
             reduce_vec = tl.sqrt(s).to(tl.bfloat16)
-
 
         # output is token-major: [num_tokens, NUM_KV_HEAD, x_D0]
         out_base = (token_id * NUM_KV_HEAD + head_id) * x_D0
@@ -367,14 +388,13 @@ loc: torch.LongTensor,
 ctx: Context,
 dim: int,
 reduce_type: ReduceType,
-quantization_type: QuantizationType
+quantization_type: QuantizationType,
 ):
-    
-    assert quantization_type == QuantizationType.BF16, "Currently only BF16 quantization is supported in reduce_pr kernel"
 
     NNZ = loc.shape[0]
     NUM_KV_HEAD = ctx.head_num
-    
+    x = _quant_view(x, quantization_type)
+
     reduce_pr_kernel[(NNZ, NUM_KV_HEAD)](
         x=x,
         output=output,
@@ -384,9 +404,11 @@ quantization_type: QuantizationType
         NUM_KV_HEAD=NUM_KV_HEAD,
         PAGE_SIZE=ctx.page_size,
         REDUCE_TYPE=reduce_type.value,
-        DIM=dim
+        DIM=dim,
+        QUANT_TYPE=quantization_type.value,
     )
-    
+
+
 def _reduce_pr(
 x: torch.Tensor,
 output: torch.Tensor,
@@ -395,11 +417,13 @@ num_kv_heads: int,
 page_size: int,
 dim: int,
 reduce_type: ReduceType,
+quantization_type: QuantizationType = QuantizationType.BF16,
 ):
-    
+
     NNZ = loc.shape[0]
     NUM_KV_HEAD = num_kv_heads
-    
+    x = _quant_view(x, quantization_type)
+
     reduce_pr_kernel[(NNZ, NUM_KV_HEAD)](
         x=x,
         output=output,
@@ -409,7 +433,8 @@ reduce_type: ReduceType,
         NUM_KV_HEAD=NUM_KV_HEAD,
         PAGE_SIZE=page_size,
         REDUCE_TYPE=reduce_type.value,
-        DIM=dim
+        DIM=dim,
+        QUANT_TYPE=quantization_type.value,
     )
 
 
@@ -421,7 +446,8 @@ x_D1: tl.constexpr,              # cols per token-page
 NUM_KV_HEAD: tl.constexpr,
 PAGE_SIZE: tl.constexpr,
 REDUCE_TYPE: tl.constexpr,       # 0: Mean, 1: Max, 2: Min, 3: L2Norm (not RMS)
-DIM: tl.constexpr                # 1: reduce over rows -> len x_D1; 2: reduce over cols -> len x_D0
+DIM: tl.constexpr,               # 1: reduce over rows -> len x_D1; 2: reduce over cols -> len x_D0
+QUANT_TYPE: tl.constexpr,        # 0: bf16, 1: fp8_e5m2, 2: fp8_e4m3
 ):
     """
     Layouts:
@@ -448,11 +474,18 @@ DIM: tl.constexpr                # 1: reduce over rows -> len x_D1; 2: reduce ov
     src_ptr  = x + x_base + rows * x_D1 + cols
     page_blk = tl.load(src_ptr)                    # assumes full page; add masks if needed
 
+    # Cast to fp32 (with bitcast for FP8) so reductions accumulate in fp32.
+    if QUANT_TYPE == 0:        # bf16
+        page_blk = page_blk.to(tl.float32)
+    elif QUANT_TYPE == 1:      # fp8_e5m2
+        page_blk = page_blk.to(tl.float8e5, bitcast=True).to(tl.float32)
+    elif QUANT_TYPE == 2:      # fp8_e4m3
+        page_blk = page_blk.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+
     # ---- reduce ----
     if DIM == 1:
         # over rows -> axis=0 -> vector len x_D1
         if REDUCE_TYPE == 0:       # Mean
-            # For better accuracy you may upcast to fp32 before sum.
             vec = (tl.sum(page_blk, axis=0) / x_D0).to(tl.bfloat16)
         elif REDUCE_TYPE == 1:     # Max
             vec = tl.max(page_blk, axis=0).to(tl.bfloat16)
@@ -492,12 +525,11 @@ dim: int,
 reduce_type: ReduceType,
 quantization_type: QuantizationType,
 ):
-    
-    assert quantization_type == QuantizationType.BF16, "Currently only BF16 quantization is supported in reduce_rr kernel"
 
     NNZ = loc.shape[0]
     NUM_KV_HEAD = ctx.head_num
-    
+    x = _quant_view(x, quantization_type)
+
     reduce_rr_kernel[(NNZ, NUM_KV_HEAD)](
         x=x,
         output=output,
@@ -507,9 +539,10 @@ quantization_type: QuantizationType,
         NUM_KV_HEAD=NUM_KV_HEAD,
         PAGE_SIZE=ctx.page_size,
         REDUCE_TYPE=reduce_type.value,
-        DIM=dim
+        DIM=dim,
+        QUANT_TYPE=quantization_type.value,
     )
-    
+
 
 def _reduce_rr(
 x: torch.Tensor,
@@ -519,11 +552,13 @@ num_kv_heads: int,
 page_size: int,
 dim: int,
 reduce_type: ReduceType,
+quantization_type: QuantizationType = QuantizationType.BF16,
 ):
-    
+
     NNZ = loc.shape[0]
     NUM_KV_HEAD = num_kv_heads
-    
+    x = _quant_view(x, quantization_type)
+
     reduce_rr_kernel[(NNZ, NUM_KV_HEAD)](
         x=x,
         output=output,
@@ -533,5 +568,6 @@ reduce_type: ReduceType,
         NUM_KV_HEAD=NUM_KV_HEAD,
         PAGE_SIZE=page_size,
         REDUCE_TYPE=reduce_type.value,
-        DIM=dim
+        DIM=dim,
+        QUANT_TYPE=quantization_type.value,
     )

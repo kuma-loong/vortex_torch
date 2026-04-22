@@ -2,6 +2,8 @@ import torch
 import triton
 import triton.language as tl
 from ..context import Context
+from ...utils import QuantizationType
+from .utils_impl import _quant_view
 
 @triton.jit
 def gemm_ppp_kernel(
@@ -15,6 +17,8 @@ def gemm_ppp_kernel(
     NUM_KV_HEAD: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     BLOCK_K: tl.constexpr,  # reduction tile size along K
+    X_QUANT: tl.constexpr,  # 0:bf16, 1:fp8_e5m2, 2:fp8_e4m3
+    Y_QUANT: tl.constexpr,  # 0:bf16, 1:fp8_e5m2, 2:fp8_e4m3
 ):
     """
     Compute one page of O = Y @ X^T in page-major layout (PPP).
@@ -79,9 +83,20 @@ def gemm_ppp_kernel(
         x_ptr = x + x_off + x_rows * x_D1 + ks_b1
         x_chunk = tl.load(x_ptr, mask=k_mask[None, :], other=0.0)
 
-        # Upcast to fp32 for stable accumulation
-        y32 = y_chunk.to(tl.float32)
-        x32 = x_chunk.to(tl.float32)
+        # Upcast to fp32 (with bitcast for FP8) for stable accumulation
+        if Y_QUANT == 0:
+            y32 = y_chunk.to(tl.float32)
+        elif Y_QUANT == 1:
+            y32 = y_chunk.to(tl.float8e5, bitcast=True).to(tl.float32)
+        elif Y_QUANT == 2:
+            y32 = y_chunk.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+
+        if X_QUANT == 0:
+            x32 = x_chunk.to(tl.float32)
+        elif X_QUANT == 1:
+            x32 = x_chunk.to(tl.float8e5, bitcast=True).to(tl.float32)
+        elif X_QUANT == 2:
+            x32 = x_chunk.to(tl.float8e4nv, bitcast=True).to(tl.float32)
 
         # Broadcast outer and reduce over BK:
         # [y_D0, 1, BK] * [1, x_D0, BK] -> [y_D0, x_D0, BK] -> sum(axis=2)
@@ -100,12 +115,16 @@ x: torch.Tensor,
 y: torch.Tensor,
 output: torch.Tensor,
 loc: torch.LongTensor,
-ctx: Context
+ctx: Context,
+x_quantization_type: QuantizationType = QuantizationType.BF16,
+y_quantization_type: QuantizationType = QuantizationType.BF16,
 ):
-    
+
     NNZ = loc.shape[0]
     NUM_KV_HEAD = ctx.head_num
-    
+    x = _quant_view(x, x_quantization_type)
+    y = _quant_view(y, y_quantization_type)
+
     gemm_ppp_kernel[(NNZ, NUM_KV_HEAD)](
         x=x,
         y=y,
@@ -119,7 +138,9 @@ ctx: Context
         o_D1=output.shape[2],
         NUM_KV_HEAD=NUM_KV_HEAD,
         PAGE_SIZE=ctx.page_size,
-        BLOCK_K=32
+        BLOCK_K=32,
+        X_QUANT=x_quantization_type.value,
+        Y_QUANT=y_quantization_type.value,
     )
 
 
@@ -129,12 +150,16 @@ y: torch.Tensor,
 output: torch.Tensor,
 loc: torch.LongTensor,
 num_kv_heads: int,
-page_size: int
+page_size: int,
+x_quantization_type: QuantizationType = QuantizationType.BF16,
+y_quantization_type: QuantizationType = QuantizationType.BF16,
 ):
-    
+
     NNZ = loc.shape[0]
     NUM_KV_HEAD = num_kv_heads
-    
+    x = _quant_view(x, x_quantization_type)
+    y = _quant_view(y, y_quantization_type)
+
     gemm_ppp_kernel[(NNZ, NUM_KV_HEAD)](
         x=x,
         y=y,
@@ -148,7 +173,9 @@ page_size: int
         o_D1=output.shape[2],
         NUM_KV_HEAD=NUM_KV_HEAD,
         PAGE_SIZE=page_size,
-        BLOCK_K=32
+        BLOCK_K=32,
+        X_QUANT=x_quantization_type.value,
+        Y_QUANT=y_quantization_type.value,
     )
 
 
@@ -164,6 +191,8 @@ def gemm_ppr_kernel(
     NUM_KV_HEAD: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     BLOCK_K: tl.constexpr,  # reduction tile size along K
+    X_QUANT: tl.constexpr,  # 0:bf16, 1:fp8_e5m2, 2:fp8_e4m3
+    Y_QUANT: tl.constexpr,  # 0:bf16, 1:fp8_e5m2, 2:fp8_e4m3
 ):
     """
     Compute one tile of O = Y @ X^T with PPR layout:
@@ -237,9 +266,20 @@ def gemm_ppr_kernel(
         x_ptr   = x + x_off + x_rows * x_D1 + ks_b1
         x_chunk = tl.load(x_ptr, mask=k_mask[None, :], other=0.0)
 
-        # Upcast to fp32 for stable accumulation
-        y32 = y_chunk.to(tl.float32)         # [y_D0, BK]
-        x32 = x_chunk.to(tl.float32)         # [x_D0, BK]
+        # Upcast to fp32 (with bitcast for FP8) for stable accumulation
+        if Y_QUANT == 0:
+            y32 = y_chunk.to(tl.float32)
+        elif Y_QUANT == 1:
+            y32 = y_chunk.to(tl.float8e5, bitcast=True).to(tl.float32)
+        elif Y_QUANT == 2:
+            y32 = y_chunk.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+
+        if X_QUANT == 0:
+            x32 = x_chunk.to(tl.float32)
+        elif X_QUANT == 1:
+            x32 = x_chunk.to(tl.float8e5, bitcast=True).to(tl.float32)
+        elif X_QUANT == 2:
+            x32 = x_chunk.to(tl.float8e4nv, bitcast=True).to(tl.float32)
 
         # Broadcast outer and reduce over BK:
         # [y_D0, 1, BK] * [1, x_D0, BK] -> [y_D0, x_D0, BK] -> sum(axis=2)
@@ -257,12 +297,16 @@ x: torch.Tensor,
 y: torch.Tensor,
 output: torch.Tensor,
 loc: torch.LongTensor,
-ctx: Context
+ctx: Context,
+x_quantization_type: QuantizationType = QuantizationType.BF16,
+y_quantization_type: QuantizationType = QuantizationType.BF16,
 ):
-    
+
     NNZ = loc.shape[0]
     NUM_KV_HEAD = ctx.head_num
-    
+    x = _quant_view(x, x_quantization_type)
+    y = _quant_view(y, y_quantization_type)
+
     gemm_ppr_kernel[(NNZ, NUM_KV_HEAD)](
         x=x,
         y=y,
@@ -276,7 +320,9 @@ ctx: Context
         o_D1=output.shape[2],
         NUM_KV_HEAD=NUM_KV_HEAD,
         PAGE_SIZE=ctx.page_size,
-        BLOCK_K=32
+        BLOCK_K=32,
+        X_QUANT=x_quantization_type.value,
+        Y_QUANT=y_quantization_type.value,
     )
 
 
@@ -286,12 +332,16 @@ y: torch.Tensor,
 output: torch.Tensor,
 loc: torch.LongTensor,
 num_kv_heads: int,
-page_size: int
+page_size: int,
+x_quantization_type: QuantizationType = QuantizationType.BF16,
+y_quantization_type: QuantizationType = QuantizationType.BF16,
 ):
-    
+
     NNZ = loc.shape[0]
     NUM_KV_HEAD = num_kv_heads
-    
+    x = _quant_view(x, x_quantization_type)
+    y = _quant_view(y, y_quantization_type)
+
     gemm_ppr_kernel[(NNZ, NUM_KV_HEAD)](
         x=x,
         y=y,
@@ -305,7 +355,9 @@ page_size: int
         o_D1=output.shape[2],
         NUM_KV_HEAD=NUM_KV_HEAD,
         PAGE_SIZE=page_size,
-        BLOCK_K=32
+        BLOCK_K=32,
+        X_QUANT=x_quantization_type.value,
+        Y_QUANT=y_quantization_type.value,
     )
 
 @triton.jit
@@ -320,6 +372,8 @@ def gemm_rrp_kernel(
     NUM_KV_HEAD: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     BLOCK_K: tl.constexpr,  # reduction tile size along K
+    X_QUANT: tl.constexpr,  # 0:bf16, 1:fp8_e5m2, 2:fp8_e4m3
+    Y_QUANT: tl.constexpr,  # 0:bf16, 1:fp8_e5m2, 2:fp8_e4m3
 ):
     """
     Compute one page of O = Y @ X^T with RRP layout:
@@ -393,9 +447,20 @@ def gemm_rrp_kernel(
         x_ptr   = x + x_off + x_rows * x_D1 + ks_b1
         x_chunk = tl.load(x_ptr, mask=k_mask[None, :], other=0.0)
 
-        # Upcast to fp32 for stable accumulation
-        y32 = y_chunk.to(tl.float32)         # [y_D0, BK]
-        x32 = x_chunk.to(tl.float32)         # [x_D0, BK]
+        # Upcast to fp32 (with bitcast for FP8) for stable accumulation
+        if Y_QUANT == 0:
+            y32 = y_chunk.to(tl.float32)
+        elif Y_QUANT == 1:
+            y32 = y_chunk.to(tl.float8e5, bitcast=True).to(tl.float32)
+        elif Y_QUANT == 2:
+            y32 = y_chunk.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+
+        if X_QUANT == 0:
+            x32 = x_chunk.to(tl.float32)
+        elif X_QUANT == 1:
+            x32 = x_chunk.to(tl.float8e5, bitcast=True).to(tl.float32)
+        elif X_QUANT == 2:
+            x32 = x_chunk.to(tl.float8e4nv, bitcast=True).to(tl.float32)
 
         # Broadcast outer and reduce over BK:
         # [y_D0, 1, BK] * [1, x_D0, BK] -> [y_D0, x_D0, BK] -> sum(axis=2)
@@ -414,12 +479,16 @@ x: torch.Tensor,
 y: torch.Tensor,
 output: torch.Tensor,
 loc: torch.LongTensor,
-ctx: Context
+ctx: Context,
+x_quantization_type: QuantizationType = QuantizationType.BF16,
+y_quantization_type: QuantizationType = QuantizationType.BF16,
 ):
-    
+
     NNZ = loc.shape[0]
     NUM_KV_HEAD = ctx.head_num
-    
+    x = _quant_view(x, x_quantization_type)
+    y = _quant_view(y, y_quantization_type)
+
     gemm_rrp_kernel[(NNZ, NUM_KV_HEAD)](
         x=x,
         y=y,
@@ -433,7 +502,9 @@ ctx: Context
         o_D1=output.shape[2],
         NUM_KV_HEAD=NUM_KV_HEAD,
         PAGE_SIZE=ctx.page_size,
-        BLOCK_K=32
+        BLOCK_K=32,
+        X_QUANT=x_quantization_type.value,
+        Y_QUANT=y_quantization_type.value,
     )
 
 
@@ -443,12 +514,16 @@ y: torch.Tensor,
 output: torch.Tensor,
 loc: torch.LongTensor,
 num_kv_heads: int,
-page_size: int
+page_size: int,
+x_quantization_type: QuantizationType = QuantizationType.BF16,
+y_quantization_type: QuantizationType = QuantizationType.BF16,
 ):
-    
+
     NNZ = loc.shape[0]
     NUM_KV_HEAD = num_kv_heads
-    
+    x = _quant_view(x, x_quantization_type)
+    y = _quant_view(y, y_quantization_type)
+
     gemm_rrp_kernel[(NNZ, NUM_KV_HEAD)](
         x=x,
         y=y,
@@ -462,7 +537,9 @@ page_size: int
         o_D1=output.shape[2],
         NUM_KV_HEAD=NUM_KV_HEAD,
         PAGE_SIZE=page_size,
-        BLOCK_K=32
+        BLOCK_K=32,
+        X_QUANT=x_quantization_type.value,
+        Y_QUANT=y_quantization_type.value,
     )
 
 @triton.jit
@@ -477,6 +554,8 @@ def gemm_rrr_kernel(
     NUM_KV_HEAD: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     BLOCK_K: tl.constexpr,  # reduction chunk size along K
+    X_QUANT: tl.constexpr,  # 0:bf16, 1:fp8_e5m2, 2:fp8_e4m3
+    Y_QUANT: tl.constexpr,  # 0:bf16, 1:fp8_e5m2, 2:fp8_e4m3
 ):
     """
     Compute one token-major tile of O = Y @ X^T with RRR layout:
@@ -549,9 +628,20 @@ def gemm_rrr_kernel(
         x_ptr   = x + x_off + x_rows * x_D1 + ks_b1
         x_chunk = tl.load(x_ptr, mask=k_mask[None, :], other=0.0)
 
-        # Upcast to fp32 for stable accumulation
-        y32 = y_chunk.to(tl.float32)         # [y_D0, BK]
-        x32 = x_chunk.to(tl.float32)         # [x_D0, BK]
+        # Upcast to fp32 (with bitcast for FP8) for stable accumulation
+        if Y_QUANT == 0:
+            y32 = y_chunk.to(tl.float32)
+        elif Y_QUANT == 1:
+            y32 = y_chunk.to(tl.float8e5, bitcast=True).to(tl.float32)
+        elif Y_QUANT == 2:
+            y32 = y_chunk.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+
+        if X_QUANT == 0:
+            x32 = x_chunk.to(tl.float32)
+        elif X_QUANT == 1:
+            x32 = x_chunk.to(tl.float8e5, bitcast=True).to(tl.float32)
+        elif X_QUANT == 2:
+            x32 = x_chunk.to(tl.float8e4nv, bitcast=True).to(tl.float32)
 
         # Broadcast outer and reduce over BK:
         # [y_D0, 1, BK] * [1, x_D0, BK] -> [y_D0, x_D0, BK] -> sum(axis=2)
@@ -570,12 +660,16 @@ x: torch.Tensor,
 y: torch.Tensor,
 output: torch.Tensor,
 loc: torch.LongTensor,
-ctx: Context
+ctx: Context,
+x_quantization_type: QuantizationType = QuantizationType.BF16,
+y_quantization_type: QuantizationType = QuantizationType.BF16,
 ):
-    
+
     NNZ = loc.shape[0]
     NUM_KV_HEAD = ctx.head_num
-    
+    x = _quant_view(x, x_quantization_type)
+    y = _quant_view(y, y_quantization_type)
+
     gemm_rrr_kernel[(NNZ, NUM_KV_HEAD)](
         x=x,
         y=y,
@@ -589,7 +683,9 @@ ctx: Context
         o_D1=output.shape[2],
         NUM_KV_HEAD=NUM_KV_HEAD,
         PAGE_SIZE=ctx.page_size,
-        BLOCK_K=32
+        BLOCK_K=32,
+        X_QUANT=x_quantization_type.value,
+        Y_QUANT=y_quantization_type.value,
     )
 
 
@@ -599,12 +695,16 @@ y: torch.Tensor,
 output: torch.Tensor,
 loc: torch.LongTensor,
 num_kv_heads: int,
-page_size: int
+page_size: int,
+x_quantization_type: QuantizationType = QuantizationType.BF16,
+y_quantization_type: QuantizationType = QuantizationType.BF16,
 ):
-    
+
     NNZ = loc.shape[0]
     NUM_KV_HEAD = num_kv_heads
-    
+    x = _quant_view(x, x_quantization_type)
+    y = _quant_view(y, y_quantization_type)
+
     gemm_rrr_kernel[(NNZ, NUM_KV_HEAD)](
         x=x,
         y=y,
@@ -618,5 +718,7 @@ page_size: int
         o_D1=output.shape[2],
         NUM_KV_HEAD=NUM_KV_HEAD,
         PAGE_SIZE=page_size,
-        BLOCK_K=32
+        BLOCK_K=32,
+        X_QUANT=x_quantization_type.value,
+        Y_QUANT=y_quantization_type.value,
     )

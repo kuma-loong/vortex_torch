@@ -3,57 +3,6 @@
 
 
 template <int NUM_THREADS, int ITEM_PER_THREAD>
-__global__ void TopKOutput_F32_Kernel(
-const float* __restrict__ score,
-const int*   __restrict__ dense_kv_indptr,
-const int*   __restrict__ sparse_kv_indptr,
-const int*   __restrict__ dense_kv_indices,
-int*         __restrict__ sparse_kv_indices,
-const int    topk_val,
-const int    page_reserved_bos,
-const int    page_reserved_eos)
-{
-    const int bx = blockIdx.x;
-    const int tx = threadIdx.x;
-
-    const int start = dense_kv_indptr[bx] + page_reserved_bos;
-    const int end   = dense_kv_indptr[bx + 1] - page_reserved_eos;
-    const int nblk  = end - start;
-    if (nblk <= topk_val) return;
-
-    const float* __restrict__ score_blk = score + start;
-    const int*   __restrict__ idx_blk   = dense_kv_indices + start;
-    int*         __restrict__ out_blk   = sparse_kv_indices + sparse_kv_indptr[bx] + page_reserved_bos;
-
-    float key[ITEM_PER_THREAD];
-    int   val[ITEM_PER_THREAD];
-
-    using BLF  = cub::BlockLoad<float, NUM_THREADS, ITEM_PER_THREAD, cub::BLOCK_LOAD_WARP_TRANSPOSE>;
-    using BLI  = cub::BlockLoad<int,   NUM_THREADS, ITEM_PER_THREAD, cub::BLOCK_LOAD_WARP_TRANSPOSE>;
-    using BSI  = cub::BlockStore<int,  NUM_THREADS, ITEM_PER_THREAD, cub::BLOCK_STORE_WARP_TRANSPOSE>;
-    using Sort = cub::BlockRadixSort<float, NUM_THREADS, ITEM_PER_THREAD, int>;
-
-    __shared__ union {
-        typename BLF::TempStorage  lf;
-        typename BLI::TempStorage  li;
-        typename BSI::TempStorage  si;
-        typename Sort::TempStorage sort;
-    } temp;
-
-    BLF(temp.lf).Load(score_blk, key, nblk, -INFINITY);
-    __syncthreads();
-    BLI(temp.li).Load(idx_blk,   val, nblk, 0);
-    __syncthreads();
-
-    Sort(temp.sort).SortDescending(key, val);
-    __syncthreads();
-
-    const int valid_out = min(topk_val, nblk);
-    BSI(temp.si).Store(out_blk, /*per-thread regs*/ val, valid_out);
-}
-
-
-template <int NUM_THREADS, int ITEM_PER_THREAD>
 __global__ void TopKOutput_BF16_Kernel(
 const __nv_bfloat16* __restrict__ score,
 const int*           __restrict__ dense_kv_indptr,

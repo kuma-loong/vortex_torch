@@ -1,8 +1,7 @@
 import torch
-from typing import Tuple, Dict, Callable, Optional
+from typing import Dict, Callable, Optional
 from .context import Context
 from ..abs import vTensor, as_vtensor, FORMAT, vOp
-from .triton_kernels.elementwise_impl import elementwise_rr
 from ..utils import ElementwiseOpType, Schedule
 
 class Elementwise(vOp):
@@ -16,18 +15,15 @@ class Elementwise(vOp):
 
     Attributes
     ----------
-    _impl_map : Dict[FORMAT, Tuple[Callable, FORMAT]]
-        Implementation dispatch table keyed by input format.  
-        Each entry maps to ``(callable_impl, resolved_output_format)``.
+    _impl_map : Dict[FORMAT, FORMAT]
+        Dispatch table keyed by input format. Each entry maps to the
+        resolved output format.
 
     alpha : float
         Scalar parameter used by some ops. Default is ``1.0``.
 
     beta : float
         Scalar parameter used by some ops. Default is ``1.0``.
-
-    impl : Optional[Callable]
-        The resolved implementation selected during :meth:`profile`.
 
     op_type : Optional[ElementwiseOpType]
         The operator type used by the implementation.
@@ -39,23 +35,21 @@ class Elementwise(vOp):
         Preallocated output tensor buffer.
     """
 
-    # Implementation dispatch table: keyed only by x_format.
-    # Value: (callable_impl, resolved_output_format)
+    # Dispatch table keyed by x_format -> resolved output format.
     _impl_map: Dict[FORMAT, FORMAT] = {
-        FORMAT.RAGGED: (FORMAT.RAGGED),
+        FORMAT.RAGGED: FORMAT.RAGGED,
         # Add more entries if you support other formats:
-        # FORMAT.PAGED: (elementwise_pp, FORMAT.PAGED),
+        # FORMAT.PAGED: FORMAT.PAGED,
     }
 
     def __init__(self, alpha: float = 1.0, beta: float = 1.0):
-        assert False, "Elementwise operator is currently disabled pending implementation of the elementwise_rr kernel. Please implement the kernel and update the _impl_map to enable this functionality."
         super().__init__()
-        self.impl: Optional[Callable] = None
         self.op_type: Optional[ElementwiseOpType] = None
         self.alpha = alpha
         self.beta = beta
         self.output_format: Optional[FORMAT] = None
         self.output_buffer: Optional[torch.Tensor] = None
+        self.schedule = Schedule.W
 
     def profile(self, x: vTensor, ctx: Context) -> vTensor:
         """
@@ -96,63 +90,24 @@ class Elementwise(vOp):
             f"{prefix}no implementation for x_fmt={x_fmt}. "
             f"Available keys: {list(self._impl_map.keys())}"
         )
-        self.impl, self.output_format = self._impl_map[x_fmt]
+        self.output_format = self._impl_map[x_fmt]
+
+        C, D = x.shape[1], x.shape[2]
 
         # Allocate output buffer on x.device with x.dtype
-        S = ctx.max_num_pages             # runtime "S" axis from context
-        C, D = x.shape[1], x.shape[2]
-        self.output_buffer = torch.empty(
-            (S, C, D),
+        self.output_buffer = as_vtensor(torch.empty(
+            (0, C, D),
             device=x.device,
             dtype=x.dtype,
+        ), self.output_format, tensor_id=len(ctx.tensor_list)  # Assign a new tensor_id based on current tensor count
         )
+        # Track auxiliary memory and graph structure in the context
+        ctx.tensor_list.append(self.output_buffer)  # Track the output buffer in the context
+        ctx.output_tensor_to_op_list.append(len(ctx.op_list))  # Map the output tensor to this operation
+        ctx.op_list.append(self)  # Track this operation in the context
+        ctx.op_to_input_tensor_list.append([x.tensor_id])  # Map this op to its input tensors
+        ctx.op_to_output_tensor_list.append([self.output_buffer.tensor_id])  # Map this op to its output tensor
 
-        # Account auxiliary memory
-        ctx.add_aux_memory(self.output_buffer)
-
-        for t in [x]:
-            if t._format == FORMAT.PAGED:
-                ctx.add_aux_flops(
-                    t.shape[1] * t.shape[2]
-                )
-        
-        # Return vTensor view with dispatched output format
-        return as_vtensor(self.output_buffer, self.output_format)
-
-    def execute(self, x: torch.Tensor, ctx: Context) -> torch.Tensor:
-        """
-        Execute the selected implementation into the internal output buffer.
-
-        Expected implementation signature::
-
-            impl(x, output, op_type, alpha, beta, ctx)
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input tensor on the same device as the output buffer.
-
-        ctx : Context
-            Execution context.
-
-        Returns
-        -------
-        torch.Tensor
-            The output tensor stored in ``self.output_buffer``.
-
-        Raises
-        ------
-        AssertionError
-            If ``profile`` was not called, or device mismatch occurs.
-        """
-        prefix = self._prefix()
-        assert self.impl is not None, f"{prefix}execute called before profile() (impl is None)"
-        assert self.output_buffer is not None, f"{prefix}output buffer is None; did profile() run?"
-        assert x.device == self.output_buffer.device, (
-            f"{prefix}device mismatch: x.device={x.device}, o.device={self.output_buffer.device}"
-        )
-
-        self.impl(x, self.output_buffer, self.op_type, self.alpha, self.beta, ctx)
         return self.output_buffer
 
 

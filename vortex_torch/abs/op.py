@@ -14,7 +14,10 @@ class vOp(ABC):
     - **Profiling phase** – used to pre-compute shapes, allocate buffers, or collect statistics.
     - **Execution phase** – performs the actual operator computation.
 
-    Subclasses must implement :meth:`profile` and :meth:`execute`.
+    Subclasses **must** implement :meth:`profile`. :meth:`execute` is
+    optional — ops that run only through the compiled codegen path may
+    omit it; calling :meth:`execute` on such an op will raise
+    :class:`NotImplementedError`.
     The :meth:`__call__` method automatically dispatches between these modes
     based on the provided context.
     """
@@ -51,14 +54,14 @@ class vOp(ABC):
         raise NotImplementedError
 
     
-    @abstractmethod
     def execute(self, *args: Any, ctx: ContextBase = None, **kwargs: Any) -> Any:
-        """Abstract method: execute.
+        """Optional: execute the operator at runtime.
 
-        Called during the normal execution phase.
-
-        This method implements the actual operator logic.
-        Subclasses must provide their own implementation.
+        Subclasses that participate in the runtime (eager) path should
+        override this method. Subclasses that run only through the
+        compiled (codegen) path may leave it unimplemented; in that case
+        attempting to call :meth:`execute` raises :class:`NotImplementedError`
+        with a hint that this op is codegen-only.
 
         Args:
             *args: Positional arguments for the operation.
@@ -66,13 +69,16 @@ class vOp(ABC):
             **kwargs: Additional keyword arguments.
 
         Returns:
-            Any: The result of the operator execution.
+            Any: The result of the operator execution, if implemented.
 
         Raises:
-            NotImplementedError: If the subclass does not implement this method.
+            NotImplementedError: If the subclass has not overridden it.
         """
-        
-        raise NotImplementedError
+
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement execute(); "
+            f"this operator runs only through the compiled codegen path."
+        )
 
 
     def __call__(self, *args: Any, ctx: ContextBase = None, **kwargs: Any) -> Any:

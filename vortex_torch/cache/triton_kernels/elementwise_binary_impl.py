@@ -2,7 +2,8 @@ import torch
 import triton
 import triton.language as tl
 from ..context import Context
-from ...utils import ElementwiseBinaryOpType
+from ...utils import ElementwiseBinaryOpType, QuantizationType
+from .utils_impl import _quant_view
 
 @triton.jit
 def elementwise_binary_ppp_kernel(
@@ -18,8 +19,10 @@ PAGE_SIZE: tl.constexpr,
 OP_TYPE: tl.constexpr,  # 0:Maximum, 1:Minimum, 2:Add, 3:Mul
 alpha: tl.constexpr,
 beta: tl.constexpr,
-):  
-    
+X_QUANT: tl.constexpr,  # 0:bf16, 1:fp8_e5m2, 2:fp8_e4m3
+Y_QUANT: tl.constexpr,  # 0:bf16, 1:fp8_e5m2, 2:fp8_e4m3
+):
+
     token_id = tl.program_id(0)
     head_id  = tl.program_id(1)
 
@@ -32,27 +35,42 @@ beta: tl.constexpr,
     x_offset = page_id * x_D0 * x_D1
     y_offset = page_id * y_D0 * y_D1
     o_offset = page_id * o_D0 * o_D1
-    
-    x_i = tl.load(x + x_offset + tl.arange(0, x_D0)[:, None] * x_D1 + tl.arange(0, x_D1)[None, :])
-    y_i = tl.load(y + y_offset + tl.arange(0, y_D0)[:, None] * y_D1 + tl.arange(0, y_D1)[None, :])
-    
-    alpha_bf16 = tl.full((), alpha, dtype=tl.bfloat16)
-    beta_bf16 = tl.full((), beta, dtype=tl.bfloat16)
-    
+
+    x_raw = tl.load(x + x_offset + tl.arange(0, x_D0)[:, None] * x_D1 + tl.arange(0, x_D1)[None, :])
+    y_raw = tl.load(y + y_offset + tl.arange(0, y_D0)[:, None] * y_D1 + tl.arange(0, y_D1)[None, :])
+
+    # Cast to fp32 (with bitcast for FP8) so the op runs in fp32.
+    if X_QUANT == 0:
+        x_f = x_raw.to(tl.float32)
+    elif X_QUANT == 1:
+        x_f = x_raw.to(tl.float8e5, bitcast=True).to(tl.float32)
+    elif X_QUANT == 2:
+        x_f = x_raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+
+    if Y_QUANT == 0:
+        y_f = y_raw.to(tl.float32)
+    elif Y_QUANT == 1:
+        y_f = y_raw.to(tl.float8e5, bitcast=True).to(tl.float32)
+    elif Y_QUANT == 2:
+        y_f = y_raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+
+    alpha_f = tl.full((), alpha, dtype=tl.float32)
+    beta_f  = tl.full((), beta,  dtype=tl.float32)
+
     if OP_TYPE == 0:
-        o_i = tl.maximum(x_i, y_i)
-            
+        o_f = tl.maximum(x_f, y_f)
+
     elif OP_TYPE == 1:
-        o_i = tl.minimum(x_i, y_i)
-            
+        o_f = tl.minimum(x_f, y_f)
+
     elif OP_TYPE == 2:
-        o_i = tl.add(alpha_bf16 * x_i, beta_bf16 * y_i)
+        o_f = alpha_f * x_f + beta_f * y_f
 
     elif OP_TYPE == 3:
-        o_i = x_i * y_i
-            
-    o_i = o_i.to(tl.bfloat16)
-    
+        o_f = x_f * y_f
+
+    o_i = o_f.to(tl.bfloat16)
+
     tl.store(output + o_offset + tl.arange(0, o_D0)[:, None] * o_D1 + tl.arange(0, o_D1)[None, :], o_i)
 
 
@@ -64,12 +82,16 @@ loc: torch.LongTensor,
 ctx: Context,
 op_type: ElementwiseBinaryOpType,
 alpha: float,
-beta: float
+beta: float,
+x_quantization_type: QuantizationType = QuantizationType.BF16,
+y_quantization_type: QuantizationType = QuantizationType.BF16,
 ):
-    
+
     NNZ = loc.shape[0]
     NUM_KV_HEAD = ctx.head_num
-    
+    x = _quant_view(x, x_quantization_type)
+    y = _quant_view(y, y_quantization_type)
+
     elementwise_binary_ppp_kernel[(NNZ, NUM_KV_HEAD)](
         x=x,
         y=y,
@@ -85,9 +107,11 @@ beta: float
         PAGE_SIZE=ctx.page_size,
         OP_TYPE=op_type.value,
         alpha=alpha,
-        beta=beta
+        beta=beta,
+        X_QUANT=x_quantization_type.value,
+        Y_QUANT=y_quantization_type.value,
     )
-    
+
 
 def _elementwise_binary_ppp(
 x: torch.Tensor,
@@ -98,12 +122,16 @@ num_kv_heads: int,
 page_size: int,
 op_type: ElementwiseBinaryOpType,
 alpha: float,
-beta: float
+beta: float,
+x_quantization_type: QuantizationType = QuantizationType.BF16,
+y_quantization_type: QuantizationType = QuantizationType.BF16,
 ):
-    
+
     NNZ = loc.shape[0]
     NUM_KV_HEAD = num_kv_heads
-    
+    x = _quant_view(x, x_quantization_type)
+    y = _quant_view(y, y_quantization_type)
+
     elementwise_binary_ppp_kernel[(NNZ, NUM_KV_HEAD)](
         x=x,
         y=y,
@@ -119,7 +147,9 @@ beta: float
         PAGE_SIZE=page_size,
         OP_TYPE=op_type.value,
         alpha=alpha,
-        beta=beta
+        beta=beta,
+        X_QUANT=x_quantization_type.value,
+        Y_QUANT=y_quantization_type.value,
     )
 
 
@@ -137,6 +167,8 @@ def elementwise_binary_rrp_kernel(
     OP_TYPE: tl.constexpr,  # 0:Maximum, 1:Minimum, 2:Add (alpha*x + beta*y), 3:Mul
     alpha: tl.constexpr,
     beta: tl.constexpr,
+    X_QUANT: tl.constexpr,  # 0:bf16, 1:fp8_e5m2, 2:fp8_e4m3
+    Y_QUANT: tl.constexpr,  # 0:bf16, 1:fp8_e5m2, 2:fp8_e4m3
 ):
     """
     Layouts:
@@ -170,24 +202,37 @@ def elementwise_binary_rrp_kernel(
     o_rows = tl.arange(0, o_D0)[:, None]; o_cols = tl.arange(0, o_D1)[None, :]
 
     # load full tiles (assume already broadcasted/compatible; no mask)
-    x_i = tl.load(x + x_offset + x_rows * x_D1 + x_cols)
-    y_i = tl.load(y + y_offset + y_rows * y_D1 + y_cols)
+    x_raw = tl.load(x + x_offset + x_rows * x_D1 + x_cols)
+    y_raw = tl.load(y + y_offset + y_rows * y_D1 + y_cols)
 
-    alpha_bf16 = tl.full((), alpha, dtype=tl.bfloat16)
-    beta_bf16 = tl.full((), beta, dtype=tl.bfloat16)
-    
-    # elementwise binary op
+    # Cast to fp32 (with bitcast for FP8) so the op runs in fp32.
+    if X_QUANT == 0:
+        x_f = x_raw.to(tl.float32)
+    elif X_QUANT == 1:
+        x_f = x_raw.to(tl.float8e5, bitcast=True).to(tl.float32)
+    elif X_QUANT == 2:
+        x_f = x_raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+
+    if Y_QUANT == 0:
+        y_f = y_raw.to(tl.float32)
+    elif Y_QUANT == 1:
+        y_f = y_raw.to(tl.float8e5, bitcast=True).to(tl.float32)
+    elif Y_QUANT == 2:
+        y_f = y_raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+
+    alpha_f = tl.full((), alpha, dtype=tl.float32)
+    beta_f  = tl.full((), beta,  dtype=tl.float32)
+
     if OP_TYPE == 0:        # maximum
-        o_i = tl.maximum(x_i, y_i)
+        o_f = tl.maximum(x_f, y_f)
     elif OP_TYPE == 1:      # minimum
-        o_i = tl.minimum(x_i, y_i)
+        o_f = tl.minimum(x_f, y_f)
     elif OP_TYPE == 2:      # alpha*x + beta*y
-        o_i = tl.add(alpha_bf16 * x_i, beta_bf16 * y_i)
+        o_f = alpha_f * x_f + beta_f * y_f
     else:                   # OP_TYPE == 3: multiply
-        o_i = x_i * y_i
+        o_f = x_f * y_f
 
-    # cast and store (page-major)
-    o_i = o_i.to(tl.bfloat16)
+    o_i = o_f.to(tl.bfloat16)
     tl.store(output + o_offset + o_rows * o_D1 + o_cols, o_i)
 
 
@@ -199,12 +244,16 @@ loc: torch.LongTensor,
 ctx: Context,
 op_type: ElementwiseBinaryOpType,
 alpha: float,
-beta: float
+beta: float,
+x_quantization_type: QuantizationType = QuantizationType.BF16,
+y_quantization_type: QuantizationType = QuantizationType.BF16,
 ):
-    
+
     NNZ = loc.shape[0]
     NUM_KV_HEAD = ctx.head_num
-    
+    x = _quant_view(x, x_quantization_type)
+    y = _quant_view(y, y_quantization_type)
+
     elementwise_binary_rrp_kernel[(NNZ, NUM_KV_HEAD)](
         x=x,
         y=y,
@@ -220,7 +269,9 @@ beta: float
         PAGE_SIZE=ctx.page_size,
         OP_TYPE=op_type.value,
         alpha=alpha,
-        beta=beta
+        beta=beta,
+        X_QUANT=x_quantization_type.value,
+        Y_QUANT=y_quantization_type.value,
     )
 
 
@@ -233,12 +284,16 @@ num_kv_heads: int,
 page_size: int,
 op_type: ElementwiseBinaryOpType,
 alpha: float,
-beta: float
+beta: float,
+x_quantization_type: QuantizationType = QuantizationType.BF16,
+y_quantization_type: QuantizationType = QuantizationType.BF16,
 ):
-    
+
     NNZ = loc.shape[0]
     NUM_KV_HEAD = num_kv_heads
-    
+    x = _quant_view(x, x_quantization_type)
+    y = _quant_view(y, y_quantization_type)
+
     elementwise_binary_rrp_kernel[(NNZ, NUM_KV_HEAD)](
         x=x,
         y=y,
@@ -254,7 +309,9 @@ beta: float
         PAGE_SIZE=page_size,
         OP_TYPE=op_type.value,
         alpha=alpha,
-        beta=beta
+        beta=beta,
+        X_QUANT=x_quantization_type.value,
+        Y_QUANT=y_quantization_type.value,
     )
     
 @triton.jit
@@ -271,6 +328,8 @@ def elementwise_binary_rrr_kernel(
     OP_TYPE: tl.constexpr,   # 0:Maximum, 1:Minimum, 2:Add(alpha*x+beta*y), 3:Mul
     alpha: tl.constexpr,
     beta: tl.constexpr,
+    X_QUANT: tl.constexpr,  # 0:bf16, 1:fp8_e5m2, 2:fp8_e4m3
+    Y_QUANT: tl.constexpr,  # 0:bf16, 1:fp8_e5m2, 2:fp8_e4m3
 ):
     """
     Layouts (all token-major):
@@ -300,23 +359,38 @@ def elementwise_binary_rrr_kernel(
     o_rows = tl.arange(0, o_D0)[:, None]; o_cols = tl.arange(0, o_D1)[None, :]
 
     # --- load full tiles (assume broadcastable/equal; no mask) ---
-    x_i = tl.load(x + x_off + x_rows * x_D1 + x_cols)
-    y_i = tl.load(y + y_off + y_rows * y_D1 + y_cols)
+    x_raw = tl.load(x + x_off + x_rows * x_D1 + x_cols)
+    y_raw = tl.load(y + y_off + y_rows * y_D1 + y_cols)
 
-    # --- ops ---
+    # Cast to fp32 (with bitcast for FP8) so the op runs in fp32.
+    if X_QUANT == 0:
+        x_f = x_raw.to(tl.float32)
+    elif X_QUANT == 1:
+        x_f = x_raw.to(tl.float8e5, bitcast=True).to(tl.float32)
+    elif X_QUANT == 2:
+        x_f = x_raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+
+    if Y_QUANT == 0:
+        y_f = y_raw.to(tl.float32)
+    elif Y_QUANT == 1:
+        y_f = y_raw.to(tl.float8e5, bitcast=True).to(tl.float32)
+    elif Y_QUANT == 2:
+        y_f = y_raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+
+    alpha_f = tl.full((), alpha, dtype=tl.float32)
+    beta_f  = tl.full((), beta,  dtype=tl.float32)
+
+    # --- ops (fp32) ---
     if OP_TYPE == 0:        # maximum
-        o_i = tl.maximum(x_i, y_i)
+        o_f = tl.maximum(x_f, y_f)
     elif OP_TYPE == 1:      # minimum
-        o_i = tl.minimum(x_i, y_i)
-    elif OP_TYPE == 2:      # alpha*x + beta*y  (alpha,beta -> bf16 scalars via tl.full)
-        alpha_bf16 = tl.full((), alpha, dtype=tl.bfloat16)
-        beta_bf16  = tl.full((), beta,  dtype=tl.bfloat16)
-        o_i = tl.add(alpha_bf16 * x_i, beta_bf16 * y_i)
+        o_f = tl.minimum(x_f, y_f)
+    elif OP_TYPE == 2:      # alpha*x + beta*y
+        o_f = alpha_f * x_f + beta_f * y_f
     else:                   # OP_TYPE == 3: multiply
-        o_i = x_i * y_i
+        o_f = x_f * y_f
 
-    # cast & store
-    o_i = o_i.to(tl.bfloat16)
+    o_i = o_f.to(tl.bfloat16)
     tl.store(output + o_off + o_rows * o_D1 + o_cols, o_i)
 
 
@@ -328,12 +402,16 @@ loc: torch.LongTensor,
 ctx: Context,
 op_type: ElementwiseBinaryOpType,
 alpha: float,
-beta: float
+beta: float,
+x_quantization_type: QuantizationType = QuantizationType.BF16,
+y_quantization_type: QuantizationType = QuantizationType.BF16,
 ):
-    
+
     NNZ = loc.shape[0]
     NUM_KV_HEAD = ctx.head_num
-    
+    x = _quant_view(x, x_quantization_type)
+    y = _quant_view(y, y_quantization_type)
+
     elementwise_binary_rrr_kernel[(NNZ, NUM_KV_HEAD)](
         x=x,
         y=y,
@@ -349,7 +427,9 @@ beta: float
         PAGE_SIZE=ctx.page_size,
         OP_TYPE=op_type.value,
         alpha=alpha,
-        beta=beta
+        beta=beta,
+        X_QUANT=x_quantization_type.value,
+        Y_QUANT=y_quantization_type.value,
     )
 
 
@@ -362,12 +442,16 @@ num_kv_heads: int,
 page_size: int,
 op_type: ElementwiseBinaryOpType,
 alpha: float,
-beta: float
+beta: float,
+x_quantization_type: QuantizationType = QuantizationType.BF16,
+y_quantization_type: QuantizationType = QuantizationType.BF16,
 ):
-    
+
     NNZ = loc.shape[0]
     NUM_KV_HEAD = num_kv_heads
-    
+    x = _quant_view(x, x_quantization_type)
+    y = _quant_view(y, y_quantization_type)
+
     elementwise_binary_rrr_kernel[(NNZ, NUM_KV_HEAD)](
         x=x,
         y=y,
@@ -383,7 +467,9 @@ beta: float
         PAGE_SIZE=page_size,
         OP_TYPE=op_type.value,
         alpha=alpha,
-        beta=beta
+        beta=beta,
+        X_QUANT=x_quantization_type.value,
+        Y_QUANT=y_quantization_type.value,
     )
     
 @triton.jit
@@ -400,6 +486,8 @@ def elementwise_binary_ppr_kernel(
     OP_TYPE: tl.constexpr,  # 0:Maximum, 1:Minimum, 2:AXPBY(alpha*x + beta*y), 3:Mul
     alpha: tl.constexpr,
     beta: tl.constexpr,
+    X_QUANT: tl.constexpr,  # 0:bf16, 1:fp8_e5m2, 2:fp8_e4m3
+    Y_QUANT: tl.constexpr,  # 0:bf16, 1:fp8_e5m2, 2:fp8_e4m3
 ):
     """
     Layouts:
@@ -456,29 +544,40 @@ def elementwise_binary_ppr_kernel(
     # -----------------------
     # Load full pages (no mask; upstream guarantees full tiles / broadcast)
     # -----------------------
-    x_i = tl.load(x + x_off + x_rows * x_D1 + x_cols)
-    y_i = tl.load(y + y_off + y_rows * y_D1 + y_cols)
+    x_raw = tl.load(x + x_off + x_rows * x_D1 + x_cols)
+    y_raw = tl.load(y + y_off + y_rows * y_D1 + y_cols)
+
+    # Cast to fp32 (with bitcast for FP8) so the op runs in fp32.
+    if X_QUANT == 0:
+        x_f = x_raw.to(tl.float32)
+    elif X_QUANT == 1:
+        x_f = x_raw.to(tl.float8e5, bitcast=True).to(tl.float32)
+    elif X_QUANT == 2:
+        x_f = x_raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+
+    if Y_QUANT == 0:
+        y_f = y_raw.to(tl.float32)
+    elif Y_QUANT == 1:
+        y_f = y_raw.to(tl.float8e5, bitcast=True).to(tl.float32)
+    elif Y_QUANT == 2:
+        y_f = y_raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+
+    alpha_f = tl.full((), alpha, dtype=tl.float32)
+    beta_f  = tl.full((), beta,  dtype=tl.float32)
 
     # -----------------------
-    # Elementwise op
+    # Elementwise op (fp32)
     # -----------------------
     if OP_TYPE == 0:       # Maximum
-        o_i = tl.maximum(x_i, y_i)
+        o_f = tl.maximum(x_f, y_f)
     elif OP_TYPE == 1:     # Minimum
-        o_i = tl.minimum(x_i, y_i)
+        o_f = tl.minimum(x_f, y_f)
     elif OP_TYPE == 2:     # AXPBY: alpha*x + beta*y
-        # Use bf16 scalars as requested
-        alpha_bf16 = tl.full((), alpha, dtype=tl.bfloat16)
-        beta_bf16  = tl.full((), beta,  dtype=tl.bfloat16)
-        o_i = tl.add(alpha_bf16 * x_i, beta_bf16 * y_i)
-        # For higher accuracy (optional):
-        # xi32 = x_i.to(tl.float32); yi32 = y_i.to(tl.float32)
-        # o_i  = (alpha * xi32 + beta * yi32)
+        o_f = alpha_f * x_f + beta_f * y_f
     else:                  # OP_TYPE == 3: Multiply
-        o_i = x_i * y_i
+        o_f = x_f * y_f
 
-    # Cast result to bf16 before storing (to match your pipeline)
-    o_i = o_i.to(tl.bfloat16)
+    o_i = o_f.to(tl.bfloat16)
 
     # -----------------------
     # Store to output (token-major)
@@ -494,12 +593,16 @@ loc: torch.LongTensor,
 ctx: Context,
 op_type: ElementwiseBinaryOpType,
 alpha: float,
-beta: float
+beta: float,
+x_quantization_type: QuantizationType = QuantizationType.BF16,
+y_quantization_type: QuantizationType = QuantizationType.BF16,
 ):
-    
+
     NNZ = loc.shape[0]
     NUM_KV_HEAD = ctx.head_num
-    
+    x = _quant_view(x, x_quantization_type)
+    y = _quant_view(y, y_quantization_type)
+
     elementwise_binary_ppr_kernel[(NNZ, NUM_KV_HEAD)](
         x=x,
         y=y,
@@ -515,10 +618,11 @@ beta: float
         PAGE_SIZE=ctx.page_size,
         OP_TYPE=op_type.value,
         alpha=alpha,
-        beta=beta
+        beta=beta,
+        X_QUANT=x_quantization_type.value,
+        Y_QUANT=y_quantization_type.value,
     )
-    
-    
+
 
 def _elementwise_binary_ppr(
 x: torch.Tensor,
@@ -529,12 +633,16 @@ num_kv_heads: int,
 page_size: int,
 op_type: ElementwiseBinaryOpType,
 alpha: float,
-beta: float
+beta: float,
+x_quantization_type: QuantizationType = QuantizationType.BF16,
+y_quantization_type: QuantizationType = QuantizationType.BF16,
 ):
-    
+
     NNZ = loc.shape[0]
     NUM_KV_HEAD = num_kv_heads
-    
+    x = _quant_view(x, x_quantization_type)
+    y = _quant_view(y, y_quantization_type)
+
     elementwise_binary_ppr_kernel[(NNZ, NUM_KV_HEAD)](
         x=x,
         y=y,
@@ -550,5 +658,7 @@ beta: float
         PAGE_SIZE=page_size,
         OP_TYPE=op_type.value,
         alpha=alpha,
-        beta=beta
+        beta=beta,
+        X_QUANT=x_quantization_type.value,
+        Y_QUANT=y_quantization_type.value,
     )

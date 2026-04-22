@@ -231,52 +231,10 @@ def parse_args():
         help="Data type for KV cache (default: auto).",
     )
 
-    parser.add_argument(
-        "--summary-dir",
-        type=str,
-        default="summary_ratio",
-        help="Directory to read prior summaries from and write this run's summary to (default: summary_ratio).",
-    )
-
     return parser.parse_args()
-
-def already_finished(summary_dir, args):
-    """Return path of a prior summary matching this run's key, or None."""
-    if not os.path.isdir(summary_dir):
-        return None
-    for fname in os.listdir(summary_dir):
-        if not fname.endswith(".json"):
-            continue
-        path = os.path.join(summary_dir, fname)
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                prev = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            continue
-        prev_args = prev.get("args", {})
-        if (
-            prev_args.get("trials") == args.trials
-            and prev_args.get("topk_ratio") == args.topk_ratio
-            and prev_args.get("vortex_module_name") == args.vortex_module_name
-            and prev_args.get("model_name") == args.model_name
-            and prev_args.get("data_path") == args.data_path
-        ):
-            return path
-    return None
-
 
 if __name__ == "__main__":
     args = parse_args()
-
-    existing = already_finished(args.summary_dir, args)
-    if existing is not None:
-        print(
-            f"Skip: already finished "
-            f"(trials={args.trials}, topk_ratio={args.topk_ratio}, "
-            f"module={args.vortex_module_name}, model={args.model_name}, "
-            f"data={args.data_path}) -> {existing}"
-        )
-        raise SystemExit(0)
 
     summary = verify_algos(
         trials=args.trials,
@@ -296,11 +254,8 @@ if __name__ == "__main__":
         kv_cache_dtype=args.kv_cache_dtype
     )
     current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    os.makedirs(args.summary_dir, exist_ok=True)
-    output_path = os.path.join(
-        args.summary_dir,
-        f"{args.model_name.replace('/', '_')}_{args.vortex_module_name}_{args.trials}trials_tp{args.tp_size}_{current_time}.json",
-    )
+    output_path = f"summary_fp8/{args.model_name.replace('/', '_')}_{args.vortex_module_name}_{args.trials}trials_tp{args.tp_size}_{current_time}.json"
+    os.makedirs("summary_fp8", exist_ok=True)
     ## args to summary
     summary["args"] = {
         "trials": args.trials,

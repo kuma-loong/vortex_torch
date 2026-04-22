@@ -1,9 +1,7 @@
 import torch
-from typing import Tuple, Dict, Callable, Optional
+from typing import Dict, Optional
 from .context import Context
 from ..abs import vTensor, FORMAT, vOp, as_vtensor
-from .triton_kernels.softmax_impl import softmax_inplace_r
-from .triton_kernels.normalize_impl import normalize_inplace_r
 from ..utils import Schedule
 
 class Softmax(vOp):
@@ -66,34 +64,30 @@ class Softmax(vOp):
 
     Attributes
     ----------
-    _impl_map : Dict[FORMAT, Tuple[Callable, FORMAT]]
-        Dispatch table keyed by ``x_format``. Each entry maps to
-        ``(callable_impl, resolved_output_format)``.
+    _impl_map : Dict[FORMAT, FORMAT]
+        Dispatch table keyed by ``x_format``. Each entry maps to the
+        resolved output format.
     dim : int
         Softmax axis. Must be ``0`` and corresponds to the packed
         :math:`S_{\text{pack}}` dimension.
     scale : float
         Multiplicative factor applied to ``x`` before the softmax
         (i.e. computes softmax of ``x * scale``).
-    impl : Optional[Callable]
-        The resolved implementation selected during :meth:`profile`.
     output_format : Optional[FORMAT]
         The output tensor format as determined in :meth:`profile`.
     """
 
-    # Implementation dispatch table: keyed by x_format.
-    # Value: (callable_impl, resolved_output_format)
+    # Dispatch table keyed by x_format -> resolved output format.
     _impl_map: Dict[FORMAT, FORMAT] = {
-        FORMAT.RAGGED: (FORMAT.RAGGED),
-        # Extend with other formats if you add more kernels, e.g.:
-        # FORMAT.PAGED: (softmax_inplace_p, FORMAT.PAGED),
+        FORMAT.RAGGED: FORMAT.RAGGED,
+        # Extend with other formats if you add more kernels:
+        # FORMAT.PAGED: FORMAT.PAGED,
     }
 
     def __init__(self, dim: int = 0, scale: float = 1.0):
         super().__init__()
         self.dim = dim
         self.scale = scale
-        self.impl: Optional[Callable] = None
         self.output_format: Optional[FORMAT] = None
         self.schedule = Schedule.S
         # Validate dim at construction
@@ -166,46 +160,6 @@ class Softmax(vOp):
 
         return self.output_buffer
 
-    # ---------------- execute ----------------
-    def execute(self, x: torch.Tensor, ctx: Context) -> torch.Tensor:
-        r"""
-        Execute the in-place scaled softmax and return the input tensor.
-
-        Conceptually, this computes a segment-wise softmax of
-        ``x * scale`` along the packed axis ``dim == 0``, where the
-        segments along that axis correspond to
-        :math:`S_0, S_1, \dots, S_{B-1}` and are treated independently.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input tensor to be modified in-place. Must be compatible with
-            the shape and format validated during :meth:`profile`.
-
-        ctx : Context
-            Execution context passed through to the implementation.
-
-        Returns
-        -------
-        torch.Tensor
-            The same tensor instance ``x``, after the in-place softmax.
-
-        Raises
-        ------
-        AssertionError
-            If :meth:`profile` has not been called and no implementation is
-            available.
-        """
-        assert False, "Softmax execution is currently disabled pending implementation of the softmax_inplace_r kernel. Please implement the kernel and update the _impl_map to enable this functionality."
-        # prefix = self._prefix()
-        # assert self.impl is not None, f"{prefix}execute called before profile() (impl is None)"
-
-        # # Expected signature: impl(x, dim, scale, ctx)
-        # self.impl(x, self.dim, self.scale, ctx)
-        # return x
-
-
-    
 
 class Normalize(vOp):
     r"""
@@ -267,32 +221,28 @@ class Normalize(vOp):
 
     Attributes
     ----------
-    _impl_map : Dict[FORMAT, Tuple[Callable, FORMAT]]
-        Dispatch table keyed by ``x_format``. Each entry maps to
-        ``(callable_impl, resolved_output_format)``.
+    _impl_map : Dict[FORMAT, FORMAT]
+        Dispatch table keyed by ``x_format``. Each entry maps to the
+        resolved output format.
     dim : int
         Normalization axis. Must be ``0`` and corresponds to the packed
         :math:`S_{\text{pack}}` dimension.
-    impl : Optional[Callable]
-        The resolved implementation selected during :meth:`profile`.
     output_format : Optional[FORMAT]
         The output tensor format as determined in :meth:`profile`.
     """
 
-    # Implementation dispatch table: keyed by x_format.
-    # Value: (callable_impl, resolved_output_format)
+    # Dispatch table keyed by x_format -> resolved output format.
     _impl_map: Dict[FORMAT, FORMAT] = {
-        FORMAT.RAGGED: (FORMAT.RAGGED),
-        # Extend with other formats if you add more kernels, e.g.:
-        # FORMAT.PAGED: (normalize_inplace_p, FORMAT.PAGED),
+        FORMAT.RAGGED: FORMAT.RAGGED,
+        # Extend with other formats if you add more kernels:
+        # FORMAT.PAGED: FORMAT.PAGED,
     }
 
     def __init__(self, dim: int = 0):
-        assert False, "Normalize operator is currently disabled pending implementation of the normalize_inplace_r kernel. Please implement the kernel and update the _impl_map to enable this functionality."
         super().__init__()
         self.dim = dim
-        self.impl: Optional[Callable] = None
         self.output_format: Optional[FORMAT] = None
+        self.schedule = Schedule.S
 
         # Validate dim at construction
         prefix = self._prefix()
@@ -365,40 +315,153 @@ class Normalize(vOp):
 
         return self.output_buffer
 
-    # ---------------- execute ----------------
-    def execute(self, x: torch.Tensor, ctx: Context) -> torch.Tensor:
-        r"""
-        Execute the in-place normalization and return the input tensor.
 
-        Conceptually, this performs segment-wise normalization along the
-        packed axis ``dim == 0``, where the segments along that axis
-        correspond to :math:`S_0, S_1, \dots, S_{B-1}` and are treated
-        independently.
+class Conv1d(vOp):
+    r"""
+    Causal 1D convolution dispatcher over a packed leading axis.
+
+    The input is treated as a rank-3 tensor
+
+    .. math::
+
+        X \in \mathbb{R}^{S_{\text{pack}} \times D_0 \times D_1},
+
+    where the leading dimension :math:`S_{\text{pack}}` is a packed
+    concatenation of :math:`B` segments of lengths :math:`S_b`. For each
+    segment :math:`b` and each fixed :math:`(d_0, d_1)`, this operator
+    applies a depth-wise causal 1D convolution of kernel size :math:`K`
+    along the packed axis **within** the segment, restricted to the range
+    that excludes the reserved BOS and EOS pages:
+
+    .. math::
+
+        \mathcal{I}_b^{\text{mid}}
+        = [\,b_{\text{bos}},\; S_b - b_{\text{eos}}\,),
+
+    where :math:`b_{\text{bos}}` and :math:`b_{\text{eos}}` are
+    ``ctx.block_reserved_bos`` and ``ctx.block_reserved_eos``.
+
+    For :math:`s \in \mathcal{I}_b^{\text{mid}}` (local index within the
+    mid-range),
+
+    .. math::
+
+        Y[s, d_0, d_1]
+        = \sum_{k=0}^{K-1} W[k, d_0, d_1] \cdot X[s - k, d_0, d_1],
+
+    where positions :math:`s - k < 0` (within the mid-range) are treated
+    as zero. The BOS/EOS reserved regions are neither read nor written.
+
+    Key properties
+    --------------
+    - Only ``dim == 0`` is supported.
+    - Dispatch is keyed by the input tensor format ``x._format``.
+    - The convolution is depth-wise: each :math:`(d_0, d_1)` channel has
+      its own :math:`K`-tap filter.
+    - Out-of-place: a fresh output buffer is allocated.
+
+    Attributes
+    ----------
+    _impl_map : Dict[FORMAT, FORMAT]
+        Dispatch table keyed by ``x_format``. Each entry maps to the
+        resolved output format.
+    dim : int
+        Convolution axis. Must be ``0`` and corresponds to the packed
+        :math:`S_{\text{pack}}` dimension.
+    weight : torch.Tensor
+        Convolution weight with shape ``[K, D_0, D_1]``, materialized
+        from the nested Python list passed at construction.
+    kernel_size : int
+        Kernel length :math:`K`, derived from ``weight.shape[0]``.
+    """
+
+    _impl_map: Dict[FORMAT, FORMAT] = {
+        FORMAT.RAGGED: FORMAT.RAGGED,
+    }
+
+    def __init__(
+        self,
+        weight: list,
+        dim: int = 0,
+        dtype: torch.dtype = torch.bfloat16,
+        device: Optional[torch.device] = None,
+    ):
+        super().__init__()
+        assert isinstance(weight, list), (
+            f"Conv1d: weight must be a Python list, got {type(weight)}"
+        )
+        weight_tensor = torch.tensor(weight, dtype=dtype, device=device)
+        assert weight_tensor.dim() == 3, (
+            f"Conv1d: weight must be a 3D nested list [K, D0, D1], "
+            f"got shape {tuple(weight_tensor.shape)}"
+        )
+        self.dim = dim
+        self.weight = weight_tensor
+        self.kernel_size = weight_tensor.shape[0]
+        self.output_format: Optional[FORMAT] = None
+        self.schedule = Schedule.S
+
+        prefix = self._prefix()
+        assert self.dim in (0,), f"{prefix}__init__: dim must be 0, got dim={self.dim}"
+
+    # ---------------- profile ----------------
+    def profile(self, x: vTensor, ctx: Context) -> vTensor:
+        r"""
+        Validate the input, select an implementation, allocate the output
+        buffer, and return a :class:`vTensor` view with the resolved format.
+
+        The input is expected to have logical shape ``[S_pack, D_0, D_1]``,
+        and the weight stored on ``self`` must have shape
+        ``[K, D_0, D_1]`` with matching inner dimensions.
 
         Parameters
         ----------
-        x : torch.Tensor
-            Input tensor to be normalized in-place. Must be compatible with
-            the shape and format validated during :meth:`profile`.
+        x : vTensor
+            Input tensor with logical shape ``[S_pack, D_0, D_1]``.
 
         ctx : Context
-            Execution context passed through to the implementation.
+            Execution context providing ``ctx.max_num_pages`` for the
+            output buffer leading dimension.
 
         Returns
         -------
-        torch.Tensor
-            The same tensor instance ``x``, after in-place normalization.
-
-        Raises
-        ------
-        AssertionError
-            If :meth:`profile` has not been called and no implementation is
-            available.
+        vTensor
+            A ``vTensor`` view wrapping the internally allocated output
+            buffer with the resolved output format.
         """
-        assert False, "Normalize execution is currently disabled pending implementation of the normalize_inplace_r kernel. Please implement the kernel and update the _impl_map to enable this functionality."
-        # prefix = self._prefix()
-        # assert self.impl is not None, f"{prefix}execute called before profile() (impl is None)"
+        prefix = self._prefix()
 
-        # # Expected signature: impl(x, dim, ctx)
-        # self.impl(x, self.dim, ctx)
-        # return x
+        assert isinstance(x, vTensor), f"{prefix}profile expects x to be vTensor, got {type(x)}"
+        assert x.dim() == 3, (
+            f"{prefix}expected 3D input [S_pack, D0, D1], "
+            f"got ndim={x.dim()} shape={tuple(x.shape)}"
+        )
+        assert self.weight.shape[1] == x.shape[1] and self.weight.shape[2] == x.shape[2], (
+            f"{prefix}weight inner dims {tuple(self.weight.shape[1:])} "
+            f"must match input inner dims {tuple(x.shape[1:])}"
+        )
+
+        x_fmt = x._format
+        assert x_fmt in self._impl_map, (
+            f"{prefix}no implementation for x_fmt={x_fmt}. "
+            f"Available keys: {list(self._impl_map.keys())}"
+        )
+        self.output_format = self._impl_map[x_fmt]
+
+        self.output_buffer = as_vtensor(
+            torch.empty(
+                (0, x.shape[1], x.shape[2]),
+                device=x.device,
+                dtype=x.dtype,
+            ),
+            self.output_format,
+            tensor_id=len(ctx.tensor_list),
+        )
+
+        ctx.tensor_list.append(self.output_buffer)
+        ctx.output_tensor_to_op_list.append(len(ctx.op_list))
+        ctx.op_list.append(self)
+        ctx.op_to_input_tensor_list.append([x.tensor_id])
+        ctx.op_to_output_tensor_list.append([self.output_buffer.tensor_id])
+
+        return self.output_buffer

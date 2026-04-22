@@ -1,8 +1,7 @@
 import torch
-from typing import Tuple, Dict, Callable, Optional
+from typing import Tuple, Dict, Optional
 from .context import Context
 from ..abs import vTensor, as_vtensor, FORMAT, vOp
-from .triton_kernels.elementwise_binary_impl import elementwise_binary_bpr, elementwise_binary_rrr, elementwise_binary_rpr
 from ..utils import ElementwiseBinaryOpType, Schedule
 
 class Elementwise_Binary(vOp):
@@ -20,18 +19,15 @@ class Elementwise_Binary(vOp):
 
     Attributes
     ----------
-    _impl_map : Dict[Tuple[FORMAT, FORMAT], Tuple[Callable, FORMAT]]
+    _impl_map : Dict[Tuple[FORMAT, FORMAT], FORMAT]
         Dispatch table keyed by ``(x_format, y_format)``. Each entry maps to
-        ``(callable_impl, resolved_output_format)``.
+        the resolved output format.
 
     alpha : float
         Scalar parameter used by some ops. Default is ``1.0``.
 
     beta : float
         Scalar parameter used by some ops. Default is ``1.0``.
-
-    impl : Optional[Callable]
-        The resolved implementation selected during :meth:`profile`.
 
     op_type : Optional[ElementwiseBinaryOpType]
         The operator type used by the implementation.
@@ -43,18 +39,16 @@ class Elementwise_Binary(vOp):
         Preallocated output tensor buffer that stores the binary result.
     """
 
-    # Implementation dispatch table: keyed by (x_format, y_format).
-    # Value: (callable_impl, resolved_output_format)
+    # Dispatch table keyed by (x_format, y_format) -> resolved output format.
     _impl_map: Dict[Tuple[FORMAT, FORMAT], FORMAT] = {
-        (FORMAT.RAGGED,  FORMAT.RAGGED): (FORMAT.RAGGED),
-        (FORMAT.BATCHED, FORMAT.PAGED):  (FORMAT.RAGGED),
-        (FORMAT.RAGGED,  FORMAT.PAGED):  (FORMAT.RAGGED),
+        (FORMAT.RAGGED,  FORMAT.RAGGED): FORMAT.RAGGED,
+        (FORMAT.BATCHED, FORMAT.PAGED):  FORMAT.RAGGED,
+        (FORMAT.RAGGED,  FORMAT.PAGED):  FORMAT.RAGGED,
         # Add more pairs as needed.
     }
 
     def __init__(self, alpha: float = 1.0, beta: float = 1.0):
         super().__init__()
-        self.impl: Optional[Callable] = None
         self.op_type: Optional[ElementwiseBinaryOpType] = None
         self.alpha = alpha
         self.beta = beta
@@ -160,53 +154,6 @@ class Elementwise_Binary(vOp):
         ctx.op_to_output_tensor_list.append([self.output_buffer.tensor_id])  # Map this op to its output tensor
 
         return self.output_buffer
-        
-
-    # ---------------- execute ----------------
-    def execute(self, x: torch.Tensor, y: torch.Tensor, ctx: Context) -> torch.Tensor:
-        r"""
-        Execute the selected binary elementwise implementation into the internal
-        output buffer and return it.
-
-        Expected implementation signature::
-
-            impl(x, y, output, op_type, alpha, beta, ctx)
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Left-hand input tensor on the same device as ``y`` and the output
-            buffer.
-
-        y : torch.Tensor
-            Right-hand input tensor on the same device as ``x`` and the output
-            buffer.
-
-        ctx : Context
-            Execution context passed through to the underlying implementation.
-
-        Returns
-        -------
-        torch.Tensor
-            The output tensor stored in ``self.output_buffer``.
-
-        Raises
-        ------
-        AssertionError
-            If :meth:`profile` has not been called (no implementation or buffer),
-            or if there is a device mismatch between inputs and output.
-        """
-        assert False, "Elementwise_Binary.execute should not be called directly; it is meant to be invoked by the generated Triton kernel. If you see this error, it likely means the kernel was not generated or called correctly."
-        # prefix = self._prefix()
-        # assert self.impl is not None, f"{prefix}execute called before profile() (impl is None)"
-        # assert self.output_buffer is not None, f"{prefix}output buffer is None; did profile() run?"
-        # assert x.device == y.device == self.output_buffer.device, (
-        #     f"{prefix}device mismatch: "
-        #     f"x={x.device}, y={y.device}, o={self.output_buffer.device}"
-        # )
-
-        # self.impl(x, y, self.output_buffer, self.op_type, self.alpha, self.beta, ctx)
-        # return self.output_buffer
 
 
 class Maximum(Elementwise_Binary):

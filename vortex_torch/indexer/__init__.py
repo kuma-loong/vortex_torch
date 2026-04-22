@@ -49,7 +49,7 @@ attention indexers in vFlow-compatible systems.
 from .matmul import GeMM, GeMV
 from .output_func import topK
 from .reduce import Max, Mean, Min, L2Norm, Sum
-from .scan import Softmax, Normalize
+from .scan import Softmax, Normalize, Conv1d
 from .transpose import Transpose
 from .elementwise_binary import Maximum, Minimum, Multiply, Add
 from .elementwise import Relu, Sigmoid, Silu, Add_Mul, Abs
@@ -60,7 +60,7 @@ __all__ = [
     "GeMM", "GeMV",
     "topK",
     "Max", "Mean", "Min", "L2Norm", "Sum",
-    "Softmax", "Normalize",
+    "Softmax", "Normalize", "Conv1d",
     "Transpose",
     "Maximum", "Minimum", "Multiply", "Add",
     "Relu", "Sigmoid", "Silu", "Add_Mul", "Abs",

@@ -1,8 +1,8 @@
 import torch
-from typing import Tuple, Dict, Callable, Optional
+from typing import Dict, Optional
 from .context import Context
 from ..abs import vTensor, as_vtensor, FORMAT, vOp
-from .triton_kernels.transpose_impl import transpose_rr
+from ..utils import Schedule
 
 class Transpose(vOp):
     r"""
@@ -35,11 +35,9 @@ class Transpose(vOp):
 
     Attributes
     ----------
-    _impl_map : Dict[FORMAT, Tuple[Callable, FORMAT]]
-        Dispatch table keyed by ``x_format``. Each entry maps to
-        ``(callable_impl, resolved_output_format)``.
-    impl : Optional[Callable]
-        The resolved implementation selected during :meth:`profile`.
+    _impl_map : Dict[FORMAT, FORMAT]
+        Dispatch table keyed by ``x_format``. Each entry maps to the
+        resolved output format.
     output_format : Optional[FORMAT]
         The output tensor format as determined in :meth:`profile`.
     output_buffer : Optional[torch.Tensor]
@@ -47,20 +45,18 @@ class Transpose(vOp):
         ``[S, D_1, D_0]``.
     """
 
-    # Implementation dispatch table: keyed only by x_format.
-    # Value: (callable_impl, resolved_output_format)
-    _impl_map: Dict[FORMAT, Tuple[Callable, FORMAT]] = {
-        FORMAT.RAGGED: (transpose_rr, FORMAT.RAGGED),
-        # Add more entries if you support other formats, e.g.:
-        # FORMAT.PAGED: (transpose_pp, FORMAT.PAGED),
+    # Dispatch table keyed by x_format -> resolved output format.
+    _impl_map: Dict[FORMAT, FORMAT] = {
+        FORMAT.RAGGED: FORMAT.RAGGED,
+        # Add more entries if you support other formats:
+        # FORMAT.PAGED: FORMAT.PAGED,
     }
 
     def __init__(self):
-        assert False, "Transpose operator is currently disabled pending implementation of the transpose_rr kernel. Please implement the kernel and update the _impl_map to enable this functionality."
         super().__init__()
-        self.impl: Optional[Callable] = None
         self.output_format: Optional[FORMAT] = None
         self.output_buffer: Optional[torch.Tensor] = None
+        self.schedule = Schedule.W
 
     # ---------------- profile ----------------
     def profile(self, x: vTensor, ctx: Context) -> vTensor:
@@ -115,7 +111,7 @@ class Transpose(vOp):
             f"{prefix}no implementation for x_fmt={x_fmt}. "
             f"Available keys: {list(self._impl_map.keys())}"
         )
-        self.impl, self.output_format = self._impl_map[x_fmt]
+        self.output_format = self._impl_map[x_fmt]
 
         # Allocate output buffer: [S, D1, D0]
         # S is derived from runtime context (number of pages/tokens in the pipeline)
@@ -138,43 +134,3 @@ class Transpose(vOp):
                 
         # Return vTensor view with dispatched output format
         return as_vtensor(self.output_buffer, self.output_format)
-
-    # ---------------- execute ----------------
-    def execute(self, x: torch.Tensor, ctx: Context) -> torch.Tensor:
-        r"""
-        Run the selected transpose implementation and return the output buffer.
-
-        The implementation transposes the last two dimensions of ``x`` into
-        the internal buffer stored in :attr:`output_buffer`, leaving the
-        leading dimension unchanged.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input tensor to be transposed, on the same device as the
-            internal output buffer.
-
-        ctx : Context
-            Execution context passed through to the implementation.
-
-        Returns
-        -------
-        torch.Tensor
-            The internally allocated output tensor with shape
-            ``[S, D_1, D_0]``.
-
-        Raises
-        ------
-        AssertionError
-            If :meth:`profile` has not been called and the internal output
-            buffer or implementation is not available.
-        """
-        prefix = self._prefix()
-        assert self.impl is not None, f"{prefix}execute called before profile() (impl is None)"
-        assert self.output_buffer is not None, (
-            f"{prefix}internal output buffer is None; did profile() run?"
-        )
-
-        # Expected signature: impl(x, output, ctx)
-        self.impl(x, self.output_buffer, ctx)
-        return self.output_buffer

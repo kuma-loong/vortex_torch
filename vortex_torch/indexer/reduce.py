@@ -1,8 +1,7 @@
 import torch
-from typing import Tuple, Dict, Callable, Optional
+from typing import Dict, Optional
 from .context import Context
 from ..abs import vTensor, as_vtensor, FORMAT, vOp
-from .triton_kernels.reduce_impl import reduce_rr
 from ..utils import ReduceType, Schedule
 
 class Reduce(vOp):
@@ -42,9 +41,9 @@ class Reduce(vOp):
 
     Attributes
     ----------
-    _impl_map : Dict[FORMAT, Tuple[Callable, FORMAT]]
-        Dispatch table keyed by ``x_format``. Each entry maps to
-        ``(callable_impl, resolved_output_format)``.
+    _impl_map : Dict[FORMAT, FORMAT]
+        Dispatch table keyed by ``x_format``. Each entry maps to the
+        resolved output format.
 
     dim : int
         Reduction dimension in the logical 3D tensor: must be either
@@ -55,9 +54,6 @@ class Reduce(vOp):
     reduce_type : Optional[ReduceType]
         The type of reduction to perform (e.g. mean, max, min, L2-norm, sum).
 
-    impl : Optional[Callable]
-        The resolved implementation selected during :meth:`profile`.
-
     output_format : Optional[FORMAT]
         The output tensor format as determined in :meth:`profile`.
 
@@ -67,20 +63,18 @@ class Reduce(vOp):
         ``dim`` as described above.
     """
 
-    # Implementation dispatch table: keyed only by x_format.
-    # Value: (callable_impl, resolved_output_format)
+    # Dispatch table keyed by x_format -> resolved output format.
     _impl_map: Dict[FORMAT, FORMAT] = {
-        FORMAT.RAGGED: (FORMAT.RAGGED),
-        FORMAT.BATCHED: (FORMAT.BATCHED),
-        # Add more entries if you support other formats, e.g.:
-        # FORMAT.PAGED: (reduce_pp, FORMAT.PAGED),
+        FORMAT.RAGGED: FORMAT.RAGGED,
+        FORMAT.BATCHED: FORMAT.BATCHED,
+        # Add more entries if you support other formats:
+        # FORMAT.PAGED: FORMAT.PAGED,
     }
 
     def __init__(self, dim: int = 1):
         super().__init__()
         self.dim = dim
         self.reduce_type: Optional[ReduceType] = None
-        self.impl: Optional[Callable] = None
         self.output_format: Optional[FORMAT] = None
         self.output_buffer: Optional[torch.Tensor] = None
         self.schedule = Schedule.W
@@ -168,52 +162,7 @@ class Reduce(vOp):
         # Return vTensor view carrying the dispatched output format
         return self.output_buffer
 
-    # ---------------- execute ----------------
-    def execute(self, x: torch.Tensor, ctx: Context) -> torch.Tensor:
-        r"""
-        Run the selected reduction implementation into the internal buffer
-        and return the result.
 
-        The underlying implementation is expected to follow the signature::
-
-            impl(x, output, dim, reduce_type, ctx)
-
-        where ``dim`` specifies which logical axis to reduce and
-        :attr:`reduce_type` selects the reduction operation.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input tensor with shape ``[N, D_0, D_1]`` on the same device as
-            the preallocated output buffer.
-
-        ctx : Context
-            Execution context passed through to the implementation.
-
-        Returns
-        -------
-        torch.Tensor
-            The output tensor stored in ``self.output_buffer``, with logical
-            shape determined by :attr:`dim` as described in :meth:`profile`.
-
-        Raises
-        ------
-        AssertionError
-            If :meth:`profile` has not been called (no implementation or
-            output buffer).
-        """
-
-        assert False
-        # prefix = self._prefix()
-        # assert self.impl is not None, f"{prefix}execute called before profile() (impl is None)"
-        # assert self.output_buffer is not None, f"{prefix}output buffer is None; did profile() run?"
-
-        # # Expected signature: impl(x, output, dim, reduce_type, ctx)
-        # self.impl(x, self.output_buffer, self.dim, self.reduce_type, ctx)
-        # return self.output_buffer
-
-
-    
 class Max(Reduce):
     r"""
     Maximum reduction over a single logical axis.

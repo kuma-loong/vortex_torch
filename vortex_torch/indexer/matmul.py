@@ -1,10 +1,8 @@
 import torch
-from typing import Tuple, Dict, Callable, Optional
+from typing import Tuple, Dict, Optional
 from .context import Context
 from ..abs import vTensor, as_vtensor, FORMAT, vOp
 from ..utils import Schedule
-from .triton_kernels.mv_impl import mv_bpr
-from .triton_kernels.matmul_impl import mm_bpr, mm_rrr, mm_rpr
 
 
 class GeMV(vOp):
@@ -65,12 +63,9 @@ class GeMV(vOp):
 
     Attributes
     ----------
-    _impl_map : Dict[Tuple[FORMAT, FORMAT], Tuple[Callable, FORMAT]]
+    _impl_map : Dict[Tuple[FORMAT, FORMAT], FORMAT]
         Dispatch table keyed by ``(x_format, y_format)``. Each entry maps
-        to ``(callable_impl, resolved_output_format)``.
-
-    impl : Optional[Callable]
-        The resolved implementation selected during :meth:`profile`.
+        to the resolved output format.
 
     output_format : Optional[FORMAT]
         The output tensor format as determined in :meth:`profile`.
@@ -79,8 +74,7 @@ class GeMV(vOp):
         Preallocated output tensor buffer of shape ``[S_pack, 1, 1]``.
     """
 
-    # Implementation dispatch table: keyed by (x_format, y_format).
-    # Value: (callable_impl, resolved_output_format)
+    # Dispatch table keyed by (x_format, y_format) -> resolved output format.
     _impl_map: Dict[Tuple[FORMAT, FORMAT], FORMAT] = {
         (FORMAT.BATCHED, FORMAT.PAGED): FORMAT.RAGGED,
         # Extend with more pairs as needed.
@@ -88,7 +82,6 @@ class GeMV(vOp):
 
     def __init__(self):
         super().__init__()
-        self.impl: Optional[Callable] = None
         self.output_format: Optional[FORMAT] = None
         self.output_buffer: Optional[torch.Tensor] = None
         self.schedule = Schedule.W
@@ -130,7 +123,6 @@ class GeMV(vOp):
             f"{prefix}no implementation for (x_fmt={x_fmt}, y_fmt={y_fmt}). "
             f"Available: {list(self._impl_map.keys())}"
         )
-        # self.impl, self.output_format = self._impl_map[key]
         self.output_format = self._impl_map[key]
         # Allocate output buffer on x.device/x.dtype
         #S_out = ctx.max_num_blocks        # logical "S_pack" per runtime
@@ -149,47 +141,6 @@ class GeMV(vOp):
         ctx.op_to_output_tensor_list.append([self.output_buffer.tensor_id])  # Map this op to its output tensor
 
         return self.output_buffer
-       
-
-    # ---------------- execute ----------------
-    def execute(self, x: torch.Tensor, y: torch.Tensor, ctx: Context) -> torch.Tensor:
-        r"""
-        Launch the selected GEMV implementation into the internal output buffer.
-
-        Expected kernel signature::
-
-            impl(x, y, output, ctx)
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input tensor corresponding to the batched vector(s), with shape
-            ``[B, 1, D]`` and on the same device as ``y`` and the output.
-
-        y : torch.Tensor
-            Input tensor corresponding to the packed matrix rows, with shape
-            ``[S_pack, 1, D]`` and on the same device as ``x`` and the output.
-
-        ctx : Context
-            Execution context passed through to the underlying implementation.
-
-        Returns
-        -------
-        torch.Tensor
-            The output tensor stored in ``self.output_buffer`` with shape
-            ``[S_pack, 1, 1]``.
-        """
-        assert False, "GeMV.execute is not implemented yet. Please implement the kernel and then enable this code."
-        # prefix = self._prefix()
-        # assert self.impl is not None, f"{prefix}execute called before profile() (impl is None)"
-        # assert self.output_buffer is not None, f"{prefix}output buffer is None; did profile() run?"
-        # assert x.device == y.device == self.output_buffer.device, (
-        #     f"{prefix}device mismatch: "
-        #     f"x={x.device}, y={y.device}, o={self.output_buffer.device}"
-        # )
-
-        # self.impl(x, y, self.output_buffer, ctx)
-        # return self.output_buffer
 
 
 
@@ -234,12 +185,9 @@ class GeMM(vOp):
 
     Attributes
     ----------
-    _impl_map : Dict[Tuple[FORMAT, FORMAT], Tuple[Callable, FORMAT]]
+    _impl_map : Dict[Tuple[FORMAT, FORMAT], FORMAT]
         Dispatch table keyed by ``(x_format, y_format)``. Each entry maps to
-        ``(callable_impl, resolved_output_format)``.
-
-    impl : Optional[Callable]
-        The resolved implementation selected during :meth:`profile`.
+        the resolved output format.
 
     output_format : Optional[FORMAT]
         The output tensor format as determined in :meth:`profile`.
@@ -248,18 +196,16 @@ class GeMM(vOp):
         Preallocated output tensor buffer of shape ``[S, N_y, N_x]``.
     """
 
-    # Implementation dispatch table: keyed by (x_format, y_format).
-    # Value: (callable_impl, resolved_output_format)
+    # Dispatch table keyed by (x_format, y_format) -> resolved output format.
     _impl_map: Dict[Tuple[FORMAT, FORMAT], FORMAT] = {
-        (FORMAT.BATCHED, FORMAT.PAGED): (FORMAT.RAGGED),
-        (FORMAT.RAGGED, FORMAT.RAGGED): (FORMAT.RAGGED),
-        (FORMAT.RAGGED, FORMAT.PAGED):  (FORMAT.RAGGED),
+        (FORMAT.BATCHED, FORMAT.PAGED): FORMAT.RAGGED,
+        (FORMAT.RAGGED, FORMAT.RAGGED): FORMAT.RAGGED,
+        (FORMAT.RAGGED, FORMAT.PAGED):  FORMAT.RAGGED,
         # Extend with more pairs as needed.
     }
 
     def __init__(self):
         super().__init__()
-        self.impl: Optional[Callable] = None
         self.output_format: Optional[FORMAT] = None
         self.output_buffer: Optional[torch.Tensor] = None
         self.schedule = Schedule.W
@@ -354,51 +300,3 @@ class GeMM(vOp):
         ctx.op_to_output_tensor_list.append([self.output_buffer.tensor_id])  # Map this op to its output tensor
 
         return self.output_buffer
-
-    # ---------------- execute ----------------
-    def execute(self, x: torch.Tensor, y: torch.Tensor, ctx: Context) -> torch.Tensor:
-        r"""
-        Launch the selected GeMM implementation into the internal buffer.
-
-        Expected kernel signature::
-
-            impl(x, y, output, ctx)
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Right-hand operand (transposed in the mathematical view), with
-            shape ``[B_or_S, N_x, K]`` on the same device as ``y`` and the
-            output buffer.
-
-        y : torch.Tensor
-            Left-hand operand with shape ``[S, N_y, K]`` on the same device
-            as ``x`` and the output buffer.
-
-        ctx : Context
-            Execution context passed through to the underlying implementation.
-
-        Returns
-        -------
-        torch.Tensor
-            The output tensor stored in ``self.output_buffer`` with shape
-            ``[S, N_y, N_x]``.
-
-        Raises
-        ------
-        AssertionError
-            If :meth:`profile` has not been called (no implementation or
-            buffer), or if there is a device mismatch between ``x``, ``y``
-            and the output buffer.
-        """
-        assert False, "GeMM.execute is not implemented yet. Please implement the kernel and then enable this code."
-        # prefix = self._prefix()
-        # assert self.impl is not None, f"{prefix}execute called before profile() (impl is None)"
-        # assert self.output_buffer is not None, f"{prefix}output buffer is None; did profile() run?"
-        # assert x.device == y.device == self.output_buffer.device, (
-        #     f"{prefix}device mismatch: "
-        #     f"x={x.device}, y={y.device}, o={self.output_buffer.device}"
-        # )
-
-        # self.impl(x, y, self.output_buffer, ctx)
-        # return self.output_buffer
