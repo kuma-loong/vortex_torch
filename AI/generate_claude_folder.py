@@ -61,8 +61,10 @@ CLAUDE_MD = dedent("""\
     clears the floor, every subsequent change should trade accuracy-headroom
     for **more throughput**: tighter `vortex_topk_val` / `vortex_topk_ratio`,
     fewer cache-side ops, fewer intermediate cache fields, narrower
-    `vortex_layers_skip`, aggressive fp8 `kv_cache_dtype`. When two variants
-    both clear the floor, pick the faster one.
+    `vortex_layers_skip`, aggressive fp8 `kv_cache_dtype`, raise
+    `mem_fraction_static` toward 0.9 (range [0.5, 0.95], default 0.8 —
+    higher = more KV-cache headroom = more throughput, but OOM risk).
+    When two variants both clear the floor, pick the faster one.
 
     ## Where the instructions live
 
@@ -246,7 +248,8 @@ SUBMISSION_WRITER = dedent("""\
     to maximise. Once it clears the floor, every further change should
     buy throughput — tighten `vortex_topk_val` / `vortex_topk_ratio`,
     drop intermediate cache fields, narrow `vortex_layers_skip`, try fp8
-    `kv_cache_dtype`.
+    `kv_cache_dtype`, push `mem_fraction_static` from 0.8 toward 0.9
+    (bounded [0.5, 0.95]; higher = more KV-cache headroom but OOM risk).
 
     ## Hard rules (AGENTS.md §2 — the framework will reject violations)
 
@@ -379,7 +382,8 @@ SUBMISSION_REVIEWER = dedent("""\
         `vortex_workload_chunk_size` are positive powers of 2;
         `vortex_topk_val`, `vortex_block_reserved_bos`,
         `vortex_block_reserved_eos` are sensible ints;
-        `vortex_dtype` / `kv_cache_dtype` are supported values.
+        `vortex_dtype` / `kv_cache_dtype` are supported values;
+        `mem_fraction_static` (if present) is a float in [0.5, 0.95].
 
     ## Output format
 

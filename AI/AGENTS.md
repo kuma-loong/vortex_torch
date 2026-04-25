@@ -211,7 +211,8 @@ And the matching config:
   "vortex_block_reserved_eos":  2,
   "vortex_layers_skip":         [0],
   "vortex_dtype":               "bfloat16",
-  "kv_cache_dtype":             "auto"
+  "kv_cache_dtype":             "auto",
+  "mem_fraction_static":        0.8
 }
 ```
 
@@ -230,6 +231,7 @@ values that suit your flow. The ones that need special care:
 | `vortex_layers_skip` | list of layer ids that bypass sparse attention (run dense). See "Layer-skip patterns" below. |
 | `vortex_dtype` | dtype for **intermediate** tensors. **Recommended: `"bfloat16"`.** Other accepted values: `"float16"`, `"float32"`, `"fp8_e5m2"`, `"fp8_e4m3"` — use only if you have a specific reason; bf16 is the tested default. |
 | `kv_cache_dtype` | dtype for the **K/V cache itself**. Choose from: `"auto"` (resolves to bfloat16), `"fp8_e4m3"`, or `"fp8_e5m2"`. Using fp8 halves cache memory at the cost of numerical precision; bf16 via `"auto"` is the safe default. |
+| `mem_fraction_static` | fraction of GPU memory sglang reserves for KV cache + model weights. Float in `[0.5, 0.95]` (out-of-range values are rejected at engine-boot). **Default 0.8.** Higher values usually raise throughput by enabling larger decode batches, but raise the risk of CUDA OOM mid-run. **Sweet spot 0.8-0.9.** Try `0.85` first; if it runs cleanly, push toward `0.9` / `0.95`. If you OOM, drop back by 0.05. |
 
 ### Budget semantics (`vortex_topk_val`, `vortex_topk_ratio`)
 
