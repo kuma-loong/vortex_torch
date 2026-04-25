@@ -22,6 +22,7 @@ void sglang_plan_decode_v2(
     const at::Tensor& req_to_token,
     const at::Tensor& req_indices,
     at::Tensor& winfo_q_indices,
+    at::Tensor& winfo_is_first_workload_per_batch,
     at::Tensor& winfo_kv_offsets,
     at::Tensor& winfo_kv_lens,
     at::Tensor& winfo_num_workloads,
@@ -125,6 +126,7 @@ __global__ void Sgl_Decode_Plan_Workload_V2_Kernel(
     const int* __restrict__ dense_kv_indptr,
     const int* __restrict__ sparse_kv_indptr,
     int* __restrict__ winfo_q_indices,
+    uint8_t* __restrict__ winfo_is_first_workload_per_batch,
     int* __restrict__ winfo_kv_offsets,
     int* __restrict__ winfo_kv_lens,
     int* __restrict__ winfo_num_workloads,
@@ -192,6 +194,7 @@ __global__ void Sgl_Decode_Plan_Workload_V2_Kernel(
                 winfo_kv_lens[j] = (j != end - 1) ? workload_chunk_size : last_len;
                 winfo_kv_offsets[j] =
                     dense_kv_indptr[tx_offset + i] + (j - start) * workload_chunk_size;
+                winfo_is_first_workload_per_batch[j] = (j == start) ? 1 : 0;
             }
         }
     }
@@ -280,6 +283,7 @@ void sglang_plan_decode_v2(
     const at::Tensor& req_to_token,
     const at::Tensor& req_indices,
     at::Tensor& winfo_q_indices,
+    at::Tensor& winfo_is_first_workload_per_batch,
     at::Tensor& winfo_kv_offsets,
     at::Tensor& winfo_kv_lens,
     at::Tensor& winfo_num_workloads,
@@ -302,6 +306,7 @@ void sglang_plan_decode_v2(
     TORCH_CHECK(req_to_token.is_cuda(), "req_to_token must be a CUDA tensor");
     TORCH_CHECK(req_indices.is_cuda(), "req_indices must be a CUDA tensor");
     TORCH_CHECK(winfo_q_indices.is_cuda(), "winfo_q_indices must be a CUDA tensor");
+    TORCH_CHECK(winfo_is_first_workload_per_batch.is_cuda(), "winfo_is_first_workload_per_batch must be a CUDA tensor");
     TORCH_CHECK(winfo_kv_offsets.is_cuda(), "winfo_kv_offsets must be a CUDA tensor");
     TORCH_CHECK(winfo_kv_lens.is_cuda(), "winfo_kv_lens must be a CUDA tensor");
     TORCH_CHECK(winfo_num_workloads.is_cuda(), "winfo_num_workloads must be a CUDA tensor");
@@ -316,6 +321,7 @@ void sglang_plan_decode_v2(
     TORCH_CHECK(sparse_kv_indices.dtype() == torch::kInt32, "sparse_kv_indices must be int32");
     TORCH_CHECK(kv_last_page_len.dtype() == torch::kInt32, "kv_last_page_len must be int32");
     TORCH_CHECK(winfo_q_indices.dtype() == torch::kInt32, "winfo_q_indices must be int32");
+    TORCH_CHECK(winfo_is_first_workload_per_batch.dtype() == torch::kUInt8, "winfo_is_first_workload_per_batch must be uint8");
     TORCH_CHECK(winfo_kv_offsets.dtype() == torch::kInt32, "winfo_kv_offsets must be int32");
     TORCH_CHECK(winfo_kv_lens.dtype() == torch::kInt32, "winfo_kv_lens must be int32");
     TORCH_CHECK(winfo_num_workloads.dtype() == torch::kInt32, "winfo_num_workloads must be int32");
@@ -357,6 +363,7 @@ void sglang_plan_decode_v2(
             dense_kv_indptr.data_ptr<int>(),
             sparse_kv_indptr.data_ptr<int>(),
             winfo_q_indices.data_ptr<int>(),
+            winfo_is_first_workload_per_batch.data_ptr<uint8_t>(),
             winfo_kv_offsets.data_ptr<int>(),
             winfo_kv_lens.data_ptr<int>(),
             winfo_num_workloads.data_ptr<int>(),
@@ -371,6 +378,7 @@ void sglang_plan_decode_v2(
             dense_kv_indptr.data_ptr<int>(),
             sparse_kv_indptr.data_ptr<int>(),
             winfo_q_indices.data_ptr<int>(),
+            winfo_is_first_workload_per_batch.data_ptr<uint8_t>(),
             winfo_kv_offsets.data_ptr<int>(),
             winfo_kv_lens.data_ptr<int>(),
             winfo_num_workloads.data_ptr<int>(),
@@ -385,6 +393,7 @@ void sglang_plan_decode_v2(
             dense_kv_indptr.data_ptr<int>(),
             sparse_kv_indptr.data_ptr<int>(),
             winfo_q_indices.data_ptr<int>(),
+            winfo_is_first_workload_per_batch.data_ptr<uint8_t>(),
             winfo_kv_offsets.data_ptr<int>(),
             winfo_kv_lens.data_ptr<int>(),
             winfo_num_workloads.data_ptr<int>(),
@@ -399,6 +408,7 @@ void sglang_plan_decode_v2(
             dense_kv_indptr.data_ptr<int>(),
             sparse_kv_indptr.data_ptr<int>(),
             winfo_q_indices.data_ptr<int>(),
+            winfo_is_first_workload_per_batch.data_ptr<uint8_t>(),
             winfo_kv_offsets.data_ptr<int>(),
             winfo_kv_lens.data_ptr<int>(),
             winfo_num_workloads.data_ptr<int>(),

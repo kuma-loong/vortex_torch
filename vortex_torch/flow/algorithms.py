@@ -2,8 +2,8 @@ import torch
 from typing import Dict
 
 from .flow import vFlow
-from ..indexer import topK, GeMV, Softmax, Max, Sum, GeMM, Maximum, Multiply, Add, L2Norm, Save, Load, Mean
-from ..cache import Mean as CMean, Max as CMax, Min as CMin, L2Norm as CL2Norm
+from ..indexer import topK, GeMV, Softmax, Max, Sum, GeMM, Maximum, Multiply, Add, L2Norm, Save, Load, Mean, MaskSlice
+from ..cache import Mean as CMean, Max as CMax, Min as CMin, L2Norm as CL2Norm, Fill as CFill
 from ..abs import ContextBase
 from .registry import register
 
@@ -497,10 +497,239 @@ class GQAQuestSparseAttention(vFlow):
         }
 
 
+@register("masked_quest_sparse_attention")
+class MaskedQuestSparseAttention(vFlow):
+    r"""
+    QUEST-style sparse attention with a feature-axis :class:`MaskSlice`.
+
+    Identical to :class:`GQAQuestSparseAttention` in its routing logic,
+    but before summing over the feature dimension it multiplies the
+    envelope tensor by a position-dependent mask built with
+    :class:`MaskSlice`:
+
+    .. math::
+
+        m[\ldots, d] =
+        \begin{cases}
+            0, & d < \text{MASK\_END}, \\
+            1, & d \ge \text{MASK\_END}.
+        \end{cases}
+
+    This suppresses the leading ``MASK_END`` feature planes of the
+    QUEST envelope score — a cheap, position-only way to exclude
+    low-signal channels. Because :class:`MaskSlice` is a pure
+    position-based writer (its output does not depend on the input
+    values), no extra state is threaded through ``ctx``.
+
+    The mask is applied along ``dim=2`` (the head / feature dim ``D``),
+    so ``MASK_END`` must be :math:`\le D` at runtime. The default
+    ``MASK_END = 8`` is safe for all head dims in the verification
+    sweep (``D \in \{32, 64, 128\}``).
+    """
+
+    MASK_END = 8  # mask [0, MASK_END) features; safe for D in {32, 64, 128}
+
+    def __init__(self):
+        super().__init__()
+
+        # Indexer-side ops
+        self.mul_max = Multiply()
+        self.mul_min = Multiply()
+        self.maximum_op = Maximum()
+        # Position-only mask on the feature axis: α=0 on [0, MASK_END), β=1 elsewhere.
+        self.feature_mask = MaskSlice(
+            start=0, end=self.MASK_END, dim=2, alpha=0.0, beta=1.0
+        )
+        self.mul_mask = Multiply()
+        self.sum = Sum(dim=2)
+        self.max_op = Max(dim=1)
+        self.output_func = topK()
+
+        # Cache-side ops
+        self.reduction_max = CMax(dim=1)
+        self.reduction_min = CMin(dim=1)
+
+    def forward_indexer(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        cache: Dict[str, torch.Tensor],
+        ctx: ContextBase,
+    ):
+        s_max = self.mul_max(q, cache["max"], ctx=ctx)      # [S, H_q, D]
+        s_min = self.mul_min(q, cache["min"], ctx=ctx)      # [S, H_q, D]
+        s = self.maximum_op(s_max, s_min, ctx=ctx)          # [S, H_q, D]
+        mask = self.feature_mask(s, ctx=ctx)                # [S, H_q, D]
+        masked_s = self.mul_mask(s, mask, ctx=ctx)          # [S, H_q, D]
+        score = self.sum(masked_s, ctx=ctx)                 # [S, H_q, 1]
+        aggr_score = self.max_op(score, ctx=ctx)            # [S, 1, 1]
+        self.output_func(aggr_score, o, ctx=ctx)
+
+    def forward_cache(
+        self,
+        cache: Dict[str, torch.Tensor],
+        loc: torch.Tensor,
+        ctx: ContextBase,
+    ):
+        self.reduction_max(cache["k"], cache["max"], loc=loc, ctx=ctx)
+        self.reduction_min(cache["k"], cache["min"], loc=loc, ctx=ctx)
+
+    def create_cache(self, block_size: int, head_dim: int):
+        return {
+            "max": (1, head_dim),
+            "min": (1, head_dim),
+        }
+
+
+@register("centered_block_sparse_attention")
+class CenteredBlockSparseAttention(vFlow):
+    r"""
+    Block-sparse attention that **centers** per-page scores against a
+    per-(batch, kv_head) mean before topK selection.
+
+    The centering uses two features that landed together:
+
+    1. :class:`Mean` with ``dim=0`` — a *cross-row* (Schedule.S) reduce
+       that collapses the packed page axis into one value per
+       (batch, kv_head). The result is a BATCHED intermediate of shape
+       :math:`[B \cdot H_{kv}, 1, 1]`, allocated by the compiler with
+       leading dim ``ctx.max_bs * ctx.num_kv_heads``.
+
+    2. :class:`Add` with ``alpha=1, beta=-1`` over a (RAGGED, BATCHED)
+       pair — uses the new mixed-format dispatch in
+       :class:`Elementwise_Binary` so the per-page RAGGED score can be
+       offset by the BATCHED summary.
+
+    Pipeline (indexer)
+    ------------------
+    .. code-block:: text
+
+        s         = q * cache["centroids"]      # RAGGED [S, H_q, D]
+        score_d   = sum(s, dim=2)               # RAGGED [S, H_q, 1]
+        score     = mean(score_d, dim=1)        # RAGGED [S, 1, 1]
+        mean_seq  = mean(score, dim=0)          # BATCHED [B*H_kv, 1, 1]   (Schedule.S)
+        centered  = score - mean_seq            # RAGGED [S, 1, 1]   (RAGGED + BATCHED)
+        topK(centered, o)
+    """
+
+    def __init__(self):
+        super().__init__()
+        # Indexer-side ops
+        self.mul = Multiply()
+        self.sum_d = Sum(dim=2)
+        self.mean_h = Mean(dim=1)
+        self.mean_seq = Mean(dim=0)            # Schedule.S, RAGGED → BATCHED
+        self.center = Add(alpha=1.0, beta=-1.0)  # score - mean_seq
+        self.output_func = topK()
+
+        # Cache-side ops
+        self.reduction = CMean(dim=1)
+
+    def forward_indexer(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        cache: Dict[str, torch.Tensor],
+        ctx: ContextBase,
+    ):
+        s = self.mul(q, cache["centroids"], ctx=ctx)        # RAGGED
+        score_d = self.sum_d(s, ctx=ctx)                    # RAGGED
+        score = self.mean_h(score_d, ctx=ctx)               # RAGGED [S, 1, 1]
+        mean_seq = self.mean_seq(score, ctx=ctx)            # BATCHED [B*H_kv, 1, 1]
+        centered = self.center(score, mean_seq, ctx=ctx)    # RAGGED via (R, B) dispatch
+        self.output_func(centered, o, ctx=ctx)
+
+    def forward_cache(
+        self,
+        cache: Dict[str, torch.Tensor],
+        loc: torch.Tensor,
+        ctx: ContextBase,
+    ):
+        self.reduction(cache["k"], cache["centroids"], loc=loc, ctx=ctx)
+
+    def create_cache(self, block_size: int, head_dim: int):
+        return {
+            "centroids": (1, head_dim),
+        }
+
+
+@register("running_avg_block_sparse")
+class RunningAvgBlockSparse(vFlow):
+    r"""
+    Block-sparse attention with a running-average page score.
+
+    Each decode step we maintain a per-page persistent scalar
+    ``cache["running_score"]`` updated by
+
+    .. math::
+
+        \text{running\_score} \leftarrow
+        \alpha \cdot \text{last\_running\_score} + \text{current\_score},
+
+    where ``current_score`` is the usual ``q_mean · centroid`` per-page
+    score and ``alpha`` controls momentum. Pages that keep scoring
+    highly accumulate; pages that lose relevance decay.
+
+    Illustrates the :class:`Save` / :class:`Load` pattern for persistent
+    state across decode steps — ``running_score`` is declared in
+    :meth:`create_cache` but written entirely from
+    :meth:`forward_indexer` via ``Save``; :meth:`forward_cache` never
+    touches it.
+    """
+    ALPHA = 0.9
+
+    def __init__(self):
+        super().__init__()
+        # Indexer-side ops
+        self.mean        = Mean(dim=1)
+        self.gemm        = GeMM()
+        self.load_score  = Load()
+        self.fuse        = Add(alpha=self.ALPHA, beta=1.0)
+        self.save_score  = Save()
+        self.output_func = topK()
+
+        # Cache-side ops
+        self.reduction = CMean(dim=1)
+        # Zero-initialise the persistent per-block scalar when each new
+        # block completes. Without this, the first ``Load`` after a
+        # block is allocated reads whatever was in that memory slot
+        # before — typically stale values from a prior sequence.
+        self.init_running_score = CFill(alpha=0.0)
+
+    def forward_indexer(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        cache: Dict[str, torch.Tensor],
+        ctx: ContextBase,
+    ):
+        q_mean       = self.mean(q, ctx=ctx)                               # [1, 1, D]
+        current      = self.gemm(q_mean, cache["centroids"], ctx=ctx)      # [S, 1, 1]
+        last_running = self.load_score(cache["running_score"], ctx=ctx)    # [S, 1, 1]
+        running      = self.fuse(last_running, current, ctx=ctx)           # α*last + current
+        self.save_score(running, cache["running_score"], ctx=ctx)          # persist
+        self.output_func(running, o, ctx=ctx)
+
+    def forward_cache(
+        self,
+        cache: Dict[str, torch.Tensor],
+        loc: torch.Tensor,
+        ctx: ContextBase,
+    ):
+        self.reduction(cache["k"], cache["centroids"], loc=loc, ctx=ctx)
+        self.init_running_score(cache["running_score"], loc=loc, ctx=ctx)
+
+    def create_cache(self, block_size: int, head_dim: int):
+        return {
+            "centroids":     (1, head_dim),  # maintained by forward_cache
+            "running_score": (1, 1),         # maintained by forward_indexer (Save)
+        }
+
+
 # For agent developers!
 # The ops are not reusable, even if they have the same semantic meaning. Internally, they will initialize different memory buffer.
 # For example, in Quest attention, we need to define two multiply operators.
-# In the entire flow (including forward_cache/forward_indexer), native torch Ops are only allowed to apply to q in forward_indexer. For other tensors, please use vortex_torch ops in indexer/ and cache/.
+# Native torch ops are not allowed anywhere in the flow. Every tensor (q, o, cache[...], intermediates) must go through vortex_torch.indexer ops in forward_indexer and vortex_torch.cache ops in forward_cache.
 
 # In forward indexer, q can be viewed as [1, H_q, D] or [B, H_q, D] (B=1) and cache["xxx"] can be viewed as [S, r, c] (r, c defined in create_cache) logically.
 # In forward cache, the cache["xxx"] is viewed as [B, r, c]  (r, c defined in create_cache) logically.

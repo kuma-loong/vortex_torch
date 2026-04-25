@@ -33,10 +33,19 @@ vFlows in downstream models and runtime systems.
 from .flow import vFlow
 from .registry import register
 from .loader import build_vflow
+from .verify import (
+    verify_flow_compilable, VerifyReport, Config, Failure,
+    DEFAULT_G_VALUES, DEFAULT_D_VALUES, DEFAULT_BLOCK_SIZES,
+    DEFAULT_PAGE_BLOCK_RATIOS, DEFAULT_PAGES_PER_WORKLOAD,
+)
 from . import algorithms
 __all__ = [
     "vFlow",
     "register",
     "build_vflow",
-    "algorithms"
+    "verify_flow_compilable",
+    "VerifyReport",
+    "Config",
+    "Failure",
+    "algorithms",
 ]

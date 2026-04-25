@@ -2,7 +2,7 @@ from __future__ import annotations
 from typing import Any, Final, Union
 import torch
 from ..abs import ContextBase
-from ..utils import UNSET, Mode
+from ..utils import UNSET, Mode, resolve_dtype
 import uuid
 
 class Context(ContextBase):
@@ -12,9 +12,9 @@ class Context(ContextBase):
     
     __slots__ =  ContextBase.__slots__ + (
         # indices / indptr
-        "dense_kv_indices", "sparse_kv_indices", "dense_kv_indptr", "sparse_kv_indptr", "kv_last_page_len", "batch_size",
+        "dense_kv_indices", "sparse_kv_indices", "dense_kv_indptr", "sparse_kv_indptr", "kv_last_page_len", "batch_size", "max_bs",
         # winfo
-        "winfo_q_indices", "winfo_kv_offsets", "winfo_kv_lens", "winfo_num_workloads", "winfo_chunk_size", "max_num_workloads",
+        "winfo_q_indices", "winfo_is_first_workload_per_batch", "winfo_kv_offsets", "winfo_kv_lens", "winfo_num_workloads", "winfo_chunk_size", "max_num_workloads",
         # chunk limits
         "workload_chunk_size",
         # head / shape
@@ -22,7 +22,7 @@ class Context(ContextBase):
         # hardware / paging
         "num_sms", "page_size", "max_num_pages", "max_num_pages_per_request", "block_size", "max_num_blocks", "max_num_blocks_per_request", "num_blocks_per_page", "num_pages_per_workload",
         # misc
-        "indexer_dtype", "topk_val", "topk_ratio", "block_reserved_bos", "block_reserved_eos", 
+        "topk_val", "topk_ratio", "block_reserved_bos", "block_reserved_eos",
         
         # auxilary memory in graph
         "_aux_total_bytes",
@@ -30,7 +30,7 @@ class Context(ContextBase):
         # auxilary flops in graph
         "_aux_total_flops",
 
-        "tensor_list", "op_list", "output_tensor_to_op_list", "op_to_input_tensor_list", "op_to_output_tensor_list",
+        "tensor_list", "op_list", "output_tensor_to_op_list", "op_to_input_tensor_list", "op_to_output_tensor_list", "side_effect_op_ids",
 
         "sparse_attention_name", "impl_backend", "tensor_id_to_tensor_name_map", "compilation_header_lines", "auxilary_func_def_lines",
 
@@ -44,9 +44,11 @@ class Context(ContextBase):
     sparse_kv_indptr: torch.Tensor   #: CSR-style indptr for sparse KV segments.
     kv_last_page_len: int            #: Length of the last KV page.
     batch_size: int                  #: Active batch size.
+    max_bs: int                      #: Maximum batch size (allocation budget).
 
     # --- workload info (winfo) ---
     winfo_q_indices: torch.Tensor    #: Query indices used in workload scheduling.
+    winfo_is_first_workload_per_batch: torch.Tensor  #: uint8 flag per workload: 1 iff first workload of its (batch, head).
     winfo_kv_offsets: torch.Tensor   #: KV offsets per workload.
     winfo_kv_lens: torch.Tensor      #: KV lengths per workload.
     winfo_num_workloads: int         #: Number of workloads in the current batch.
@@ -74,7 +76,6 @@ class Context(ContextBase):
     num_pages_per_workload: int      #: Number of pages processed per workload (derived from chunk size).
 
     # --- miscellaneous ---
-    indexer_dtype: torch.dtype       #: Dtype used by indexer operations.
     topk_val: int                    #: Top-K value used in pruning or selection.
     topk_ratio: float                #: Top-K ratio used in pruning or selection.
     block_reserved_bos: int           #: Reserved page count for BOS (begin-of-sequence).
@@ -88,6 +89,7 @@ class Context(ContextBase):
     output_tensor_to_op_list: list    #: Mapping from output tensors to their producing operations.
     op_to_input_tensor_list: list     #: Mapping from operations to their input tensors.
     op_to_output_tensor_list: list    #: Mapping from operations to their output tensors.
+    side_effect_op_ids: list          #: Op ids that are pure side-effect writers (e.g. Save into a cache field).
     sparse_attention_name: str          #: Name of the sparse attention implementation to use.
     impl_backend: str       #: Implementation backend to use for code generation.
     tensor_id_to_tensor_name_map: dict #: Mapping from tensor IDs to human-readable names for debugging.
@@ -133,6 +135,7 @@ class Context(ContextBase):
             else (sa.vortex_max_seq_lens + sa.page_size - 1) // sa.page_size
         )
         max_bs = int(model_runner.req_to_token_pool.size)
+        self.max_bs = max_bs
 
         # Backend-known fields
         self.dense_kv_indices = parent.kv_indices_decode[0]
@@ -162,11 +165,9 @@ class Context(ContextBase):
         self.num_pages_per_workload = self.workload_chunk_size // self.num_blocks_per_page
         self.topk_val = sa.vortex_topk_val
         self.topk_ratio = sa.vortex_topk_ratio
-        dtype_str = getattr(sa, "vortex_indexer_dtype", "float32")
-        if isinstance(dtype_str, str):
-            self.indexer_dtype = getattr(torch, dtype_str, torch.float32)
-        else:
-            self.indexer_dtype = dtype_str
+        self.vortex_dtype = resolve_dtype(
+            getattr(sa, "vortex_dtype", "bfloat16"), default=torch.bfloat16
+        )
         
         self.block_reserved_bos = sa.vortex_block_reserved_bos
         self.block_reserved_eos = sa.vortex_block_reserved_eos
@@ -177,6 +178,7 @@ class Context(ContextBase):
 
         device = getattr(model_runner, "device", "cpu")
         self.winfo_q_indices = torch.zeros((self.max_num_workloads,), dtype=torch.int32, device=device)
+        self.winfo_is_first_workload_per_batch = torch.zeros((self.max_num_workloads,), dtype=torch.uint8, device=device)
         self.winfo_kv_offsets = torch.zeros((self.max_num_workloads,), dtype=torch.int32, device=device)
         self.winfo_kv_lens = torch.zeros((self.max_num_workloads,), dtype=torch.int32, device=device)
         self.winfo_num_workloads = torch.zeros((1,), dtype=torch.int32, device=device)
@@ -187,6 +189,7 @@ class Context(ContextBase):
         self.output_tensor_to_op_list = []
         self.op_to_input_tensor_list = []
         self.op_to_output_tensor_list = []
+        self.side_effect_op_ids = []
         self.tensor_id_to_tensor_name_map = {}
         self.compilation_header_lines = []
         self.auxilary_func_def_lines = []

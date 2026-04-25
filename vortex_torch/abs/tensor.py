@@ -1,8 +1,28 @@
+"""Pure-metadata tensor type used throughout the vortex graph + compiler.
+
+A :class:`vTensor` does **not** carry any real storage. It is a small
+descriptor that records exactly what the rest of the system needs to
+reason about a tensor at graph-construction and codegen time:
+
+  * ``shape``     — tuple of ints
+  * ``dtype``     — :class:`torch.dtype`
+  * ``device``    — :class:`torch.device` / str / ``None``
+  * ``_format``   — :class:`FORMAT` (BATCHED / RAGGED / PAGED)
+  * ``tensor_id`` — int, the graph-level identity used by the compiler
+
+It also exposes ``dim()`` for parity with ``torch.Tensor`` so existing
+profile-time validation code (``assert x.dim() == 3``) keeps working.
+
+There is intentionally **no** torch op support, no ``__torch_function__``
+override, no parent ``torch.Tensor`` class. ``vTensor`` is just metadata.
+Real tensors used by the runtime/execute path stay as plain
+``torch.Tensor`` instances.
+"""
+
 from __future__ import annotations
 import torch
 from enum import Enum
-from typing import Any, Iterable
-import numbers
+from typing import Any, Optional, Sequence, Union
 
 
 class FORMAT(Enum):
@@ -19,228 +39,165 @@ class FORMAT(Enum):
     PAGED = 2
 
 
-class vTensor(torch.Tensor):
-    """Tensor subclass with `_format` and `tensor_id` metadata fields.
+class vTensor:
+    """Pure-metadata virtual tensor.
 
-    Rules:
-    - Torch ops do NOT change `_format` or `tensor_id`.
-    - All vTensors in the same op must have the same `_format`.
-    - All vTensors in the same op must have the same `tensor_id`.
-    - vTensor CANNOT participate in ops with plain torch.Tensors (raise RuntimeError).
-    - vTensor CAN participate in ops with Python scalars (int/float/bool).
-    - `tensor_id` must be explicitly provided; no automatic allocation.
+    Carries the descriptor fields used by the graph builder, the
+    compiler, and the codegen layer. It does not own any GPU / CPU
+    memory and intentionally cannot participate in torch ops — code
+    that wants to compute on real data should hold a ``torch.Tensor``
+    separately and use the ``vTensor`` only for graph bookkeeping.
     """
 
-    # -------- construction & (de)serialization --------
-    def __new__(
-        cls,
-        data,
+    __slots__ = ("shape", "dtype", "device", "_format", "tensor_id")
+
+    shape: tuple
+    dtype: torch.dtype
+    device: Optional[Union[torch.device, str]]
+    _format: FORMAT
+    tensor_id: int
+
+    def __init__(
+        self,
+        shape: Sequence[int] = (),
+        dtype: torch.dtype = torch.bfloat16,
+        device: Optional[Union[torch.device, str]] = None,
         _format: FORMAT = FORMAT.BATCHED,
-        tensor_id: int | None = None,
-        **kwargs,
-    ):
-        # Accept scalar/iterable/torch.Tensor inputs
-        if not isinstance(data, torch.Tensor):
-            data = torch.as_tensor(data, **kwargs)
-
-        if tensor_id is None:
-            tensor_id = -1  # Use -1 as a sentinel for "unassigned" tensor_id
-
+        tensor_id: int = -1,
+    ) -> None:
         if not isinstance(tensor_id, int):
             raise TypeError(f"tensor_id must be int, got {type(tensor_id).__name__}")
+        if not isinstance(_format, FORMAT):
+            raise TypeError(f"_format must be a FORMAT enum, got {type(_format).__name__}")
 
-        # Create subclass without copying storage
-        out = torch.Tensor._make_subclass(cls, data, require_grad=data.requires_grad)
-        out._format = _format
-        out.tensor_id = tensor_id
-        return out
+        # Normalize ``shape`` so ``shape[i]``, ``len(shape)`` and ``tuple(shape)``
+        # all behave like ``torch.Tensor.shape``.
+        self.shape = tuple(int(s) for s in shape)
+        self.dtype = dtype
+        self.device = device
+        self._format = _format
+        self.tensor_id = tensor_id
 
-    def __repr__(self):
-        base = super().__repr__().replace(self.__class__.__name__, "Tensor")
-        return f"vTensor(format={self._format}, tensor_id={self.tensor_id}, {base})"
+    # -------- shape helpers --------
+    def dim(self) -> int:
+        """Number of dimensions; mirrors :meth:`torch.Tensor.dim`."""
+        return len(self.shape)
 
-    # Pickle support
-    def __reduce_ex__(self, protocol):
+    @property
+    def ndim(self) -> int:
+        return len(self.shape)
+
+    def numel(self) -> int:
+        n = 1
+        for s in self.shape:
+            n *= int(s)
+        return n
+
+    def size(self, dim: Optional[int] = None):
+        """Mirror of :meth:`torch.Tensor.size`."""
+        if dim is None:
+            return self.shape
+        return self.shape[dim]
+
+    # -------- repr --------
+    def __repr__(self) -> str:
         return (
-            self._rebuild_from_tensor,
-            (torch.Tensor(self), self._format, self.tensor_id, self.requires_grad),
+            f"vTensor(shape={self.shape}, dtype={self.dtype}, "
+            f"device={self.device}, _format={self._format}, "
+            f"tensor_id={self.tensor_id})"
         )
 
-    @staticmethod
-    def _rebuild_from_tensor(
-        t: torch.Tensor,
-        fmt: FORMAT,
-        tensor_id: int,
-        requires_grad: bool,
-    ):
-        out = torch.Tensor._make_subclass(vTensor, t, require_grad=requires_grad)
-        out._format = fmt
-        out.tensor_id = tensor_id
-        return out
+    # -------- pickle / copy --------
+    def __reduce__(self):
+        return (
+            _rebuild_vtensor,
+            (self.shape, self.dtype, self.device, self._format, self.tensor_id),
+        )
 
-    # -------- helpers --------
-    @classmethod
-    def _from_base(cls, base: torch.Tensor, fmt: FORMAT, tensor_id: int):
-        if not isinstance(tensor_id, int):
-            raise TypeError(f"tensor_id must be int, got {type(tensor_id).__name__}")
 
-        out = torch.Tensor._make_subclass(cls, base, require_grad=base.requires_grad)
-        out._format = fmt
-        out.tensor_id = tensor_id
-        return out
-
-    @staticmethod
-    def _iter_tensors(obj: Any) -> Iterable[torch.Tensor]:
-        """Recursively yield tensors from nested args/kwargs."""
-        if isinstance(obj, torch.Tensor):
-            yield obj
-        elif isinstance(obj, (list, tuple)):
-            for x in obj:
-                yield from vTensor._iter_tensors(x)
-        elif isinstance(obj, dict):
-            for x in obj.values():
-                yield from vTensor._iter_tensors(x)
-
-    @staticmethod
-    def _extract_metadata_and_validate(args, kwargs) -> tuple[FORMAT | None, int | None]:
-        """Collect vTensor metadata, ensure no mixing with plain Tensors, and return the op metadata."""
-        tensors = list(vTensor._iter_tensors((args, kwargs)))
-
-        # Disallow presence of any plain torch.Tensor alongside vTensor
-        has_v = any(isinstance(t, vTensor) for t in tensors)
-        has_plain = any(isinstance(t, torch.Tensor) and not isinstance(t, vTensor) for t in tensors)
-        if has_v and has_plain:
-            raise RuntimeError("vTensor cannot operate with plain torch.Tensor in the same op.")
-
-        # Enforce format consistency
-        fmts = {t._format for t in tensors if isinstance(t, vTensor)}
-        if len(fmts) > 1:
-            raise RuntimeError(f"vTensor _format mismatch in op: {fmts}")
-
-        # Enforce tensor_id consistency
-        tensor_ids = {t.tensor_id for t in tensors if isinstance(t, vTensor)}
-        if len(tensor_ids) > 1:
-            raise RuntimeError(f"vTensor tensor_id mismatch in op: {tensor_ids}")
-
-        fmt = next(iter(fmts)) if fmts else None
-        tensor_id = next(iter(tensor_ids)) if tensor_ids else None
-        return fmt, tensor_id
-
-    @classmethod
-    def _propagate_metadata(cls, result, fmt: FORMAT | None, tensor_id: int | None):
-        """Propagate metadata into results (wrap plain Tensors as vTensor)."""
-        if fmt is None and tensor_id is None:
-            return result  # No vTensor involved => nothing to propagate
-
-        if isinstance(result, torch.Tensor):
-            if isinstance(result, vTensor):
-                result._format = fmt
-                result.tensor_id = tensor_id
-                return result
-            else:
-                return cls._from_base(result, fmt, tensor_id)
-        elif isinstance(result, (list, tuple)):
-            t = type(result)
-            return t(cls._propagate_metadata(x, fmt, tensor_id) for x in result)
-        elif isinstance(result, dict):
-            return {k: cls._propagate_metadata(v, fmt, tensor_id) for k, v in result.items()}
-        else:
-            # Non-tensor outputs (numbers, bools, None, etc.) are returned as-is
-            return result
-
-    @staticmethod
-    def _is_allowed_scalar(x: Any) -> bool:
-        """Return True if x is a Python numeric/bool scalar allowed to mix with vTensor."""
-        return isinstance(x, numbers.Number)
-
-    @classmethod
-    def __torch_function__(cls, func, types, args=(), kwargs=None):
-        if kwargs is None:
-            kwargs = {}
-
-        # If no vTensor types are involved, fall back to default behavior.
-        if not any(issubclass(t, vTensor) for t in types):
-            return super().__torch_function__(func, types, args, kwargs)
-
-        # Validate metadata constraints
-        fmt, tensor_id = cls._extract_metadata_and_validate(args, kwargs)
-
-        # Execute op via parent dispatch
-        out = super().__torch_function__(func, types, args, kwargs)
-
-        # Propagate metadata into outputs
-        return cls._propagate_metadata(out, fmt, tensor_id)
+def _rebuild_vtensor(shape, dtype, device, _format, tensor_id):
+    return vTensor(
+        shape=shape, dtype=dtype, device=device, _format=_format, tensor_id=tensor_id,
+    )
 
 
 # -------- convenience factory --------
 def as_vtensor(
-    x: torch.Tensor | Any,
+    x: Any = None,
     _format: FORMAT = FORMAT.BATCHED,
-    tensor_id: int | None = None,
+    tensor_id: int = -1,
+    *,
+    shape: Optional[Sequence[int]] = None,
+    dtype: Optional[torch.dtype] = None,
+    device: Optional[Union[torch.device, str]] = None,
 ) -> vTensor:
-    """Wrap an input as ``vTensor`` without copying storage.
+    """Build a :class:`vTensor`.
 
-    Args:
-        x (torch.Tensor | Any): Input to wrap.
-        _format (FORMAT, optional): Desired tensor storage/layout format.
-        tensor_id (int | None, optional): Must be explicitly provided.
+    Three calling styles, all returning a fresh ``vTensor`` (or, for an
+    existing ``vTensor``, the same object re-tagged):
 
-    Returns:
-        vTensor: A ``vTensor`` that references the same underlying storage as ``x``.
+    1. **Re-tag an existing vTensor** — ``as_vtensor(vt, fmt, tid)``
+       overwrites ``vt._format`` and ``vt.tensor_id`` in place and
+       returns ``vt``. Useful when the caller wants to add an existing
+       tensor descriptor to the graph under a fresh id.
+
+    2. **Extract metadata from a torch.Tensor** — ``as_vtensor(real, fmt, tid)``
+       reads ``shape``, ``dtype``, ``device`` from ``real`` and returns
+       a brand-new ``vTensor``. The original tensor is **not** retained
+       — vTensor is pure metadata.
+
+    3. **Direct construction by kwargs** —
+       ``as_vtensor(_format=fmt, tensor_id=tid, shape=..., dtype=..., device=...)``.
+       Use this when no real torch tensor is available (the common case
+       once the compile path is fully virtualized).
     """
-    if tensor_id is None:
-        tensor_id = -1  # Use -1 as a sentinel for "unassigned" tensor_id
-
-    if not isinstance(tensor_id, int):
-        raise TypeError(f"tensor_id must be int, got {type(tensor_id).__name__}")
-
     if isinstance(x, vTensor):
         x._format = _format
         x.tensor_id = tensor_id
         return x
 
-    if not isinstance(x, torch.Tensor):
-        x = torch.as_tensor(x)
+    if isinstance(x, torch.Tensor):
+        return vTensor(
+            shape=tuple(x.shape),
+            dtype=x.dtype,
+            device=x.device,
+            _format=_format,
+            tensor_id=tensor_id,
+        )
 
-    return vTensor._from_base(x, _format, tensor_id)
+    if x is None:
+        return vTensor(
+            shape=shape if shape is not None else (),
+            dtype=dtype if dtype is not None else torch.bfloat16,
+            device=device,
+            _format=_format,
+            tensor_id=tensor_id,
+        )
+
+    raise TypeError(
+        f"as_vtensor: cannot convert {type(x).__name__} to vTensor; "
+        "pass a torch.Tensor, an existing vTensor, or shape/dtype/device kwargs."
+    )
 
 
 if __name__ == "__main__":
-    shared_id = 1
+    # Direct construction
+    a = vTensor(shape=(2, 3, 4), dtype=torch.bfloat16, device="cuda:0",
+                _format=FORMAT.RAGGED, tensor_id=0)
+    print("a:", a)
+    print("dim:", a.dim(), "ndim:", a.ndim, "numel:", a.numel(), "size(1):", a.size(1))
 
-    a = as_vtensor(torch.randn(2, 3), FORMAT.RAGGED, tensor_id=shared_id)
-    b = as_vtensor(torch.ones(2, 3), FORMAT.RAGGED, tensor_id=shared_id)
+    # Extract metadata from a real torch.Tensor
+    real = torch.empty(2, 3, 4, dtype=torch.float8_e4m3fn)
+    b = as_vtensor(real, FORMAT.PAGED, tensor_id=1)
+    print("b:", b)
 
-    # Allowed: vTensor with scalar
-    y = a + 2.0
-    print("ok scalar:", isinstance(y, vTensor), y._format, y.tensor_id)
+    # Re-tag an existing vTensor
+    c = as_vtensor(a, FORMAT.BATCHED, tensor_id=42)
+    assert c is a
+    print("c (same as a, re-tagged):", c)
 
-    # Allowed: vTensor with vTensor (same format and same tensor_id)
-    z = a * b
-    print("ok same-id:", isinstance(z, vTensor), z._format, z.tensor_id)
-
-    # Disallowed: vTensor with plain Tensor
-    try:
-        _ = a + torch.randn(2, 3)
-    except RuntimeError as e:
-        print("expected error (plain tensor):", e)
-
-    # Disallowed: different formats
-    c = as_vtensor(torch.randn(2, 3), FORMAT.PAGED, tensor_id=shared_id)
-    try:
-        _ = a + c
-    except RuntimeError as e:
-        print("expected error (format mismatch):", e)
-
-    # Disallowed: different tensor_id
-    d = as_vtensor(torch.randn(2, 3), FORMAT.RAGGED, tensor_id=2)
-    try:
-        _ = a + d
-    except RuntimeError as e:
-        print("expected error (tensor_id mismatch):", e)
-
-    # Disallowed: missing tensor_id
-    try:
-        e = as_vtensor(torch.randn(2, 3), FORMAT.RAGGED)
-    except ValueError as e:
-        print("expected error (missing tensor_id):", e)
+    # Direct construction via kwargs only
+    d = as_vtensor(_format=FORMAT.RAGGED, tensor_id=2,
+                   shape=(0, 4, 128), dtype=torch.bfloat16, device="cuda:0")
+    print("d:", d)

@@ -131,7 +131,7 @@ def generate_entry_point(full_graph: Graph, sub_graphs: List[Graph], ctx: Contex
             memory_initiazation_lines.append(
                 f"self.tensor_{t.tensor_id} = torch.empty("
                 f"({B}, {t.shape[1]}, {t.shape[2]}), "
-                f"dtype=torch.{t.dtype}, device='{t.device}')"
+                f"dtype={t.dtype}, device='{t.device}')"
             )
             tensor_id_to_tensor_name_map[t.tensor_id] = f"self.tensor_{t.tensor_id}"
 

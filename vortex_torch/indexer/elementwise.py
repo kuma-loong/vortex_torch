@@ -1,7 +1,7 @@
 import torch
 from typing import Dict, Callable, Optional
 from .context import Context
-from ..abs import vTensor, as_vtensor, FORMAT, vOp
+from ..abs import vTensor, FORMAT, vOp
 from ..utils import ElementwiseOpType, Schedule
 
 class Elementwise(vOp):
@@ -94,12 +94,13 @@ class Elementwise(vOp):
 
         C, D = x.shape[1], x.shape[2]
 
-        # Allocate output buffer on x.device with x.dtype
-        self.output_buffer = as_vtensor(torch.empty(
-            (0, C, D),
+        # Pure-metadata vTensor — no torch.empty allocation needed.
+        self.output_buffer = vTensor(
+            shape=(0, C, D),
+            dtype=ctx.vortex_dtype,
             device=x.device,
-            dtype=x.dtype,
-        ), self.output_format, tensor_id=len(ctx.tensor_list)  # Assign a new tensor_id based on current tensor count
+            _format=self.output_format,
+            tensor_id=len(ctx.tensor_list),
         )
         # Track auxiliary memory and graph structure in the context
         ctx.tensor_list.append(self.output_buffer)  # Track the output buffer in the context
@@ -251,3 +252,59 @@ class Abs(Elementwise):
     def __init__(self, alpha: float = 0.0, beta: float = 1.0):
         super().__init__(alpha, beta)
         self.op_type = ElementwiseOpType.Abs
+
+
+class Log(Elementwise):
+    r"""
+    Natural logarithm of an affine transform.
+
+    This operator applies:
+
+    .. math::
+
+        \operatorname{out}(x) = \log(\beta x + \alpha)
+
+    With the defaults :math:`\alpha = 0` and :math:`\beta = 1`, this
+    reduces to the standard natural logarithm :math:`\log(x)`.
+
+    Parameters
+    ----------
+    alpha : float, optional
+        Additive bias term inside the logarithm, used in
+        :math:`\beta x + \alpha`. Default is ``0.0``.
+
+    beta : float, optional
+        Multiplicative scale term inside the logarithm, used in
+        :math:`\beta x + \alpha`. Default is ``1.0``.
+    """
+    def __init__(self, alpha: float = 0.0, beta: float = 1.0):
+        super().__init__(alpha, beta)
+        self.op_type = ElementwiseOpType.Log
+
+
+class Exp(Elementwise):
+    r"""
+    Exponential of an affine transform.
+
+    This operator applies:
+
+    .. math::
+
+        \operatorname{out}(x) = \exp(\beta x + \alpha)
+
+    With the defaults :math:`\alpha = 0` and :math:`\beta = 1`, this
+    reduces to the standard exponential :math:`\exp(x)`.
+
+    Parameters
+    ----------
+    alpha : float, optional
+        Additive bias term inside the exponential, used in
+        :math:`\beta x + \alpha`. Default is ``0.0``.
+
+    beta : float, optional
+        Multiplicative scale term inside the exponential, used in
+        :math:`\beta x + \alpha`. Default is ``1.0``.
+    """
+    def __init__(self, alpha: float = 0.0, beta: float = 1.0):
+        super().__init__(alpha, beta)
+        self.op_type = ElementwiseOpType.Exp

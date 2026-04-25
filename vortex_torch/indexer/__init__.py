@@ -30,8 +30,10 @@ Included components:
 
 - Binary/unary elementwise ops:
   :class:`Maximum`, :class:`Minimum`, :class:`Multiply`, :class:`Add`,
+  :class:`WhereEqual`, :class:`WhereNotEqual`, :class:`WhereGreater`,
+  :class:`WhereGreaterEqual`, :class:`WhereLess`, :class:`WhereLessEqual`,
   :class:`Relu`, :class:`Sigmoid`, :class:`Silu`, :class:`Add_Mul`,
-  :class:`Abs`.
+  :class:`Abs`, :class:`Log`, :class:`Exp`.
 
 - Utilities:
   :mod:`utils_sglang` for SGLang-related helpers.
@@ -51,9 +53,14 @@ from .output_func import topK
 from .reduce import Max, Mean, Min, L2Norm, Sum
 from .scan import Softmax, Normalize, Conv1d
 from .transpose import Transpose
-from .elementwise_binary import Maximum, Minimum, Multiply, Add
-from .elementwise import Relu, Sigmoid, Silu, Add_Mul, Abs
+from .elementwise_binary import (
+    Maximum, Minimum, Multiply, Add,
+    WhereEqual, WhereNotEqual, WhereGreater,
+    WhereGreaterEqual, WhereLess, WhereLessEqual,
+)
+from .elementwise import Relu, Sigmoid, Silu, Add_Mul, Abs, Log, Exp
 from .save_load import Save, Load
+from .mask import MaskSlice
 from . import utils_sglang, compiler
 from .context import Context, get_ctx
 __all__ = [ 
@@ -63,11 +70,13 @@ __all__ = [
     "Softmax", "Normalize", "Conv1d",
     "Transpose",
     "Maximum", "Minimum", "Multiply", "Add",
-    "Relu", "Sigmoid", "Silu", "Add_Mul", "Abs",
+    "WhereEqual", "WhereNotEqual", "WhereGreater",
+    "WhereGreaterEqual", "WhereLess", "WhereLessEqual",
+    "Relu", "Sigmoid", "Silu", "Add_Mul", "Abs", "Log", "Exp",
     "Save", "Load",
+    "MaskSlice",
     "utils_sglang",
     "Context",
     "get_ctx",
     "compiler",
 ]
-

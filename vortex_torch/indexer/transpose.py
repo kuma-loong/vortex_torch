@@ -1,7 +1,7 @@
 import torch
 from typing import Dict, Optional
 from .context import Context
-from ..abs import vTensor, as_vtensor, FORMAT, vOp
+from ..abs import vTensor, FORMAT, vOp
 from ..utils import Schedule
 
 class Transpose(vOp):
@@ -117,20 +117,20 @@ class Transpose(vOp):
         # S is derived from runtime context (number of pages/tokens in the pipeline)
         S = ctx.max_num_pages
         D0, D1 = x.shape[1], x.shape[2]
-        self.output_buffer = torch.empty(
-            (S, D1, D0),
+        # Pure-metadata vTensor — no real allocation. The compiled code
+        # supplies storage; we only need shape/dtype/device for codegen.
+        self.output_buffer = vTensor(
+            shape=(S, D1, D0),
+            dtype=ctx.vortex_dtype,
             device=x.device,
-            dtype=x.dtype,
+            _format=self.output_format,
+            tensor_id=-1,  # set by caller / graph registration if needed
         )
-
-        # Account auxiliary memory
-        ctx.add_aux_memory(self.output_buffer)
 
         for t in [x]:
             if t._format == FORMAT.PAGED:
                 ctx.add_aux_flops(
                     t.shape[1] * t.shape[2]
                 )
-                
-        # Return vTensor view with dispatched output format
-        return as_vtensor(self.output_buffer, self.output_format)
+
+        return self.output_buffer

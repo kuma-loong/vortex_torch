@@ -2,7 +2,7 @@ from __future__ import annotations
 from typing import Any, Final
 import torch
 import uuid
-from ..utils import UNSET, Mode
+from ..utils import UNSET, Mode, resolve_dtype
 from ..abs import ContextBase
 
 
@@ -110,6 +110,9 @@ class Context(ContextBase):
             raise RuntimeError("Context.create() already called; pass overwrite=True to reinitialize.")
 
         sa = model_runner.server_args
+        self.vortex_dtype = resolve_dtype(
+            getattr(sa, "vortex_dtype", "bfloat16"), default=torch.bfloat16
+        )
         self.page_size = parent.page_size
         self.block_size = parent.block_size
         assert self.page_size % self.block_size == 0, "Page size must be a multiple of block size for block-sparse attention"

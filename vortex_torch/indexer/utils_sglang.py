@@ -35,6 +35,7 @@ def get_decode_planner(policy: str = None):
             req_to_token,
             req_indices,
             ctx.winfo_q_indices,
+            ctx.winfo_is_first_workload_per_batch,
             ctx.winfo_kv_offsets,
             ctx.winfo_kv_lens,
             ctx.winfo_num_workloads,

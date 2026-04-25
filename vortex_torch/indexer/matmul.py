@@ -1,7 +1,7 @@
 import torch
 from typing import Tuple, Dict, Optional
 from .context import Context
-from ..abs import vTensor, as_vtensor, FORMAT, vOp
+from ..abs import vTensor, FORMAT, vOp
 from ..utils import Schedule
 
 
@@ -75,9 +75,21 @@ class GeMV(vOp):
     """
 
     # Dispatch table keyed by (x_format, y_format) -> resolved output format.
+    # All per-(batch, head)/per-S combinations produce a RAGGED result (one
+    # row per S-slice). (BATCHED, BATCHED) is the special case: both inputs
+    # are page-independent so the result is also page-independent —
+    # produces a BATCHED tensor. The Schedule.W kernel writes the same value
+    # from every workload that shares ``(batch, head)``; redundant but safe.
     _impl_map: Dict[Tuple[FORMAT, FORMAT], FORMAT] = {
-        (FORMAT.BATCHED, FORMAT.PAGED): FORMAT.RAGGED,
-        # Extend with more pairs as needed.
+        (FORMAT.BATCHED, FORMAT.BATCHED): FORMAT.BATCHED,
+        (FORMAT.BATCHED, FORMAT.PAGED):   FORMAT.RAGGED,
+        (FORMAT.BATCHED, FORMAT.RAGGED):  FORMAT.RAGGED,
+        (FORMAT.PAGED,   FORMAT.BATCHED): FORMAT.RAGGED,
+        (FORMAT.PAGED,   FORMAT.PAGED):   FORMAT.RAGGED,
+        (FORMAT.PAGED,   FORMAT.RAGGED):  FORMAT.RAGGED,
+        (FORMAT.RAGGED,  FORMAT.BATCHED): FORMAT.RAGGED,
+        (FORMAT.RAGGED,  FORMAT.PAGED):   FORMAT.RAGGED,
+        (FORMAT.RAGGED,  FORMAT.RAGGED):  FORMAT.RAGGED,
     }
 
     def __init__(self):
@@ -124,13 +136,13 @@ class GeMV(vOp):
             f"Available: {list(self._impl_map.keys())}"
         )
         self.output_format = self._impl_map[key]
-        # Allocate output buffer on x.device/x.dtype
-        #S_out = ctx.max_num_blocks        # logical "S_pack" per runtime
-        self.output_buffer = as_vtensor(torch.empty(
-            (0, 1, 1),
+        # Pure-metadata vTensor — no torch.empty allocation needed.
+        self.output_buffer = vTensor(
+            shape=(0, 1, 1),
+            dtype=ctx.vortex_dtype,
             device=x.device,
-            dtype=x.dtype,
-        ), self.output_format, tensor_id=len(ctx.tensor_list)  # Assign a new tensor_id based on current tensor count
+            _format=self.output_format,
+            tensor_id=len(ctx.tensor_list),
         )
 
         # Track auxiliary memory and graph structure in the context
@@ -197,11 +209,19 @@ class GeMM(vOp):
     """
 
     # Dispatch table keyed by (x_format, y_format) -> resolved output format.
+    # See :class:`GeMV` for the rationale; (BATCHED, BATCHED) keeps both
+    # inputs page-independent and produces a BATCHED result, written by the
+    # Schedule.W kernel via the BATCHED store path.
     _impl_map: Dict[Tuple[FORMAT, FORMAT], FORMAT] = {
-        (FORMAT.BATCHED, FORMAT.PAGED): FORMAT.RAGGED,
-        (FORMAT.RAGGED, FORMAT.RAGGED): FORMAT.RAGGED,
-        (FORMAT.RAGGED, FORMAT.PAGED):  FORMAT.RAGGED,
-        # Extend with more pairs as needed.
+        (FORMAT.BATCHED, FORMAT.BATCHED): FORMAT.BATCHED,
+        (FORMAT.BATCHED, FORMAT.PAGED):   FORMAT.RAGGED,
+        (FORMAT.BATCHED, FORMAT.RAGGED):  FORMAT.RAGGED,
+        (FORMAT.PAGED,   FORMAT.BATCHED): FORMAT.RAGGED,
+        (FORMAT.PAGED,   FORMAT.PAGED):   FORMAT.RAGGED,
+        (FORMAT.PAGED,   FORMAT.RAGGED):  FORMAT.RAGGED,
+        (FORMAT.RAGGED,  FORMAT.BATCHED): FORMAT.RAGGED,
+        (FORMAT.RAGGED,  FORMAT.PAGED):   FORMAT.RAGGED,
+        (FORMAT.RAGGED,  FORMAT.RAGGED):  FORMAT.RAGGED,
     }
 
     def __init__(self):
@@ -284,12 +304,13 @@ class GeMM(vOp):
         # Output logical sizes: Ny x Nx
         Ny, Nx = y.shape[1], x.shape[1]
 
-        # Allocate output buffer on x.device/x.dtype
-        self.output_buffer = as_vtensor(torch.empty(
-            (0, Ny, Nx),
+        # Pure-metadata vTensor — no torch.empty allocation needed.
+        self.output_buffer = vTensor(
+            shape=(0, Ny, Nx),
+            dtype=ctx.vortex_dtype,
             device=x.device,
-            dtype=x.dtype,
-        ), self.output_format, tensor_id=len(ctx.tensor_list)  # Assign a new tensor_id based on current tensor count
+            _format=self.output_format,
+            tensor_id=len(ctx.tensor_list),
         )
 
         # Track auxiliary memory and graph structure in the context

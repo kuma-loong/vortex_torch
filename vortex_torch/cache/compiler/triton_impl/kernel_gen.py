@@ -74,14 +74,33 @@ def _load_cast_expr(tensor_ptr_expr: str, t) -> str:
     return f"tl.load({tensor_ptr_expr}).to(tl.float32)"
 
 
+_TORCH_TO_TL = {
+    torch.bfloat16: "tl.bfloat16",
+    torch.float16:  "tl.float16",
+    torch.float32:  "tl.float32",
+}
+
+
 def _store_cast_expr(block_expr: str, t) -> str:
     """Return the expression to be written by ``tl.store`` so it matches the
-    underlying storage dtype of ``t`` (after the wrapper's FP8 → uint8 view)."""
+    underlying storage dtype of ``t`` (after the wrapper's FP8 → uint8 view).
+
+    FP8 paths clamp to the representable range before the narrow cast to
+    avoid saturating to ``inf``. Max finite magnitudes: e5m2 = 57344,
+    e4m3fn = 448 (mirrors ``set_kv_buffer_fp8_*``).
+    """
     if t.dtype == torch.float8_e5m2:
-        return f"{block_expr}.to(tl.float8e5).to(tl.uint8, bitcast=True)"
+        clamped = f"tl.minimum(tl.maximum({block_expr}, -57344.0), 57344.0)"
+        return f"{clamped}.to(tl.float8e5).to(tl.uint8, bitcast=True)"
     if t.dtype == torch.float8_e4m3fn:
-        return f"{block_expr}.to(tl.float8e4nv).to(tl.uint8, bitcast=True)"
-    return f"{block_expr}.to(tl.bfloat16)"
+        clamped = f"tl.minimum(tl.maximum({block_expr}, -448.0), 448.0)"
+        return f"{clamped}.to(tl.float8e4nv).to(tl.uint8, bitcast=True)"
+    tl_name = _TORCH_TO_TL.get(t.dtype)
+    if tl_name is None:
+        raise NotImplementedError(
+            f"cache.kernel_gen: unsupported store dtype {t.dtype!r}"
+        )
+    return f"{block_expr}.to({tl_name})"
 
 
 def generate_initialization_str(sub_graph: Graph, ctx: Context) -> str:
@@ -134,8 +153,8 @@ def _block_store_lines(local_tensor_id: int, t, ctx: Context) -> List[str]:
     Output dtype selection:
 
       * ``bf16``              — default; ``.to(tl.bfloat16)``.
-      * ``float8_e5m2``       — ``.to(tl.float8e5).to(tl.uint8, bitcast=True)``
-      * ``float8_e4m3fn``     — ``.to(tl.float8e4nv).to(tl.uint8, bitcast=True)``
+      * ``fp8_e5m2``          — ``.to(tl.float8e5).to(tl.uint8, bitcast=True)``
+      * ``fp8_e4m3fn``        — ``.to(tl.float8e4nv).to(tl.uint8, bitcast=True)``
 
     FP8 tensors are passed in viewed as ``uint8`` by the wrapper, so the
     store writes raw FP8 bits into the same backing storage.

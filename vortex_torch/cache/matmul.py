@@ -1,10 +1,8 @@
 import torch
 from .context import Context
-from ..abs import vOp
-from .triton_kernels.matmul_impl import gemm_ppp, gemm_rrp, gemm_ppr, gemm_rrr
-from ..abs import vTensor, FORMAT, as_vtensor
+from ..abs import vOp, vTensor, FORMAT
 from ..utils import Schedule
-from typing import Tuple, Dict, Callable, Optional
+from typing import Tuple, Dict, Optional
 
 
 class GeMM(vOp):
@@ -70,83 +68,41 @@ class GeMM(vOp):
 
     Attributes
     ----------
-    _impl_map : Dict[Tuple[FORMAT, FORMAT, FORMAT], Tuple[Callable, FORMAT]]
-        Dispatch table keyed by ``(x_format, y_format, o_format)``. Each
-        entry maps to ``(callable_impl, resolved_output_format)``.
-
-    impl : Optional[Callable]
-        The resolved implementation selected during :meth:`profile`.
-
+    _impl_map : Dict[Tuple[FORMAT, FORMAT, FORMAT], FORMAT]
+        Dispatch table keyed by ``(x_format, y_format, o_format)``.
+        Each entry maps to the resolved output format.
     output_format : Optional[FORMAT]
         The output tensor format as determined in :meth:`profile`.
-
-    output_buffer : Optional[torch.Tensor]
-        Internal output buffer allocated when ``output`` is ``None``.
+    output_buffer : Optional[vTensor]
+        Pure-metadata vTensor descriptor for the output (graph node).
     """
 
-    # Implementation registry:
-    #   value impl is a Python wrapper that launches the corresponding kernel, e.g.:
-    #   def gemm_ppp(x, y, output, loc, ctx): ...
-    _impl_map: Dict[Tuple[FORMAT, FORMAT, FORMAT], Tuple[Callable, FORMAT]] = {
-        (FORMAT.PAGED,  FORMAT.PAGED,  FORMAT.PAGED):  (gemm_ppp, FORMAT.PAGED),
-        (FORMAT.PAGED,  FORMAT.PAGED,  FORMAT.RAGGED): (gemm_ppr, FORMAT.RAGGED),
-        (FORMAT.RAGGED, FORMAT.RAGGED, FORMAT.PAGED):  (gemm_rrp, FORMAT.PAGED),
-        (FORMAT.RAGGED, FORMAT.RAGGED, FORMAT.RAGGED): (gemm_rrr, FORMAT.RAGGED),
+    _impl_map: Dict[Tuple[FORMAT, FORMAT, FORMAT], FORMAT] = {
+        (FORMAT.PAGED,  FORMAT.PAGED,  FORMAT.PAGED):  FORMAT.PAGED,
+        (FORMAT.PAGED,  FORMAT.PAGED,  FORMAT.RAGGED): FORMAT.RAGGED,
+        (FORMAT.RAGGED, FORMAT.RAGGED, FORMAT.PAGED):  FORMAT.PAGED,
+        (FORMAT.RAGGED, FORMAT.RAGGED, FORMAT.RAGGED): FORMAT.RAGGED,
     }
 
     def __init__(self):
-        r"""
-        Initialize a GEMM dispatcher.
-
-        The dispatcher itself does not take algorithmic parameters; it
-        simply holds the resolved implementation, output format, and
-        optional internal output buffer selected during :meth:`profile`.
-        """
         super().__init__()
-        self.impl: Optional[Callable] = None
         self.output_format: Optional[FORMAT] = None
-        self.output_buffer: Optional[torch.Tensor] = None
+        self.output_buffer: Optional[vTensor] = None
         # Cache GeMM fuses into the per-block kernel — see
         # ``cache.compiler.triton_impl.kernel_gen``.
         self.schedule = Schedule.W
 
-    def _infer_impl_ragged(
+    def _infer_output_format_ragged(
         self, x_fmt: FORMAT, y_fmt: FORMAT
-    ) -> Tuple[Callable, FORMAT]:
-        r"""
-        Infer an implementation assuming a RAGGED output format.
-
-        This helper is used when :meth:`profile` is called with
-        ``output is None``. It selects an implementation for the key
-        ``(x_fmt, y_fmt, FORMAT.RAGGED)`` in :attr:`_impl_map`.
-
-        Parameters
-        ----------
-        x_fmt : FORMAT
-            Format of the right-hand operand ``x`` (which is transposed
-            inside the GEMM).
-
-        y_fmt : FORMAT
-            Format of the left-hand operand ``y``.
-
-        Returns
-        -------
-        (Callable, FORMAT)
-            The implementation callable and the resolved output format.
-
-        Raises
-        ------
-        AssertionError
-            If there is no entry for
-            ``(x_fmt, y_fmt, FORMAT.RAGGED)`` in :attr:`_impl_map`.
-        """
+    ) -> FORMAT:
+        """Pick the RAGGED-output dispatch entry for ``(x_fmt, y_fmt)``."""
         key = (x_fmt, y_fmt, FORMAT.RAGGED)
         assert key in self._impl_map, (
             f"{self._prefix()}no RAGGED-output implementation for "
             f"(x_fmt={x_fmt}, y_fmt={y_fmt}). "
             f"Available keys: {list(self._impl_map.keys())}"
         )
-        return self._impl_map[key]  # -> (impl, out_fmt)
+        return self._impl_map[key]
 
     # --------------------------------------------------------------------- #
     # profile: validate, select impl/format, and optionally allocate output
@@ -233,31 +189,25 @@ class GeMM(vOp):
         Ny, Nx = y.shape[1], x.shape[1]
         x_fmt, y_fmt = x._format, y._format
 
-        # Case A: output not provided -> choose RAGGED impl and allocate buffer
+        # Case A: output not provided -> pick RAGGED impl and build a
+        # pure-metadata vTensor, then register it in the cache graph.
         if output is None:
-            self.impl, self.output_format = self._infer_impl_ragged(x_fmt, y_fmt)
+            self.output_format = self._infer_output_format_ragged(x_fmt, y_fmt)
 
-            # Allocate on x.device/x.dtype; B comes from runtime context
             B = ctx.max_new_tokens_per_batch * ctx.head_num
-            self.output_buffer = torch.empty(
-                (B, Ny, Nx),
+            self.output_buffer = vTensor(
+                shape=(B, Ny, Nx),
+                dtype=ctx.vortex_dtype,
                 device=x.device,
-                dtype=x.dtype,
-            )
-            ctx.add_aux_memory(self.output_buffer)
-
-            # Register in the cache graph.
-            output_vtensor = as_vtensor(
-                self.output_buffer,
-                self.output_format,
+                _format=self.output_format,
                 tensor_id=len(ctx.tensor_list),
             )
-            ctx.tensor_list.append(output_vtensor)
+            ctx.tensor_list.append(self.output_buffer)
             ctx.output_tensor_to_op_list.append(len(ctx.op_list))
             ctx.op_list.append(self)
             ctx.op_to_input_tensor_list.append([x.tensor_id, y.tensor_id])
-            ctx.op_to_output_tensor_list.append([output_vtensor.tensor_id])
-            return output_vtensor
+            ctx.op_to_output_tensor_list.append([self.output_buffer.tensor_id])
+            return self.output_buffer
 
         # Case B: output provided -> validate and select exact impl
         assert isinstance(output, vTensor), f"{prefix}output must be vTensor, got {type(output)}"
@@ -271,7 +221,7 @@ class GeMM(vOp):
             f"{prefix}no implementation for (x_fmt={x_fmt}, y_fmt={y_fmt}, o_fmt={o_fmt}). "
             f"Available keys: {list(self._impl_map.keys())}"
         )
-        self.impl, self.output_format = self._impl_map[key]
+        self.output_format = self._impl_map[key]
 
         # Shape consistency: GEMM yields [*, Ny, Nx]
         assert output.shape[1] == Ny and output.shape[2] == Nx, (
@@ -290,62 +240,4 @@ class GeMM(vOp):
         ctx.op_to_input_tensor_list.append([x.tensor_id, y.tensor_id])
         ctx.op_to_output_tensor_list.append([output.tensor_id])
 
-        return output
-
-    # --------------------------------------------------------------------- #
-    # execute: run selected impl and return the plain output tensor
-    # --------------------------------------------------------------------- #
-    def execute(
-        self, x: torch.Tensor, y: torch.Tensor, output: Optional[torch.Tensor], loc: torch.Tensor, ctx: Context
-    ) -> torch.Tensor:
-        r"""
-        Execute the selected GEMM implementation.
-
-        This method assumes that :meth:`profile` has already selected an
-        implementation and, if needed, allocated an internal output buffer.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Plain right-hand operand tensor with shape compatible with the
-            :class:`vTensor` validated in :meth:`profile`.
-
-        y : torch.Tensor
-            Plain left-hand operand tensor with shape compatible with the
-            :class:`vTensor` validated in :meth:`profile`.
-
-        output : Optional[torch.Tensor]
-            Optional preallocated output tensor. If ``None``, the internal
-            buffer created during :meth:`profile` will be used.
-
-        loc : torch.Tensor
-            Auxiliary tensor carrying metadata required by the GEMM
-            implementation.
-
-        ctx : Context
-            Execution context forwarded to the implementation.
-
-        Returns
-        -------
-        torch.Tensor
-            The output tensor written by the implementation: either the
-            provided ``output`` or the internal buffer.
-
-        Raises
-        ------
-        AssertionError
-            If :meth:`profile` has not been called and no implementation or
-            internal buffer is available.
-        """
-        prefix = self._prefix()
-        assert self.impl is not None, f"{prefix}called before profile() (impl is None)"
-
-        if output is None:
-            assert self.output_buffer is not None, (
-                f"{prefix}internal output buffer is None; did profile() run?"
-            )
-            output = self.output_buffer
-
-        # Expected signature for impl: impl(x, y, output, loc, ctx)
-        self.impl(x, y, output, loc, ctx)
         return output

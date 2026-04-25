@@ -1,7 +1,7 @@
 import torch
 from typing import Dict, Optional
 from .context import Context
-from ..abs import vTensor, as_vtensor, FORMAT, vOp
+from ..abs import vTensor, FORMAT, vOp
 from ..utils import ReduceType, Schedule
 
 class Reduce(vOp):
@@ -63,7 +63,8 @@ class Reduce(vOp):
         ``dim`` as described above.
     """
 
-    # Dispatch table keyed by x_format -> resolved output format.
+    # Dispatch table for dim in {1, 2} (fused, Schedule.W). dim==0 is a
+    # cross-row reduction (Schedule.S, RAGGED → BATCHED) handled below.
     _impl_map: Dict[FORMAT, FORMAT] = {
         FORMAT.RAGGED: FORMAT.RAGGED,
         FORMAT.BATCHED: FORMAT.BATCHED,
@@ -77,10 +78,14 @@ class Reduce(vOp):
         self.reduce_type: Optional[ReduceType] = None
         self.output_format: Optional[FORMAT] = None
         self.output_buffer: Optional[torch.Tensor] = None
-        self.schedule = Schedule.W
-        # Validate reduction dimension at construction
+        # dim==0 reduces across the packed leading axis; the result is one
+        # summary per (batch, kv_head), so it can't fuse into a per-block
+        # workload kernel — schedule it standalone.
+        self.schedule = Schedule.S if dim == 0 else Schedule.W
         prefix = self._prefix()
-        assert self.dim in (1, 2), f"{prefix}__init__: dim must be 1 or 2, got dim={self.dim}"
+        assert self.dim in (0, 1, 2), (
+            f"{prefix}__init__: dim must be 0, 1, or 2, got dim={self.dim}"
+        )
 
     # ---------------- profile ----------------
     def profile(self, x: vTensor, ctx: Context) -> vTensor:
@@ -129,27 +134,35 @@ class Reduce(vOp):
             f"got ndim={x.dim()} shape={tuple(x.shape)}"
         )
 
-        # Dispatch by input format
         x_fmt = x._format
-        assert x_fmt in self._impl_map, (
-            f"{prefix}no implementation for x_fmt={x_fmt}. "
-            f"Available keys: {list(self._impl_map.keys())}"
-        )
-        self.output_format = self._impl_map[x_fmt]
-
-        # Compute output logical shape according to `dim`
-        # The leading dimension N is taken from the runtime context,
-        # not from x.shape[0], to remain consistent with other ops.
         D0, D1 = x.shape[1], x.shape[2]
-        out_D0 = 1 if self.dim == 1 else D0   # D_0 collapsed when reducing over dim=1
-        out_D1 = 1 if self.dim == 2 else D1   # D_1 collapsed when reducing over dim=2
 
-        # Allocate output buffer on x.device with x.dtype
-        self.output_buffer = as_vtensor(torch.empty(
-            (0, out_D0, out_D1),
+        if self.dim == 0:
+            # Cross-row reduction: collapse the packed leading axis into one
+            # summary per (batch, kv_head). Input must be RAGGED (per-page or
+            # per-token); the compiler allocates a BATCHED buffer with leading
+            # dim ``ctx.max_bs * ctx.num_kv_heads`` (see indexer interface).
+            assert x_fmt == FORMAT.RAGGED, (
+                f"{prefix}dim=0 reduce requires RAGGED input, got {x_fmt}"
+            )
+            self.output_format = FORMAT.BATCHED
+            out_D0, out_D1 = D0, D1
+        else:
+            assert x_fmt in self._impl_map, (
+                f"{prefix}no implementation for x_fmt={x_fmt}. "
+                f"Available keys: {list(self._impl_map.keys())}"
+            )
+            self.output_format = self._impl_map[x_fmt]
+            out_D0 = 1 if self.dim == 1 else D0
+            out_D1 = 1 if self.dim == 2 else D1
+
+        # Pure-metadata vTensor — no torch.empty allocation needed.
+        self.output_buffer = vTensor(
+            shape=(0, out_D0, out_D1),
+            dtype=ctx.vortex_dtype,
             device=x.device,
-            dtype=x.dtype,
-        ), self.output_format, tensor_id=len(ctx.tensor_list)  # Assign a new tensor_id based on current tensor count
+            _format=self.output_format,
+            tensor_id=len(ctx.tensor_list),
         )
 
         # Track auxiliary memory and graph structure in the context

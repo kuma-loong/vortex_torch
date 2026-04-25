@@ -27,6 +27,7 @@ def generate_elementwise_binary_impl(graph: Graph, op_id: int, ctx: Context) -> 
     z = f"tensor_{output_tensor_id}_block"
     a = float(op.alpha)
     b = float(op.beta)
+    neg_inf = f"tl.full({x}.shape, -1e30, dtype=tl.float32)"
 
     if op.op_type == ElementwiseBinaryOpType.Maximum:
         return f"{z} = tl.maximum({x}, {y})"
@@ -37,6 +38,18 @@ def generate_elementwise_binary_impl(graph: Graph, op_id: int, ctx: Context) -> 
         return f"{z} = {a} * {x} + {b} * {y}"
     if op.op_type == ElementwiseBinaryOpType.Mul:
         return f"{z} = {x} * {y}"
+    if op.op_type == ElementwiseBinaryOpType.WhereEqual:
+        return f"{z} = tl.where({x} == {y}, 0.0, {neg_inf})"
+    if op.op_type == ElementwiseBinaryOpType.WhereNotEqual:
+        return f"{z} = tl.where({x} != {y}, 0.0, {neg_inf})"
+    if op.op_type == ElementwiseBinaryOpType.WhereGreater:
+        return f"{z} = tl.where({x} > {y}, 0.0, {neg_inf})"
+    if op.op_type == ElementwiseBinaryOpType.WhereGreaterEqual:
+        return f"{z} = tl.where({x} >= {y}, 0.0, {neg_inf})"
+    if op.op_type == ElementwiseBinaryOpType.WhereLess:
+        return f"{z} = tl.where({x} < {y}, 0.0, {neg_inf})"
+    if op.op_type == ElementwiseBinaryOpType.WhereLessEqual:
+        return f"{z} = tl.where({x} <= {y}, 0.0, {neg_inf})"
 
     raise NotImplementedError(
         f"Elementwise_Binary op_type {op.op_type!r} is not yet wired in cache codegen"

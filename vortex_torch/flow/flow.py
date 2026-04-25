@@ -1,7 +1,10 @@
 from abc import ABC, abstractmethod
+from typing import Dict, Tuple, Union
+
 import torch
-from typing import Dict, Tuple
+
 from ..abs import ContextBase
+from ..utils import resolve_dtype
 
 class vFlow(ABC):
     r"""
@@ -348,12 +351,12 @@ class vFlow(ABC):
         
         return self.token_ratio
 
-    def initialize(self, 
-        block_size: int, 
-        head_dim: int, 
-        kv_cache_dtype: torch.dtype, 
-        q_data_type: torch.dtype, 
-        intermediate_dtype: torch.dtype = torch.bfloat16
+    def initialize(self,
+        block_size: int,
+        head_dim: int,
+        kv_cache_dtype: Union[torch.dtype, str],
+        q_data_type: Union[torch.dtype, str],
+        intermediate_dtype: Union[torch.dtype, str] = torch.bfloat16,
         ):
         r"""
         Optional initialization method called by the runtime after cache
@@ -369,19 +372,24 @@ class vFlow(ABC):
             Number of tokens per block.
         head_dim : int
             Head dimension.
-        kv_cache_dtype : torch.dtype
-            Data type for key/value caches.
-        q_data_type : torch.dtype
-            Data type for query tensor.
-        intermediate_dtype : torch.dtype
-            Data type for intermediate tensors. This is optional and defaults to :class:`torch.bfloat16`.
+        kv_cache_dtype : torch.dtype or str
+            Data type for key/value caches. Accepts a :class:`torch.dtype`
+            or one of the canonical strings in
+            :data:`vortex_torch.utils.DTYPE_STR_TO_TORCH`
+            (e.g. ``"bfloat16"``, ``"fp8_e5m2"``).
+        q_data_type : torch.dtype or str
+            Data type for query tensor. Same string convention as
+            ``kv_cache_dtype``.
+        intermediate_dtype : torch.dtype or str
+            Data type for intermediate tensors. Defaults to ``torch.bfloat16``.
+            Same string convention as ``kv_cache_dtype``.
         """
-        
+
         self.block_size = block_size
         self.head_dim = head_dim
-        self.kv_cache_dtype = kv_cache_dtype
-        self.q_data_type = q_data_type
-        self.intermediate_dtype = intermediate_dtype
+        self.kv_cache_dtype = resolve_dtype(kv_cache_dtype)
+        self.q_data_type = resolve_dtype(q_data_type)
+        self.intermediate_dtype = resolve_dtype(intermediate_dtype)
         self.token_ratio = 0.0
         raw_cache_meta_info = self.create_cache(block_size, head_dim)
         assert "k" not in raw_cache_meta_info, "create_cache must not declare 'k' key"

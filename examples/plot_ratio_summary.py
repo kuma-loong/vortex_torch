@@ -3,6 +3,7 @@ vs topk_ratio for each (model, dataset), comparing block_sparse vs gqa_quest.
 
 Reads summary JSONs under summary_ratio/ and writes PNGs to figures_ratio/.
 """
+import argparse
 import glob
 import json
 import os
@@ -11,23 +12,23 @@ from collections import defaultdict
 
 import matplotlib.pyplot as plt
 
-SUMMARY_DIR = "summary_ratio"
-# full_attention baseline is sourced from summary/ (same as figures_val).
-BASELINE_DIR = "summary"
-OUT_DIR = "figures_ratio"
-os.makedirs(OUT_DIR, exist_ok=True)
-
 MODEL_ORDER = ["Qwen3-0.6B", "Qwen3-1.7B", "Qwen3-4B", "Qwen3-8B"]
 DATASETS = ["examples/amc23.jsonl", "examples/aime24.jsonl"]
-MODULES = ["block_sparse_attention", "gqa_quest_sparse_attention"]
+MODULES = [
+    "block_sparse_attention",
+    "gqa_quest_sparse_attention",
+    "gqa_block_sparse_attention",
+]
 MODULE_LABEL = {
     "block_sparse_attention": "block_sparse",
     "gqa_quest_sparse_attention": "gqa_quest",
+    "gqa_block_sparse_attention": "gqa_block_sparse",
     "full_attention": "full_attention",
 }
 MODULE_STYLE = {
     "block_sparse_attention": dict(color="#2E86DE", marker="o", linewidth=2.2, markersize=7),
     "gqa_quest_sparse_attention": dict(color="#EE5253", marker="s", linewidth=2.2, markersize=7),
+    "gqa_block_sparse_attention": dict(color="#8E44AD", marker="^", linewidth=2.2, markersize=8),
     "full_attention": dict(color="#10AC84"),
 }
 
@@ -66,22 +67,26 @@ def style_axes(ax):
     ax.minorticks_on()
 
 
-def load_latest():
+def load_latest(summary_dirs):
+    """Merge latest run per config across one or more summary directories."""
+    if isinstance(summary_dirs, str):
+        summary_dirs = [summary_dirs]
     best = {}
-    for f in sorted(glob.glob(os.path.join(SUMMARY_DIR, "*.json"))):
-        with open(f) as fp:
-            d = json.load(fp)
-        a = d["args"]
-        key = (
-            os.path.basename(a["model_name"]),
-            a["vortex_module_name"],
-            a["trials"],
-            a["topk_ratio"],
-            a["data_path"],
-        )
-        ts = ts_re.search(f).group(1)
-        if key not in best or ts > best[key][0]:
-            best[key] = (ts, d)
+    for summary_dir in summary_dirs:
+        for f in sorted(glob.glob(os.path.join(summary_dir, "*.json"))):
+            with open(f) as fp:
+                d = json.load(fp)
+            a = d["args"]
+            key = (
+                os.path.basename(a["model_name"]),
+                a["vortex_module_name"],
+                a["trials"],
+                a["topk_ratio"],
+                a["data_path"],
+            )
+            ts = ts_re.search(f).group(1)
+            if key not in best or ts > best[key][0]:
+                best[key] = (ts, d)
     return best
 
 
@@ -142,7 +147,7 @@ def load_baseline(baseline_dir):
     return out
 
 
-def plot_side_by_side(agg, baseline, model, ds, savepath):
+def plot_side_by_side(agg, baseline, model, ds, title_suffix, savepath):
     fig, (ax_acc, ax_tp) = plt.subplots(1, 2, figsize=(12, 4.3))
 
     for module in MODULES:
@@ -171,7 +176,10 @@ def plot_side_by_side(agg, baseline, model, ds, savepath):
                           label=f"full_attention ({fa['tput']:.0f})")
 
     ds_name = os.path.basename(ds).replace(".jsonl", "")
-    fig.suptitle(f"{model} — {ds_name}", fontsize=13, fontweight="bold")
+    suptitle = f"{model} — {ds_name}"
+    if title_suffix:
+        suptitle += f"  [{title_suffix}]"
+    fig.suptitle(suptitle, fontsize=13, fontweight="bold")
 
     style_axes(ax_acc)
     ax_acc.set_xlabel("topk_ratio")
@@ -192,7 +200,7 @@ def plot_side_by_side(agg, baseline, model, ds, savepath):
     plt.close(fig)
 
 
-def plot_pareto(agg, baseline, model, ds, savepath):
+def plot_pareto(agg, baseline, model, ds, title_suffix, savepath):
     fig, ax = plt.subplots(figsize=(6.5, 4.8))
     for module in MODULES:
         pts = [(tk, v) for (m, d, mo, tk), v in agg.items()
@@ -219,8 +227,10 @@ def plot_pareto(agg, baseline, model, ds, savepath):
                    label="full_attention", zorder=5)
 
     ds_name = os.path.basename(ds).replace(".jsonl", "")
-    ax.set_title(f"{model} — {ds_name}  (labels: topk_ratio)",
-                 fontsize=12, fontweight="bold")
+    title = f"{model} — {ds_name}  (labels: topk_ratio)"
+    if title_suffix:
+        title += f"  [{title_suffix}]"
+    ax.set_title(title, fontsize=12, fontweight="bold")
     ax.set_xlabel("throughput (tokens/s)")
     ax.set_ylabel("accuracy (mean @ max trials)")
     style_axes(ax)
@@ -231,11 +241,31 @@ def plot_pareto(agg, baseline, model, ds, savepath):
     plt.close(fig)
 
 
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--summary-dir", default=["summary_ratio"], nargs="+",
+                   help="One or more directories of topk_ratio sweep JSONs "
+                        "(default: summary_ratio). Runs are deduped by "
+                        "(model, module, trials, topk_ratio, dataset), keeping "
+                        "the latest timestamp across all dirs.")
+    p.add_argument("--baseline-dir", default="summary",
+                   help="Directory to read full_attention baseline from "
+                        "(default: summary)")
+    p.add_argument("--out-dir", default="figures_ratio",
+                   help="Directory to write PNGs (default: figures_ratio)")
+    p.add_argument("--title-suffix", default="",
+                   help="Text appended in brackets to each figure title "
+                        "(e.g. 'topk_val=61').")
+    return p.parse_args()
+
+
 def main():
+    args = parse_args()
+    os.makedirs(args.out_dir, exist_ok=True)
     apply_style()
-    best = load_latest()
+    best = load_latest(args.summary_dir)
     agg = aggregate(best)
-    baseline = load_baseline(BASELINE_DIR)
+    baseline = load_baseline(args.baseline_dir)
 
     for model in MODEL_ORDER:
         for ds in DATASETS:
@@ -243,12 +273,14 @@ def main():
             if not has_data:
                 continue
             ds_name = os.path.basename(ds).replace(".jsonl", "")
-            plot_side_by_side(agg, baseline, model, ds,
-                              os.path.join(OUT_DIR, f"{model}_{ds_name}_acc_tput.png"))
-            plot_pareto(agg, baseline, model, ds,
-                        os.path.join(OUT_DIR, f"{model}_{ds_name}_pareto.png"))
+            plot_side_by_side(
+                agg, baseline, model, ds, args.title_suffix,
+                os.path.join(args.out_dir, f"{model}_{ds_name}_acc_tput.png"))
+            plot_pareto(
+                agg, baseline, model, ds, args.title_suffix,
+                os.path.join(args.out_dir, f"{model}_{ds_name}_pareto.png"))
 
-    print(f"Wrote figures to {OUT_DIR}/")
+    print(f"Wrote figures to {args.out_dir}/")
 
 
 if __name__ == "__main__":

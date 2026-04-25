@@ -1,10 +1,8 @@
 import torch
-from ..abs import vOp
+from ..abs import vOp, vTensor, FORMAT
 from .context import Context
-from .triton_kernels.elementwise_impl import elementwise_pp, elementwise_rp, elementwise_pr, elementwise_rr
-from ..abs import vTensor, FORMAT, as_vtensor
 from ..utils import ElementwiseOpType, Schedule
-from typing import Tuple, Dict, Callable, Optional
+from typing import Tuple, Dict, Optional
 
 class Elementwise(vOp):
     r"""
@@ -55,90 +53,48 @@ class Elementwise(vOp):
 
     Attributes
     ----------
-    _impl_map : Dict[Tuple[FORMAT, FORMAT], Tuple[Callable, FORMAT]]
-        Dispatch table keyed by ``(x_format, o_format)``. Each entry maps
-        to ``(callable_impl, resolved_output_format)``.
+    _impl_map : Dict[Tuple[FORMAT, FORMAT], FORMAT]
+        Dispatch table keyed by ``(x_format, o_format)``. Each entry
+        maps to the resolved output format.
     alpha : float
         Scalar parameter used by certain unary ops.
     beta : float
         Scalar parameter used by certain unary ops.
     op_type : Optional[ElementwiseOpType]
         Runtime-set enum/int describing the specific elementwise operation.
-    impl : Optional[Callable]
-        The resolved implementation selected during :meth:`profile`.
     output_format : Optional[FORMAT]
         The output tensor format as determined in :meth:`profile`.
-    output_buffer : Optional[torch.Tensor]
-        Internal output buffer allocated when ``output`` is ``None``.
+    output_buffer : Optional[vTensor]
+        Pure-metadata vTensor descriptor for the output (graph node).
     """
 
-    # Implementation registry:
-    #   key   = (x_format, o_format)
-    #   value = (callable_impl, resolved_output_format)
-    _impl_map: Dict[Tuple[FORMAT, FORMAT], Tuple[Callable, FORMAT]] = {
-        (FORMAT.PAGED,  FORMAT.PAGED):  (elementwise_pp, FORMAT.PAGED),
-        (FORMAT.PAGED,  FORMAT.RAGGED): (elementwise_pr, FORMAT.RAGGED),
-        (FORMAT.RAGGED, FORMAT.PAGED):  (elementwise_rp, FORMAT.PAGED),
-        (FORMAT.RAGGED, FORMAT.RAGGED): (elementwise_rr, FORMAT.RAGGED),
+    _impl_map: Dict[Tuple[FORMAT, FORMAT], FORMAT] = {
+        (FORMAT.PAGED,  FORMAT.PAGED):  FORMAT.PAGED,
+        (FORMAT.PAGED,  FORMAT.RAGGED): FORMAT.RAGGED,
+        (FORMAT.RAGGED, FORMAT.PAGED):  FORMAT.PAGED,
+        (FORMAT.RAGGED, FORMAT.RAGGED): FORMAT.RAGGED,
     }
 
     def __init__(self, alpha: float = 0.0, beta: float = 1.0):
-        r"""
-        Initialize a unary elementwise dispatcher.
-
-        Parameters
-        ----------
-        alpha : float, optional
-            Scalar parameter used by certain elementwise operations
-            (for example, as an additive or bias term). Default is ``0.0``.
-
-        beta : float, optional
-            Scalar parameter used by certain elementwise operations
-            (for example, as a multiplicative or slope term).
-            Default is ``1.0``.
-        """
         super().__init__()
         self.alpha = alpha
         self.beta = beta
-        self.op_type: Optional[ElementwiseOpType] = None          # runtime-set enum/int for the op
-        self.impl: Optional[Callable] = None
+        self.op_type: Optional[ElementwiseOpType] = None
         self.output_format: Optional[FORMAT] = None
-        self.output_buffer: Optional[torch.Tensor] = None
+        self.output_buffer: Optional[vTensor] = None
         # Cache elementwise ops fuse with neighbours into a single
         # token-driven kernel — see ``cache.compiler.triton_impl.kernel_gen``.
         self.schedule = Schedule.W
 
     # ------------------------------ helpers ------------------------------ #
-    def _infer_impl_ragged(self, x_fmt: FORMAT) -> Tuple[Callable, FORMAT]:
-        r"""
-        Infer an implementation assuming a RAGGED output format.
-
-        This helper is used when :meth:`profile` is called with
-        ``output is None``. It selects an implementation for the
-        key ``(x_fmt, FORMAT.RAGGED)`` in :attr:`_impl_map`.
-
-        Parameters
-        ----------
-        x_fmt : FORMAT
-            The format of the input tensor ``x``.
-
-        Returns
-        -------
-        (Callable, FORMAT)
-            The implementation callable and the resolved output format.
-
-        Raises
-        ------
-        AssertionError
-            If there is no entry for ``(x_fmt, FORMAT.RAGGED)`` in
-            :attr:`_impl_map`.
-        """
+    def _infer_output_format_ragged(self, x_fmt: FORMAT) -> FORMAT:
+        """Pick the RAGGED-output dispatch entry; used when ``output is None``."""
         key = (x_fmt, FORMAT.RAGGED)
         assert key in self._impl_map, (
             f"{self._prefix()}no RAGGED-output implementation for x_fmt={x_fmt}. "
             f"Available keys: {list(self._impl_map.keys())}"
         )
-        return self._impl_map[key]  # -> (impl, out_fmt)
+        return self._impl_map[key]
 
     # --------------------------------------------------------------------- #
     # profile: validate, select impl/format, and optionally allocate output
@@ -220,32 +176,25 @@ class Elementwise(vOp):
         x_fmt = x._format
         N, D = x.shape[1], x.shape[2]
 
-        # Case A: output not provided -> choose RAGGED impl and allocate buffer
+        # Case A: output not provided -> pick RAGGED-output impl, construct
+        # a pure-metadata vTensor, and register it in the cache graph.
         if output is None:
-            self.impl, self.output_format = self._infer_impl_ragged(x_fmt)
+            self.output_format = self._infer_output_format_ragged(x_fmt)
 
-            # Allocate on x.device/x.dtype; B comes from runtime context
             B = ctx.max_new_tokens_per_batch * ctx.head_num
-            self.output_buffer = torch.empty(
-                (B, N, D),
+            self.output_buffer = vTensor(
+                shape=(B, N, D),
+                dtype=ctx.vortex_dtype,
                 device=x.device,
-                dtype=x.dtype,
-            )
-            ctx.add_aux_memory(self.output_buffer)
-
-            # Wrap with a fresh tensor_id and register in the cache graph,
-            # mirroring the indexer-side ``profile`` convention.
-            output_vtensor = as_vtensor(
-                self.output_buffer,
-                self.output_format,
+                _format=self.output_format,
                 tensor_id=len(ctx.tensor_list),
             )
-            ctx.tensor_list.append(output_vtensor)
+            ctx.tensor_list.append(self.output_buffer)
             ctx.output_tensor_to_op_list.append(len(ctx.op_list))
             ctx.op_list.append(self)
             ctx.op_to_input_tensor_list.append([x.tensor_id])
-            ctx.op_to_output_tensor_list.append([output_vtensor.tensor_id])
-            return output_vtensor
+            ctx.op_to_output_tensor_list.append([self.output_buffer.tensor_id])
+            return self.output_buffer
 
         # Case B: output provided -> validate and select exact impl
         assert isinstance(output, vTensor), f"{prefix}output must be vTensor, got {type(output)}"
@@ -260,7 +209,7 @@ class Elementwise(vOp):
             f"{prefix}no implementation for (x_fmt={x_fmt}, o_fmt={o_fmt}). "
             f"Available keys: {list(self._impl_map.keys())}"
         )
-        self.impl, self.output_format = self._impl_map[key]
+        self.output_format = self._impl_map[key]
 
         # Shape consistency: unary elementwise keeps (N,D)
         assert output.shape[1] == N and output.shape[2] == D, (
@@ -283,62 +232,6 @@ class Elementwise(vOp):
         ctx.op_to_output_tensor_list.append([output.tensor_id])
 
         return output
-
-    # --------------------------------------------------------------------- #
-    # execute: run selected impl and return the plain output tensor
-    # --------------------------------------------------------------------- #
-    def execute(
-        self, x: torch.Tensor, output: Optional[torch.Tensor], loc: torch.Tensor, ctx: Context
-    ) -> torch.Tensor:
-        r"""
-        Execute the selected unary elementwise implementation.
-
-        This method assumes that :meth:`profile` has already selected an
-        implementation and, if needed, allocated an internal output buffer.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Plain input tensor with shape consistent with the ``vTensor``
-            validated in :meth:`profile`.
-
-        output : Optional[torch.Tensor]
-            Optional preallocated output tensor. If ``None``, the internal
-            buffer created during :meth:`profile` will be used.
-
-        loc : torch.Tensor
-            Auxiliary tensor carrying per-position metadata required by the
-            implementation (e.g., location/segment indices).
-
-        ctx : Context
-            Execution context forwarded to the implementation.
-
-        Returns
-        -------
-        torch.Tensor
-            The output tensor written by the implementation: either the
-            provided ``output`` or the internal buffer.
-
-        Raises
-        ------
-        AssertionError
-            If :meth:`profile` has not been called and no implementation
-            or internal buffer is available.
-        """
-        prefix = self._prefix()
-        assert self.impl is not None, f"{prefix}called before profile() (impl is None)"
-
-        if output is None:
-            assert self.output_buffer is not None, (
-                f"{prefix}internal output buffer is None; did profile() run?"
-            )
-            output = self.output_buffer
-
-        # Expected signature for impl:
-        #   impl(x, output, loc, ctx, op_type, alpha, beta)
-        self.impl(x, output, loc, ctx, self.op_type, self.alpha, self.beta)
-        return output
-
 
 
 class Relu(Elementwise):
@@ -509,3 +402,63 @@ class Abs(Elementwise):
     def __init__(self, alpha: float = 0.0, beta: float = 1.0):
         super().__init__(alpha, beta)
         self.op_type = ElementwiseOpType.Abs
+
+
+class Log(Elementwise):
+    r"""
+    Natural logarithm of an affine transform.
+
+    This operator applies, elementwise, the scalar function
+
+    .. math::
+
+        f(x; \alpha, \beta) = \log(\beta x + \alpha).
+
+    Given an input tensor :math:`X \in \mathbb{R}^{B \times N \times D}`,
+    the output is
+
+    .. math::
+
+        Y[b, n, d] = \log(\beta X[b, n, d] + \alpha).
+
+    Parameters
+    ----------
+    alpha : float, optional
+        Additive bias term inside the logarithm. Default is ``0.0``.
+
+    beta : float, optional
+        Multiplicative scale term inside the logarithm. Default is ``1.0``.
+    """
+    def __init__(self, alpha: float = 0.0, beta: float = 1.0):
+        super().__init__(alpha, beta)
+        self.op_type = ElementwiseOpType.Log
+
+
+class Exp(Elementwise):
+    r"""
+    Exponential of an affine transform.
+
+    This operator applies, elementwise, the scalar function
+
+    .. math::
+
+        f(x; \alpha, \beta) = \exp(\beta x + \alpha).
+
+    Given an input tensor :math:`X \in \mathbb{R}^{B \times N \times D}`,
+    the output is
+
+    .. math::
+
+        Y[b, n, d] = \exp(\beta X[b, n, d] + \alpha).
+
+    Parameters
+    ----------
+    alpha : float, optional
+        Additive bias term inside the exponential. Default is ``0.0``.
+
+    beta : float, optional
+        Multiplicative scale term inside the exponential. Default is ``1.0``.
+    """
+    def __init__(self, alpha: float = 0.0, beta: float = 1.0):
+        super().__init__(alpha, beta)
+        self.op_type = ElementwiseOpType.Exp

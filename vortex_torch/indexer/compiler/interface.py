@@ -51,8 +51,14 @@ def generate_subgraph_func(sub_graph: Graph, sub_graph_id: int, ctx: Context) ->
 
     arg_list = []
 
-    # Collect input tensors
+    # A tensor that's both an input and an output (e.g. a cache field
+    # Load'd + Save'd in the same subgraph) must only be bound once.
+    output_set = set(sub_graph.output_tensor_ids)
+
+    # Collect input tensors (skip any that also appear in outputs)
     for local_tensor_id in sub_graph.input_tensor_ids:
+        if local_tensor_id in output_set:
+            continue
         arg_list.append(f"tensor_{local_tensor_id}")
 
     # Collect output tensors
@@ -84,7 +90,12 @@ def {ctx.sparse_attention_name}_subgraph_{sub_graph_id}_interface(
 def generate_subgraph_entry_point(sub_graph: Graph, sub_graph_id: int, ctx: Context, tensor_id_to_tensor_name_map: dict) -> Tuple[str, str]:
     lines = []
     lines.append(f"{ctx.sparse_attention_name}_subgraph_{sub_graph_id}_interface(")
+    # Match the input/output deduplication in ``generate_subgraph_func``
+    # so the call-site argument count matches the target signature.
+    output_set = set(sub_graph.global_output_tensor_ids)
     for global_tensor_id in sub_graph.global_input_tensor_ids:
+        if global_tensor_id in output_set:
+            continue
         tensor_name = tensor_id_to_tensor_name_map[global_tensor_id]
         lines.append(f"    {tensor_name},  # global input tensor {global_tensor_id}")
     for global_tensor_id in sub_graph.global_output_tensor_ids:
@@ -100,13 +111,34 @@ def generate_entry_point(full_graph: Graph, sub_graphs: list[Graph], ctx: Contex
     entry_point_arg_list = []
     entry_point_impl_lines = []
     tensor_id_to_tensor_name_map = ctx.tensor_id_to_tensor_name_map
+
+    # Caller-provided tensors (the attention output ``o`` and any
+    # side-effect sinks such as ``Save`` outputs pointing into the
+    # cache) are already in ``full_graph.global_output_tensor_ids`` —
+    # their names are supplied by the user via
+    # ``ctx.tensor_id_to_tensor_name_map`` (e.g. ``"o"``, ``"cache['k']"``).
+    # We only allocate ``self.tensor_<id>`` buffers for *intermediate*
+    # RAGGED tensors that cross subgraph boundaries.
+    # A tensor is "caller-provided" if the user already wired a Python name
+    # for it (e.g. ``"o"``, ``"cache['k']"``). Side-effect sinks like
+    # ``Save`` end up in ``global_output_tensor_ids`` *and* the name map —
+    # we skip them. An intermediate that ended up flagged as a
+    # global-output (e.g. an unused tensor that survived DCE as a sink)
+    # without a user-provided name still needs a real buffer, so allocate.
     for sub_graph_id, sub_graph in enumerate(sub_graphs):
        for local_tensor_id in sub_graph.output_tensor_ids:
            t = sub_graph.tensor_list[local_tensor_id]
-           if t.tensor_id == 1:
-                continue  # skip output tensor "o"
-           assert t._format == FORMAT.RAGGED, f"Expected ragged tensor format for output tensors, got {t._format}"
-           memory_initiazation_lines.append(f"self.tensor_{t.tensor_id} = torch.empty(({ctx.max_num_blocks}, {t.shape[1]}, {t.shape[2]}), dtype=torch.{t.dtype}, device='{t.device}')") 
+           if t.tensor_id in tensor_id_to_tensor_name_map:
+                continue  # caller-provided ("o", cache fields, ...)
+           if t._format == FORMAT.RAGGED:
+               leading = ctx.max_num_blocks
+           elif t._format == FORMAT.BATCHED:
+               leading = ctx.max_bs * ctx.num_kv_heads
+           else:
+               raise AssertionError(
+                   f"Intermediate tensor must be RAGGED or BATCHED, got {t._format}"
+               )
+           memory_initiazation_lines.append(f"self.tensor_{t.tensor_id} = torch.empty(({leading}, {t.shape[1]}, {t.shape[2]}), dtype={t.dtype}, device='{t.device}')")
            tensor_id_to_tensor_name_map[t.tensor_id] = f"self.tensor_{t.tensor_id}"
     
     # Python forbids empty function bodies — fall back to ``pass`` when

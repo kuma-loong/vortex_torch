@@ -270,18 +270,23 @@ def _build_op_dag(
     output_tensor_to_op_list,
     op_to_input_tensor_list: List[List[int]],
     op_to_output_tensor_list,
-    final_output_tensor_id: int,
+    final_output_tensor_ids: List[int],
+    side_effect_op_ids: List[int] = (),
 ) -> Tuple[OpDAG, Set[int]]:
     """
-    Build an OpDAG containing only the ops reachable from the final output.
-    Nodes are stored in topological order (dependencies before dependents).
-    """
-    final_producer = output_tensor_to_op_list[final_output_tensor_id]
-    if final_producer is None:
-        raise RuntimeError(
-            f"final_output_tensor_id={final_output_tensor_id} has no producer op"
-        )
+    Build an OpDAG containing only the ops reachable from any of the
+    final output tensors. Nodes are stored in topological order
+    (dependencies before dependents).
 
+    A pipeline has three kinds of roots:
+      * the attention output ``tensor_id == 1``,
+      * tensors that are produced but have no in-graph consumer
+        (orphan sinks),
+      * side-effect ops such as ``Save`` that intentionally do not
+        claim their target tensor as a producer — passed via
+        ``side_effect_op_ids``.
+    All three seed the reverse DFS so their dependencies survive.
+    """
     visited: Set[int] = set()
     topo_order: List[int] = []
 
@@ -295,7 +300,17 @@ def _build_op_dag(
                 dfs(producer)
         topo_order.append(op_id)
 
-    dfs(final_producer)
+    for tid in final_output_tensor_ids:
+        producer = output_tensor_to_op_list[tid]
+        if producer is None:
+            # Fine: a cache-field target of a ``Save`` op has no producer
+            # in ``output_tensor_to_op_list`` by design; the Save op is
+            # seeded separately via ``side_effect_op_ids``.
+            continue
+        dfs(producer)
+
+    for op_id in side_effect_op_ids:
+        dfs(op_id)
 
     reachable: Set[int] = set(topo_order)
 
@@ -385,7 +400,7 @@ def _build_all_graphs(
     op_to_input_tensor_list: List[List[int]],
     op_to_output_tensor_list,
     tensor_to_consumers: DefaultDict[int, List[int]],
-    final_output_tensor_id: int,
+    final_output_tensor_ids: List[int],
 ) -> Tuple[Graph, List[Graph]]:
     """Convert the fused subgraph groups back into Graph objects."""
 
@@ -393,6 +408,7 @@ def _build_all_graphs(
         _as_tensor_id_list(x) for x in op_to_output_tensor_list
     ]
     topo_op_ids = op_dag.nodes
+    final_output_set: Set[int] = set(final_output_tensor_ids)
 
     # --- Full graph ---
     full_input_set: Set[int] = set()
@@ -410,7 +426,7 @@ def _build_all_graphs(
         global_op_to_output_tensor_list=op_to_output_tensor_list,
         selected_global_op_ids=topo_op_ids,
         global_input_tensor_ids=sorted(full_input_set),
-        global_output_tensor_ids=[final_output_tensor_id],
+        global_output_tensor_ids=sorted(final_output_set),
     )
 
     # --- Collect & topo-sort subgraphs ---
@@ -473,7 +489,7 @@ def _build_all_graphs(
 
         for op_id in sg_op_ids:
             for out_tid in op_to_output_tensor_ids[op_id]:
-                if out_tid == final_output_tensor_id:
+                if out_tid in final_output_set:
                     output_set.add(out_tid)
                     continue
                 for consumer in tensor_to_consumers.get(out_tid, []):
@@ -507,7 +523,34 @@ def contruct_graph(ctx: Context) -> Tuple[Graph, List[Graph]]:
     op_to_input_tensor_list: List[List[int]] = ctx.op_to_input_tensor_list
     op_to_output_tensor_list = ctx.op_to_output_tensor_list
 
-    final_output_tensor_id = 1
+    # --- consumer lookup (used both to derive the sink set and to decide
+    # which tensors cross subgraph boundaries in Phase 3) ---
+    tensor_to_consumers: DefaultDict[int, List[int]] = defaultdict(list)
+    for consumer_op_id, input_tids in enumerate(op_to_input_tensor_list):
+        for tid in input_tids:
+            tensor_to_consumers[tid].append(consumer_op_id)
+
+    # Terminal tensors that must survive DCE. Always include the
+    # attention output ``tensor_id == 1``; additionally include every
+    # tensor that is produced but has no in-graph consumer (orphan
+    # sinks); additionally include every cache-field target of a
+    # ``Save`` (these don't appear as "orphans" because their producer
+    # slot is intentionally left ``None`` to avoid a Load → Save cycle —
+    # see ``indexer/save_load.py``).
+    side_effect_op_ids: List[int] = list(getattr(ctx, "side_effect_op_ids", []))
+    save_target_tids = {
+        tid
+        for op_id in side_effect_op_ids
+        for tid in op_to_output_tensor_list[op_id]
+    }
+    final_output_tensor_ids: List[int] = sorted({
+        1,
+        *(
+            tid for tid, producer in enumerate(output_tensor_to_op_list)
+            if producer is not None and not tensor_to_consumers.get(tid)
+        ),
+        *save_target_tids,
+    })
 
     # ---------------------------------------------------------------
     # Phase 1: Convert to op-level DAG (ops as nodes, tensor edges)
@@ -517,7 +560,8 @@ def contruct_graph(ctx: Context) -> Tuple[Graph, List[Graph]]:
         output_tensor_to_op_list=output_tensor_to_op_list,
         op_to_input_tensor_list=op_to_input_tensor_list,
         op_to_output_tensor_list=op_to_output_tensor_list,
-        final_output_tensor_id=final_output_tensor_id,
+        final_output_tensor_ids=final_output_tensor_ids,
+        side_effect_op_ids=side_effect_op_ids,
     )
 
     # ---------------------------------------------------------------
@@ -528,11 +572,6 @@ def contruct_graph(ctx: Context) -> Tuple[Graph, List[Graph]]:
     # ---------------------------------------------------------------
     # Phase 3: Convert back to Graph objects (full + subgraphs)
     # ---------------------------------------------------------------
-    tensor_to_consumers: DefaultDict[int, List[int]] = defaultdict(list)
-    for consumer_op_id, input_tids in enumerate(op_to_input_tensor_list):
-        for tid in input_tids:
-            tensor_to_consumers[tid].append(consumer_op_id)
-
     full_graph, subgraphs = _build_all_graphs(
         op_dag=op_dag,
         uf=uf,
@@ -543,7 +582,7 @@ def contruct_graph(ctx: Context) -> Tuple[Graph, List[Graph]]:
         op_to_input_tensor_list=op_to_input_tensor_list,
         op_to_output_tensor_list=op_to_output_tensor_list,
         tensor_to_consumers=tensor_to_consumers,
-        final_output_tensor_id=final_output_tensor_id,
+        final_output_tensor_ids=final_output_tensor_ids,
     )
 
     return full_graph, subgraphs

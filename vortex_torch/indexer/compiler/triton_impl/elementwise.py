@@ -36,6 +36,14 @@ def generate_elementwise_impl(graph: Graph, op_id: int, ctx: Context) -> str:
         impl_lines = [
             f"tensor_{output_tensor_id}_block = {beta} * tensor_{input_tensor_id_0}_block + {alpha}",
         ]
+    elif op.op_type == ElementwiseOpType.Log:
+        impl_lines = [
+            f"tensor_{output_tensor_id}_block = tl.log({beta} * tensor_{input_tensor_id_0}_block + {alpha})",
+        ]
+    elif op.op_type == ElementwiseOpType.Exp:
+        impl_lines = [
+            f"tensor_{output_tensor_id}_block = tl.exp({beta} * tensor_{input_tensor_id_0}_block + {alpha})",
+        ]
 
     impl_str = "\n".join(impl_lines)
     return impl_str

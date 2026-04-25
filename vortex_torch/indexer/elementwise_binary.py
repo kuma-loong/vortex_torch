@@ -1,7 +1,7 @@
 import torch
 from typing import Tuple, Dict, Optional
 from .context import Context
-from ..abs import vTensor, as_vtensor, FORMAT, vOp
+from ..abs import vTensor, FORMAT, vOp
 from ..utils import ElementwiseBinaryOpType, Schedule
 
 class Elementwise_Binary(vOp):
@@ -40,10 +40,14 @@ class Elementwise_Binary(vOp):
     """
 
     # Dispatch table keyed by (x_format, y_format) -> resolved output format.
+    # Mixing BATCHED with RAGGED is allowed (e.g. broadcasting a per-(batch,
+    # head) summary from ``Reduce(dim=0)`` against a per-page RAGGED tensor).
     _impl_map: Dict[Tuple[FORMAT, FORMAT], FORMAT] = {
-        (FORMAT.RAGGED,  FORMAT.RAGGED): FORMAT.RAGGED,
-        (FORMAT.BATCHED, FORMAT.PAGED):  FORMAT.RAGGED,
-        (FORMAT.RAGGED,  FORMAT.PAGED):  FORMAT.RAGGED,
+        (FORMAT.RAGGED,  FORMAT.RAGGED):  FORMAT.RAGGED,
+        (FORMAT.BATCHED, FORMAT.PAGED):   FORMAT.RAGGED,
+        (FORMAT.RAGGED,  FORMAT.PAGED):   FORMAT.RAGGED,
+        (FORMAT.BATCHED, FORMAT.RAGGED):  FORMAT.RAGGED,
+        (FORMAT.RAGGED,  FORMAT.BATCHED): FORMAT.RAGGED,
         # Add more pairs as needed.
     }
 
@@ -138,13 +142,13 @@ class Elementwise_Binary(vOp):
         C_out = max(x.shape[1], y.shape[1])
         D_out = max(x.shape[2], y.shape[2])
 
-        # Allocate output buffer on x.device with x.dtype
-        # S = ctx.max_num_pages
-        self.output_buffer = as_vtensor(torch.empty(
-            (0, C_out, D_out),
+        # Pure-metadata vTensor — no torch.empty allocation needed.
+        self.output_buffer = vTensor(
+            shape=(0, C_out, D_out),
+            dtype=ctx.vortex_dtype,
             device=x.device,
-            dtype=x.dtype,
-        ), self.output_format, tensor_id=len(ctx.tensor_list)  # Assign a new tensor_id based on current tensor count
+            _format=self.output_format,
+            tensor_id=len(ctx.tensor_list),
         )
         # Track auxiliary memory and graph structure in the context
         ctx.tensor_list.append(self.output_buffer)  # Track the output buffer in the context
@@ -272,3 +276,59 @@ class Multiply(Elementwise_Binary):
         super().__init__(alpha, beta)
         self.op_type = ElementwiseBinaryOpType.Mul
 
+
+class WhereEqual(Elementwise_Binary):
+    r"""
+    Comparison mask encoded as ``0`` or ``-inf``.
+
+    This operator compares the two inputs elementwise and emits:
+
+    .. math::
+
+        \operatorname{out}(x, y) =
+        \begin{cases}
+            0, & x = y \\
+            -\infty, & x \ne y
+        \end{cases}
+
+    The output is intended for masking score tensors before downstream
+    operators such as softmax.
+    """
+    def __init__(self):
+        super().__init__()
+        self.op_type = ElementwiseBinaryOpType.WhereEqual
+
+
+class WhereNotEqual(Elementwise_Binary):
+    r"""Emit ``0`` where ``x != y`` and ``-inf`` otherwise."""
+    def __init__(self):
+        super().__init__()
+        self.op_type = ElementwiseBinaryOpType.WhereNotEqual
+
+
+class WhereGreater(Elementwise_Binary):
+    r"""Emit ``0`` where ``x > y`` and ``-inf`` otherwise."""
+    def __init__(self):
+        super().__init__()
+        self.op_type = ElementwiseBinaryOpType.WhereGreater
+
+
+class WhereGreaterEqual(Elementwise_Binary):
+    r"""Emit ``0`` where ``x >= y`` and ``-inf`` otherwise."""
+    def __init__(self):
+        super().__init__()
+        self.op_type = ElementwiseBinaryOpType.WhereGreaterEqual
+
+
+class WhereLess(Elementwise_Binary):
+    r"""Emit ``0`` where ``x < y`` and ``-inf`` otherwise."""
+    def __init__(self):
+        super().__init__()
+        self.op_type = ElementwiseBinaryOpType.WhereLess
+
+
+class WhereLessEqual(Elementwise_Binary):
+    r"""Emit ``0`` where ``x <= y`` and ``-inf`` otherwise."""
+    def __init__(self):
+        super().__init__()
+        self.op_type = ElementwiseBinaryOpType.WhereLessEqual

@@ -35,6 +35,10 @@ def generate_elementwise_impl(graph: Graph, op_id: int, ctx: Context) -> str:
         return f"{y} = tl.abs({b} * {x} + {a})"
     if op.op_type == ElementwiseOpType.Add_Mul:
         return f"{y} = {b} * {x} + {a}"
+    if op.op_type == ElementwiseOpType.Log:
+        return f"{y} = tl.log({b} * {x} + {a})"
+    if op.op_type == ElementwiseOpType.Exp:
+        return f"{y} = tl.exp({b} * {x} + {a})"
 
     raise NotImplementedError(
         f"Elementwise op_type {op.op_type!r} is not yet wired in cache codegen"

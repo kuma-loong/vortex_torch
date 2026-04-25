@@ -1,83 +1,33 @@
 import torch
-from ..abs import vOp
+from ..abs import vOp, vTensor, FORMAT
 from .context import Context
-from .triton_kernels.fill_impl import fill_p
-from ..abs import vTensor, FORMAT
 from ..utils import Schedule
-from typing import Dict, Callable, Optional
+from typing import FrozenSet
+
 
 class Fill(vOp):
     r"""
-    In-place page-wise fill dispatcher.
+    In-place page-wise fill dispatcher (codegen path only).
 
-    This operator performs an in-place, format-aware fill over a batched
-    tensor. The input is treated as a rank-3 tensor
-
-    .. math::
-
-        X \in \mathbb{R}^{B \times D_0 \times D_1},
-
-    where:
-
-    - :math:`B` is a batch-like axis (for example, batch * heads),
-    - :math:`D_0, D_1` encode per-page/per-token features.
-
-    Using per-position metadata stored in ``loc`` together with layout
-    information in :class:`Context`, the implementation identifies
-    positions where a page has reached its logical end (e.g. an
-    end-of-page or end-of-sequence condition) and fills the corresponding
-    tiles with a scalar value :attr:`alpha`:
-
-    .. math::
-
-        X[b, d_0, d_1] \leftarrow \alpha
-        \quad \text{for all positions } (b, d_0, d_1)
-        \text{ that lie past the end-of-page mark.}
-
-    All modifications are performed in-place; the tensor format
-    (PAGED, RAGGED, etc.) determines how page boundaries are interpreted
-    and which elements are affected.
-
-    Key properties
-    --------------
-    - Dispatch is keyed only by the input tensor format ``x._format``.
-    - The operator is purely in-place: no output buffer is allocated.
-    - The same :class:`vTensor` is returned from :meth:`profile`.
+    Overwrites selected page tiles of a rank-3 tensor with a scalar
+    ``alpha``. Structurally a **pure producer** of its input tensor:
+    ``Fill`` takes no graph-level inputs, and its output tensor id is
+    the same as the input tensor id (cache field being initialized).
 
     Attributes
     ----------
-    _impl_map : Dict[FORMAT, Callable]
-        Dispatch table keyed by ``x_format``. Each entry maps to a
-        callable implementation that performs the in-place fill.
-
+    _supported_formats : FrozenSet[FORMAT]
+        Input formats for which a codegen implementation exists.
     alpha : float
         Scalar fill value written into selected positions.
-
-    impl : Optional[Callable]
-        The resolved implementation selected during :meth:`profile`.
     """
 
-    # Implementation registry keyed by x_format.
-    # Expected impl signature: impl(x: torch.Tensor, loc: torch.Tensor, ctx: Context, alpha: float) -> None
-    _impl_map: Dict[FORMAT, Callable] = {
-        FORMAT.PAGED: fill_p,  # e.g., wraps `fill_p_kernel` (page-major in-place fill)
-        # Add more entries if you support other layouts, e.g.:
-        # FORMAT.RAGGED: fill_r,
-    }
+    # Supported input formats; only PAGED is wired up for now.
+    _supported_formats: FrozenSet[FORMAT] = frozenset({FORMAT.PAGED})
 
     def __init__(self, alpha: float = 0.0):
-        r"""
-        Initialize an in-place fill operator.
-
-        Parameters
-        ----------
-        alpha : float, optional
-            Scalar fill value used to overwrite positions after the
-            end-of-page condition is met. Default is ``0.0``.
-        """
         super().__init__()
         self.alpha = alpha
-        self.impl: Optional[Callable] = None
         # Cache fill fuses into the per-block kernel — see
         # ``cache.compiler.triton_impl.kernel_gen``.
         self.schedule = Schedule.W
@@ -85,41 +35,18 @@ class Fill(vOp):
     # ---------------- profile ----------------
     def profile(self, x: vTensor, loc: torch.Tensor, ctx: Context) -> vTensor:
         r"""
-        Validate inputs and select the in-place implementation.
+        Validate inputs and register this op in the cache graph.
 
-        Since the operation is in-place, no output buffer is allocated and
-        this method simply returns the input :class:`vTensor` unmodified.
-
-        Parameters
-        ----------
-        x : vTensor
-            Input tensor to be modified in-place. Expected logical shape
-            ``[B, D_0, D_1]``.
-
-        loc : torch.Tensor
-            Auxiliary tensor carrying page/position metadata used to
-            detect end-of-page locations.
-
-        ctx : Context
-            Execution context providing layout information and any
-            additional metadata needed by the implementation.
-
-        Returns
-        -------
-        vTensor
-            The same object as ``x``, returned as the output view.
-
-        Raises
-        ------
-        AssertionError
-            If ``x`` is not a :class:`vTensor`, if its rank is not 3, if
-            ``loc`` is not a :class:`torch.Tensor`, or if no
-            implementation is registered for ``x._format``.
+        ``Fill`` is a pure producer of ``x``: it overwrites ``x`` with a
+        constant and claims ``x``'s producer slot (mirroring
+        :class:`indexer.save_load.Save`). The same :class:`vTensor` is
+        returned so downstream ops can continue to reference ``x``.
         """
         prefix = self._prefix()
 
-        # Type & rank checks
-        assert isinstance(x, vTensor), f"{prefix}profile expects x to be vTensor, got {type(x)}"
+        assert isinstance(x, vTensor), (
+            f"{prefix}profile expects x to be vTensor, got {type(x)}"
+        )
         assert isinstance(loc, torch.Tensor), (
             f"{prefix}profile expects loc to be torch.Tensor, got {type(loc)}"
         )
@@ -128,61 +55,15 @@ class Fill(vOp):
             f"got ndim={x.dim()} shape={tuple(x.shape)}"
         )
 
-        # Dispatch by input format
-        x_fmt = x._format
-        assert x_fmt in self._impl_map, (
-            f"{prefix}no implementation for x_fmt={x_fmt}. "
-            f"Available keys: {list(self._impl_map.keys())}"
+        assert x._format in self._supported_formats, (
+            f"{prefix}no implementation for x_fmt={x._format}. "
+            f"Supported: {sorted(self._supported_formats, key=lambda f: f.value)}"
         )
-        self.impl = self._impl_map[x_fmt]
 
-        # Register in the cache graph as a pure producer of ``x``. ``Fill``
-        # has no graph inputs — it overwrites ``x`` with a constant — so we
-        # claim ``x``'s producer slot (mirrors ``indexer.save_load.Save``).
+        # Register in the cache graph as a pure producer of ``x``.
         ctx.output_tensor_to_op_list[x.tensor_id] = len(ctx.op_list)
         ctx.op_list.append(self)
         ctx.op_to_input_tensor_list.append([])
         ctx.op_to_output_tensor_list.append([x.tensor_id])
 
-        # In-place: return the same vTensor view
-        return x
-
-    # ---------------- execute ----------------
-    def execute(self, x: torch.Tensor, loc: torch.Tensor, ctx: Context) -> torch.Tensor:
-        r"""
-        Execute the in-place page-wise fill and return the input tensor.
-
-        The selected implementation examines page/position metadata in
-        ``loc`` and context, and overwrites elements in ``x`` with the
-        scalar value :attr:`alpha` once an end-of-page condition is
-        detected.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input tensor to be modified in-place. Must be compatible with
-            the :class:`vTensor` validated in :meth:`profile`.
-
-        loc : torch.Tensor
-            Auxiliary tensor carrying page/position metadata.
-
-        ctx : Context
-            Execution context forwarded to the implementation.
-
-        Returns
-        -------
-        torch.Tensor
-            The same tensor instance ``x``, after in-place filling.
-
-        Raises
-        ------
-        AssertionError
-            If :meth:`profile` has not been called and no implementation
-            is available.
-        """
-        prefix = self._prefix()
-        assert self.impl is not None, f"{prefix}execute called before profile() (impl is None)"
-
-        # Expected signature: impl(x, loc, ctx, alpha)
-        self.impl(x, loc, ctx, self.alpha)
         return x

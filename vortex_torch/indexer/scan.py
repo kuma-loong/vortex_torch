@@ -1,7 +1,7 @@
 import torch
 from typing import Dict, Optional
 from .context import Context
-from ..abs import vTensor, FORMAT, vOp, as_vtensor
+from ..abs import vTensor, FORMAT, vOp
 from ..utils import Schedule
 
 class Softmax(vOp):
@@ -145,11 +145,12 @@ class Softmax(vOp):
         )
         self.output_format = self._impl_map[x_fmt]
 
-        self.output_buffer = as_vtensor(torch.empty(
-            (0, x.shape[1], x.shape[2]),
+        self.output_buffer = vTensor(
+            shape=(0, x.shape[1], x.shape[2]),
+            dtype=ctx.vortex_dtype,
             device=x.device,
-            dtype=x.dtype,
-        ), self.output_format, tensor_id=len(ctx.tensor_list)  # Assign a new tensor_id based on current tensor count
+            _format=self.output_format,
+            tensor_id=len(ctx.tensor_list),
         )
         # Track auxiliary memory and graph structure in the context
         ctx.tensor_list.append(self.output_buffer)  # Track the output buffer in the context
@@ -300,11 +301,12 @@ class Normalize(vOp):
         )
         self.output_format = self._impl_map[x_fmt]
 
-        self.output_buffer = as_vtensor(torch.empty(
-            (0, x.shape[1], x.shape[2]),
+        self.output_buffer = vTensor(
+            shape=(0, x.shape[1], x.shape[2]),
+            dtype=ctx.vortex_dtype,
             device=x.device,
-            dtype=x.dtype,
-        ), self.output_format, tensor_id=len(ctx.tensor_list)  # Assign a new tensor_id based on current tensor count
+            _format=self.output_format,
+            tensor_id=len(ctx.tensor_list),
         )
         # Track auxiliary memory and graph structure in the context
         ctx.tensor_list.append(self.output_buffer)  # Track the output buffer in the context
@@ -448,13 +450,11 @@ class Conv1d(vOp):
         )
         self.output_format = self._impl_map[x_fmt]
 
-        self.output_buffer = as_vtensor(
-            torch.empty(
-                (0, x.shape[1], x.shape[2]),
-                device=x.device,
-                dtype=x.dtype,
-            ),
-            self.output_format,
+        self.output_buffer = vTensor(
+            shape=(0, x.shape[1], x.shape[2]),
+            dtype=ctx.vortex_dtype,
+            device=x.device,
+            _format=self.output_format,
             tensor_id=len(ctx.tensor_list),
         )
 

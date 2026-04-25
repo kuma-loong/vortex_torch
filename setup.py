@@ -32,23 +32,13 @@ def _normalize_single_arch(arch: str):
     raise ValueError(f"Unsupported CUDA arch format: {arch}")
 
 
-def get_cuda_gencode_flags(include_ptx: bool = False):
+def _resolve_cuda_capabilities():
     """
-    Generate NVCC -gencode flags automatically.
+    Resolve the set of target CUDA capabilities as (major, minor) tuples.
 
     Priority:
     1. TORCH_CUDA_ARCH_LIST environment variable
     2. Detect capabilities from visible local GPUs via torch.cuda
-
-    Args:
-        include_ptx: Whether to also emit PTX fallback flags.
-
-    Returns:
-        A list of NVCC flags such as:
-        [
-            "-gencode=arch=compute_89,code=sm_89",
-            "-gencode=arch=compute_90,code=sm_90",
-        ]
     """
     arch_list_env = os.environ.get("TORCH_CUDA_ARCH_LIST", "").strip()
     capabilities = set()
@@ -71,8 +61,25 @@ def get_cuda_gencode_flags(include_ptx: bool = False):
                 major, minor = torch.cuda.get_device_capability(device_idx)
                 capabilities.add((major, minor))
 
+    return capabilities
+
+
+def get_cuda_gencode_flags(include_ptx: bool = False):
+    """
+    Generate NVCC -gencode flags automatically.
+
+    Args:
+        include_ptx: Whether to also emit PTX fallback flags.
+
+    Returns:
+        A list of NVCC flags such as:
+        [
+            "-gencode=arch=compute_89,code=sm_89",
+            "-gencode=arch=compute_90,code=sm_90",
+        ]
+    """
     flags = []
-    for major, minor in sorted(capabilities):
+    for major, minor in sorted(_resolve_cuda_capabilities()):
         compute = f"compute_{major}{minor}"
         sm = f"sm_{major}{minor}"
         flags.append(f"-gencode=arch={compute},code={sm}")
@@ -83,9 +90,15 @@ def get_cuda_gencode_flags(include_ptx: bool = False):
     return flags
 
 
+_cuda_caps = _resolve_cuda_capabilities()
+
 nvcc_flags = [
     "-O3",
 ] + get_cuda_gencode_flags(include_ptx=False)
+
+# Enable FP8 (e4m3fn, e5m2) code paths only when at least one target arch is sm_90+.
+if any(cap >= (9, 0) for cap in _cuda_caps):
+    nvcc_flags.append("-DVORTEX_ENABLE_FP8")
 
 
 setup(

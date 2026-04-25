@@ -19,11 +19,12 @@ class ContextBase(ABC):
     minimal and consistent.
     """
     
-    __slots__ = ("name", "mode", "_created")
+    __slots__ = ("name", "mode", "_created", "vortex_dtype")
 
     name: str                                #: Human-readable context name.
     mode: Literal["profile", "execute"]      #: Current operating mode.
     _created: bool                           #: Backing flag for ``created`` property.
+    vortex_dtype: torch.dtype                #: Intermediate-tensor dtype (default ``torch.bfloat16``).
     
     @property
     def created(self) -> bool:

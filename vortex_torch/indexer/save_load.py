@@ -1,7 +1,7 @@
 import torch
 from typing import Dict, Optional
 from .context import Context
-from ..abs import vTensor, as_vtensor, FORMAT, vOp
+from ..abs import vTensor, FORMAT, vOp
 from ..utils import Schedule
 
 class Save(vOp):
@@ -126,13 +126,23 @@ class Save(vOp):
             f"(x.device={x.device}, o.device={o.device})"
         )
 
-        # Track in the context graph. Save claims `o` as its produced tensor
-        # (mirrors the topK pattern): we override `o`'s producer slot with
-        # this op so that downstream consumers correctly depend on Save.
-        ctx.output_tensor_to_op_list[o.tensor_id] = len(ctx.op_list)
+        # Save is a *side-effect writer*: the op stores back into a
+        # caller-provided cache field. We intentionally do NOT claim
+        # ``o.tensor_id`` as Save's producer in ``output_tensor_to_op_list``
+        # — if Load elsewhere in the graph reads the same cache field, it
+        # must see the previous-step value, not Save's updated value, and
+        # overriding the producer slot would create a Load → Save cycle
+        # through the DAG.
+        #
+        # Instead we register the op's id in ``side_effect_op_ids``; the
+        # compiler seeds its op-DFS from that set so Save survives DCE,
+        # and the target tensor is promoted to a final output so the
+        # subgraph emits a ``tl.store`` for it.
+        save_op_id = len(ctx.op_list)
         ctx.op_list.append(self)
         ctx.op_to_input_tensor_list.append([x.tensor_id])
         ctx.op_to_output_tensor_list.append([o.tensor_id])
+        ctx.side_effect_op_ids.append(save_op_id)
 
         return o
 
@@ -237,17 +247,14 @@ class Load(vOp):
         )
         self.output_format = self._impl_map[x_fmt]
 
-        # Allocate output buffer [S_out, D0, D1] as a vTensor with a fresh
-        # tensor_id, mirroring the Softmax pattern so the compiler graph
-        # can track the new buffer as a node.
+        # Pure-metadata vTensor with a fresh tensor_id, mirroring the
+        # Softmax pattern so the compiler graph can track the buffer.
         D0, D1 = x.shape[1], x.shape[2]
-        self.output_buffer = as_vtensor(
-            torch.empty(
-                (0, D0, D1),
-                device=x.device,
-                dtype=x.dtype,
-            ),
-            self.output_format,
+        self.output_buffer = vTensor(
+            shape=(0, D0, D1),
+            dtype=ctx.vortex_dtype,
+            device=x.device,
+            _format=self.output_format,
             tensor_id=len(ctx.tensor_list),
         )
 
