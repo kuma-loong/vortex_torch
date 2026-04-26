@@ -123,6 +123,7 @@ setup(
                 "csrc/utils_sglang_v2.cu",
                 "csrc/topk.cu",
                 "csrc/topk_v2.cu",
+                "csrc/approx_topk.cu",
             ],
             include_dirs=["csrc"],
             extra_compile_args={

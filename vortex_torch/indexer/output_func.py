@@ -161,3 +161,77 @@ class topK(vOp):
         ctx.op_list.append(self)  # Track this operation in the context
         ctx.op_to_input_tensor_list.append([x.tensor_id])  # Map this op to its input tensors
         ctx.op_to_output_tensor_list.append([o.tensor_id])  # Map this op to its output tensor
+
+
+class approxTopK(topK):
+    r"""
+    Approximate top-k page selector with bounded approximation.
+
+    Drop-in replacement for :class:`topK` that swaps the exact selection
+    kernel for an **adaptive 8-bit radix top-k** with a tunable
+    cost/quality knob ``tolerate_ratio``.
+
+    The radix kernel runs up to four 8-bit refinement rounds (32 bits
+    total) on fp32-promoted scores. After each round, the threshold bin
+    is found and ``topk_remaining`` is the number of slots still owed
+    by that bin. The kernel **stops early** as soon as
+
+    .. math::
+
+        \text{topk\_remaining} \;\le\; \text{tolerate\_ratio} \cdot
+        \text{target\_k},
+
+    filling the remaining slots from the current candidate set in
+    atomic-arrival order. The trade-off:
+
+    - ``tolerate_ratio = 0.0`` → all four rounds always run; result is
+      bit-exact to :class:`topK` (sorted output is the only difference —
+      this kernel emits unsorted indices, which `topK` semantics allow).
+    - ``tolerate_ratio = 1.0`` → kernel always stops after round 0,
+      cheapest setting. Selection becomes coarse: the top page-bin is
+      retained but ordering inside it is arrival-driven.
+    - ``0 < tolerate_ratio < 1`` → adaptive: cheap when scores are
+      well-separated, refines when they're tightly bunched.
+
+    The output set still always contains the reserved BOS / EOS pages
+    plus exactly ``topk_val`` chosen pages — only the *selection
+    quality* is traded for speed.
+
+    Parameters
+    ----------
+    tolerate_ratio : float, default 0.0
+        Approximation budget in ``[0.0, 1.0]``. Higher = cheaper but
+        looser. ``0.0`` recovers exact (radix) top-k. Typical values
+        for throughput hunting: ``0.05 - 0.15``.
+
+    Notes
+    -----
+    - Same dispatch as :class:`topK` (only ``RAGGED`` input format).
+    - Same per-segment contract (BOS/EOS preserved, ``topk_val`` chosen).
+    - Output indices are **unsorted within each segment** (this matches
+      ``topk_output_v2`` in the C kernel; downstream consumers must not
+      assume sorted order).
+    - Use this op when score distributions are heavy-tailed and the
+      exact top-k cost dominates indexer time. For score distributions
+      where many candidates are near the threshold, low
+      ``tolerate_ratio`` (≤ 0.05) is safer; for distributions with a
+      clear gap between selected and dropped pages, push higher
+      (0.2 - 0.5).
+    """
+
+    def __init__(self, tolerate_ratio: float = 0.0):
+        super().__init__()
+        try:
+            tol = float(tolerate_ratio)
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"approxTopK: tolerate_ratio must be a number in [0.0, 1.0], "
+                f"got {tolerate_ratio!r}"
+            ) from e
+        if not (0.0 <= tol <= 1.0):
+            raise ValueError(
+                f"approxTopK: tolerate_ratio={tol} out of range [0.0, 1.0]. "
+                f"0.0 = exact (4 rounds); 1.0 = cheapest single-round; "
+                f"typical sweet spot 0.05 - 0.15."
+            )
+        self.tolerate_ratio = tol

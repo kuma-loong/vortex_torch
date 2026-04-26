@@ -19,7 +19,7 @@ Under this fiction:
 |---|---|---|
 | `q` | `[1, H_q, D]` | the current query (one position). `H_q` is the number of query heads grouped to one kv head; `D` is the feature dim |
 | every `cache["<name>"]` | `[S, D_0, D_1]` | a per-page field with `S` pages laid out along the leading axis. `(D_0, D_1)` is whatever inner shape you declared in `create_cache` |
-| `o` | opaque | a buffer the framework hands you. Your only job is to call `topK(score, o, ctx)` to fill it |
+| `o` | opaque | a buffer the framework hands you. Your only job is to call `topK(score, o, ctx)` (exact) or `approxTopK(tolerate_ratio=…)(score, o, ctx)` (faster, approximate) to fill it |
 
 That is the whole surface. You describe the single-sequence compute and
 the framework takes care of running it everywhere it needs to run.
@@ -29,7 +29,7 @@ the framework takes care of running it everywhere it needs to run.
 ## 2. The goal (the only constraint you must satisfy)
 
 Produce a **`[S, 1, 1]` score tensor** — one scalar per page — and hand
-it to `topK`:
+it to `topK` (or its faster approximate variant `approxTopK`):
 
 ```python
 self.output_func(score, o, ctx=ctx)   # score.shape == [S, 1, 1]
@@ -38,6 +38,17 @@ self.output_func(score, o, ctx=ctx)   # score.shape == [S, 1, 1]
 `topK` selects the top-`k` pages per sequence using the score and writes
 the surviving page indices to `o`. Downstream, flashinfer attends only
 to those pages.
+
+Two terminal-op choices:
+
+- **`topK()`** — exact top-k (sorted output). Use unless `topK` cost
+  shows up as a bottleneck.
+- **`approxTopK(tolerate_ratio=0.0..1.0)`** — adaptive 8-bit radix
+  variant with a quality / cost knob. `0.0` = exact, `1.0` =
+  cheapest-possible single-round, in between = adaptive. Same
+  `(score, o, ctx=ctx)` call shape; same BOS/EOS reservation;
+  output indices unsorted within each segment. See
+  `indexer_op.md §9` for the full math + tuning guidance.
 
 Every op between `forward_indexer(self, q, o, cache, ctx)` and
 `self.output_func(score, o, ctx)` just transforms `[S, D_0, D_1]` tensors
@@ -351,7 +362,119 @@ If you don't need state to persist across steps, don't use `Save`/`Load`
 
 ---
 
-## 10. What you DON'T write
+## 10. Choosing the terminal op: `topK` vs `approxTopK`
+
+Every `forward_indexer` ends with one terminal call that consumes a
+`[S, 1, 1]` score and writes the chosen page-id set into `o`. You
+have **two** choices:
+
+### `topK()` — exact, the default
+
+```python
+self.output_func = topK()
+...
+self.output_func(score, o, ctx=ctx)
+```
+
+Picks the strictly top-`k` pages by descending score. `k` is the
+runtime constant `ctx.topk_val` (configured via `vortex_topk_val` /
+`vortex_topk_ratio`); the call doesn't take a `k` argument. BOS / EOS
+reservations are layered on automatically. **Use this unless `topK`
+shows up as a measurable cost in the indexer path.**
+
+### `approxTopK(tolerate_ratio)` — adaptive radix, faster
+
+Drop-in replacement with a quality / cost knob:
+
+```python
+self.output_func = approxTopK(tolerate_ratio=0.20)
+...
+self.output_func(score, o, ctx=ctx)   # SAME call shape
+```
+
+Runs an adaptive 8-bit radix top-k (up to four 8-bit refinement
+rounds = 32 bits). After each round, if the slots still owed by the
+threshold bin are within `tolerate_ratio · target_k`, the kernel
+**stops early** and fills those slots in arrival order from the
+current candidate set. The trade-off is a single dial:
+
+| `tolerate_ratio` | behavior | when to pick |
+|---|---|---|
+| `0.0` | all 4 rounds always run; bit-exact top-k | parity test against `topK()` |
+| `0.05 - 0.15` | adaptive: cheap on well-separated scores, refines on tight ones | **typical sweep range** for throughput hunting |
+| `0.50 - 1.0` | aggressive early-exit; selection becomes coarse | scores have a clear gap between selected and dropped pages, and you'll trade quality for speed |
+
+Same per-segment contract as `topK`: BOS / EOS preserved, exactly
+`topk_val` chosen. Only the *selection quality* moves; the slot
+**count** is identical.
+
+**Output ordering caveat.** `approxTopK` emits indices in
+**unsorted** order within each segment (matches the underlying
+`topk_output_v2` C kernel). The framework's downstream consumers
+treat the kv-indices as a set, so you don't need to care — but if
+you ever inspect the `kv_indices` tensor by hand, don't assume
+sorted.
+
+### Worked example: GQA-Quest with approximate selection
+
+Taking [`gqa_quest_sparse_attention`](../../vortex_torch/flow/algorithms.py)
+and swapping the terminal op:
+
+```python
+from vortex_torch.indexer import (
+    approxTopK, Multiply, Maximum, Sum, Max,
+)
+from vortex_torch.cache import Max as CMax, Min as CMin
+
+@register("gqa_quest_approx_cls")
+class GQAQuestApprox(vFlow):
+    def __init__(self):
+        super().__init__()
+        self.mul_max  = Multiply()
+        self.mul_min  = Multiply()
+        self.maximum  = Maximum()
+        self.sum      = Sum(dim=2)
+        self.max_op   = Max(dim=1)
+        self.output_func = approxTopK(tolerate_ratio=0.1)   # ← only difference
+        self.cmax = CMax(dim=1)
+        self.cmin = CMin(dim=1)
+
+    def create_cache(self, block_size, head_dim):
+        return {"max": (1, head_dim), "min": (1, head_dim)}
+
+    def forward_cache(self, cache, loc, ctx):
+        self.cmax(cache["k"], cache["max"], loc=loc, ctx=ctx)
+        self.cmin(cache["k"], cache["min"], loc=loc, ctx=ctx)
+
+    def forward_indexer(self, q, o, cache, ctx):
+        s_max = self.mul_max(q, cache["max"], ctx=ctx)
+        s_min = self.mul_min(q, cache["min"], ctx=ctx)
+        s     = self.maximum(s_max, s_min, ctx=ctx)
+        score = self.sum(s, ctx=ctx)
+        aggr  = self.max_op(score, ctx=ctx)
+        self.output_func(aggr, o, ctx=ctx)
+```
+
+The fused score-chain kernel is byte-identical to the `topK`
+version; only the terminal call site changes from `topk_output(...)`
+to `approx_topk_output(..., 0.25)`. This is the cleanest "free
+throughput" lever to sweep across a batch — try `tolerate_ratio ∈
+{0.0, 0.05, 0.10, 0.20, 0.30}` against the same score chain.
+
+### When NOT to use `approxTopK`
+
+- For new flows where the score chain itself is uncharacterized —
+  use exact `topK()` first to establish an accuracy floor, then
+  swap.
+- When downstream code or a debug print actually depends on sorted
+  output ordering. (Production decode does not — the framework
+  treats kv-indices as a set.)
+
+See [`indexer_op.md §9`](indexer_op.md) for the full math reference.
+
+---
+
+## 11. What you DON'T write
 
 Explicitly, the framework handles all of these — your `forward_indexer`
 body should never mention them:
@@ -372,7 +495,7 @@ re-read the op you wanted and see whether its logical semantics on
 
 ---
 
-## 11. Common recipes
+## 12. Common recipes
 
 | you want | how to do it |
 |---|---|
@@ -387,7 +510,7 @@ re-read the op you wanted and see whether its logical semantics on
 
 ---
 
-## 12. Pitfalls that trip people up
+## 13. Pitfalls that trip people up
 
 1. **Don't reuse an op instance.** `self.mul = Multiply()` used twice is
    a bug — each call site needs its own instance. Declare
@@ -403,7 +526,8 @@ re-read the op you wanted and see whether its logical semantics on
    already does what you want.
 3. **Your chain must end in `[S, 1, 1]`.** If you've got a stray `H_q`
    or `D` axis left over, fold it with `Mean` / `Max` / `Sum` before
-   calling `topK`. The `_impl_map` in `topK` will reject anything else.
+   calling `topK` (or `approxTopK`). The dispatch in both ops will
+   reject anything else.
 4. **`create_cache` declares inner shapes only.** Returning
    `{"centroids": (1, head_dim)}` tells the framework "each block owns
    one vector of size `head_dim`". The leading `S` axis is synthesised
@@ -415,7 +539,7 @@ re-read the op you wanted and see whether its logical semantics on
 
 ---
 
-## 13. Debugging checklist when a flow compiles but doesn't seem to work
+## 14. Debugging checklist when a flow compiles but doesn't seem to work
 
 1. Write the shapes as comments after every op:
    `score = self.sum(s, ctx=ctx)  # [S, H_q, 1]`. If you can't predict a
@@ -435,10 +559,11 @@ re-read the op you wanted and see whether its logical semantics on
 
 ---
 
-## 14. Mental-model summary
+## 15. Mental-model summary
 
 - `q: [1, H_q, D]`, each `cache["name"]: [S, D_0, D_1]`.
 - Compose ops with NumPy-style broadcasting to produce `score: [S, 1, 1]`.
-- `topK(score, o, ctx)` → done.
+- `topK(score, o, ctx)` (exact) **or**
+  `approxTopK(tolerate_ratio=…)(score, o, ctx)` (faster, see §10) → done.
 - `Reduce(dim=0)` is your escape hatch for per-sequence summaries.
 - Everything else is the framework's problem. Trust it.

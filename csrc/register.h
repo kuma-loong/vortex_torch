@@ -96,6 +96,19 @@ const int64_t       reserved_eos,
 const int64_t       max_seq_lengths
 );
 
+void approx_topk_output(
+const at::Tensor&   x,
+const at::Tensor&   dense_kv_indptr,
+const at::Tensor&   sparse_kv_indptr,
+const at::Tensor&   dense_kv_indices,
+at::Tensor&         sparse_kv_indices,
+const int64_t       eff_batch_size,
+const int64_t       reserved_bos,
+const int64_t       reserved_eos,
+const int64_t       max_seq_lengths,
+const double        tolerate_ratio
+);
+
 void sglang_plan_decode_fa3(
 const at::Tensor&   cached_seq_lens,
 at::Tensor&         dense_kv_indptr,

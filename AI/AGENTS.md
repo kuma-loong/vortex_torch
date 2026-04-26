@@ -112,9 +112,14 @@ The user's mental model (used throughout the tutorials):
    `self.mul_b = Multiply()` — don't share.
 3. **Don't declare `"k"` or `"v"` in `create_cache`.** The framework
    hard-asserts against that and auto-provides both.
-4. **`forward_indexer` must end in `topK(score, o, ctx=ctx)` where
-   `score.shape == [S, 1, 1]`.** Fold any stray `H_q` / `D` axes with
-   `Mean` / `Max` / `Sum` before calling `topK`.
+4. **`forward_indexer` must end in either
+   `topK(score, o, ctx=ctx)` or
+   `approxTopK(tolerate_ratio=…)(score, o, ctx=ctx)`** with
+   `score.shape == [S, 1, 1]`. Fold any stray `H_q` / `D` axes with
+   `Mean` / `Max` / `Sum` first. `approxTopK` is the throughput-
+   oriented variant (adaptive 8-bit radix; `tolerate_ratio ∈
+   [0.0, 1.0]`, `0.0` = exact, higher = cheaper-but-looser; output
+   indices unsorted within each segment).
 5. **Every declared cache field needs a writer and a reader.** A
    field nobody writes stays silently at stale bytes; a field nobody
    reads is wasted bandwidth.
@@ -125,6 +130,13 @@ The user's mental model (used throughout the tutorials):
    the first `Load` on a freshly-allocated block reads uninitialised
    memory. See the running-average example in
    `program_forward_indexer.md §9` and `program_forward_cache.md §6b`.
+8. **If the indexer uses `Save(...)`, the engine JSON must set
+   `"disable_radix_cache": true`.** Without it, sglang's prefix-radix
+   cache shares the Save'd per-request state across requests with
+   matching prompt prefixes — silently corrupting Save/Load values
+   across decode batches. Pre-flight (`check_engine_config`) rejects
+   any submission that violates this rule. The default is `false`,
+   so submissions that don't use `Save(...)` may omit the field.
 
 ---
 
@@ -139,7 +151,7 @@ from typing import Dict
 from vortex_torch.flow    import vFlow, register
 from vortex_torch.abs     import ContextBase
 from vortex_torch.indexer import (
-    topK, Mean, Max, Min, Sum, L2Norm,
+    topK, approxTopK, Mean, Max, Min, Sum, L2Norm,
     GeMM, Multiply, Add, Maximum, Minimum,
     Softmax, Normalize,
     Relu, Sigmoid, Silu, Add_Mul, Abs, Log, Exp,
@@ -232,6 +244,7 @@ values that suit your flow. The ones that need special care:
 | `vortex_dtype` | dtype for **intermediate** tensors. **Recommended: `"bfloat16"`.** Other accepted values: `"float16"`, `"float32"`, `"fp8_e5m2"`, `"fp8_e4m3"` — use only if you have a specific reason; bf16 is the tested default. |
 | `kv_cache_dtype` | dtype for the **K/V cache itself**. Choose from: `"auto"` (resolves to bfloat16), `"fp8_e4m3"`, or `"fp8_e5m2"`. Using fp8 halves cache memory at the cost of numerical precision; bf16 via `"auto"` is the safe default. |
 | `mem_fraction_static` | fraction of GPU memory sglang reserves for KV cache + model weights. Float in `[0.5, 0.95]` (out-of-range values are rejected at engine-boot). **Default 0.8.** Higher values usually raise throughput by enabling larger decode batches, but raise the risk of CUDA OOM mid-run. **Sweet spot 0.8-0.9.** Try `0.85` first; if it runs cleanly, push toward `0.9` / `0.95`. If you OOM, drop back by 0.05. |
+| `disable_radix_cache` | bool. **Default `false`.** **REQUIRED `true` if your `forward_indexer` uses `Save(...)`** (i.e. persistent per-request state via `Save`/`Load`). sglang's prefix-radix cache otherwise reuses KV across requests sharing a prompt prefix — for normal flows that's free throughput, but for `Save`/`Load` flows it shares per-request state across requests and corrupts your Save'd values. Pre-flight rejects the violation. Don't set it for non-`Save` flows: leaving it `false` lets the prefix cache help you. |
 
 ### Budget semantics (`vortex_topk_val`, `vortex_topk_ratio`)
 
@@ -613,8 +626,9 @@ every batch completion mutates §1 and §2.
       accuracy (see §5b) before anything else.
 - [ ] Once the floor is cleared, iterate to **push throughput up** —
       tighten sparsity, drop unused cache fields, try fp8
-      `kv_cache_dtype` — while keeping `mean@16` on the right side of
-      the floor.
+      `kv_cache_dtype`, raise `mem_fraction_static` toward 0.9, swap
+      `topK()` for `approxTopK(tolerate_ratio=…)` — while keeping
+      `mean@16` on the right side of the floor.
 - [ ] Done — sglang can now boot your flow by pointing at the JSON.
 
 ---
@@ -628,11 +642,12 @@ every batch completion mutates §1 and §2.
    `"v"`.
 4. Every op — cache side or indexer side — is from `vortex_torch.cache`
    or `vortex_torch.indexer`. No native torch ops.
-5. `forward_indexer` ends in `topK(score, o, ctx=ctx)` with
+5. `forward_indexer` ends in `topK(score, o, ctx=ctx)` *or*
+   `approxTopK(tolerate_ratio=…)(score, o, ctx=ctx)` with
    `score.shape == [S, 1, 1]`.
 6. If any cache field is read+written across decode steps via
    `Load`/`Save`, zero-initialise it in `forward_cache` with
-   `CFill(0.0)`.
+   `CFill(0.0)`, AND set `"disable_radix_cache": true` in the JSON.
 7. Run `check_engine_config(...)` before declaring done.
 8. Run `algorithm_scientist/run_submission_aime24.py --config <your JSON>` to get
    the `mean@16` / `pass@16` / `throughput` numbers.

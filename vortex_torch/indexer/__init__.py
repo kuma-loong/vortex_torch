@@ -13,8 +13,11 @@ Included components:
   for page-tiled GEMM/GEMV used in similarity scoring.
 
 - Output routing:
-  :class:`topK`
+  :class:`topK`, :class:`approxTopK`
   for selecting sparse page indices based on per-token scores.
+  :class:`approxTopK` is a faster, approximate variant with a tunable
+  ``tolerate_ratio`` quality / cost knob; useful when topK selection
+  cost dominates the indexer path.
 
 - Reductions:
   :class:`Max`, :class:`Mean`, :class:`Min`, :class:`L2Norm`, :class:`Sum`
@@ -49,7 +52,7 @@ attention indexers in vFlow-compatible systems.
 
 
 from .matmul import GeMM, GeMV
-from .output_func import topK
+from .output_func import topK, approxTopK
 from .reduce import Max, Mean, Min, L2Norm, Sum
 from .scan import Softmax, Normalize, Conv1d
 from .transpose import Transpose
@@ -65,7 +68,7 @@ from . import utils_sglang, compiler
 from .context import Context, get_ctx
 __all__ = [ 
     "GeMM", "GeMV",
-    "topK",
+    "topK", "approxTopK",
     "Max", "Mean", "Min", "L2Norm", "Sum",
     "Softmax", "Normalize", "Conv1d",
     "Transpose",

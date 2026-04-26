@@ -47,12 +47,20 @@ class MyFlow(vFlow):
         self.k_mean(cache["k"], cache["centroids"], loc=loc, ctx=ctx)
 
     # (3) Route queries to pages each decode step: build a per-page
-    #     score of shape [S, 1, 1] and hand it to topK.
+    #     score of shape [S, 1, 1] and hand it to topK (or its faster
+    #     approximate variant approxTopK).
     def forward_indexer(self, q, o, cache, ctx):
         qm     = self.q_mean(q, ctx=ctx)                         # [1, 1, D]
         score  = self.gemm(qm, cache["centroids"], ctx=ctx)      # [S, 1, 1]
         self.output_func(score, o, ctx=ctx)                      # writes top-k page ids
 ```
+
+> **Choice of terminal op:** `self.output_func` above is `topK()`, the
+> exact selector. For a faster approximate alternative, swap in
+> `approxTopK(tolerate_ratio=t)` with `t ∈ [0.0, 1.0]` (`0.0` = exact,
+> higher = cheaper-but-looser; output indices unsorted). Same call
+> shape, same BOS/EOS guarantees. See
+> [`indexer_op.md §9`](indexer_op.md) for the full math + tuning hints.
 
 That's the entire user surface. You don't write kernels, loops,
 allocations, or any plumbing — the framework handles all of it.
@@ -84,7 +92,7 @@ lookups, or Triton code.
 |---|---|---|
 | `create_cache(block_size, head_dim)` | declares auxiliary cache fields (centroids, envelopes, running scores, …) | returns a `{name: (D_0, D_1)}` dict. **Don't** include `"k"` / `"v"`. |
 | `forward_cache(cache, loc, ctx)` | computes per-block summaries from `cache["k"]` / `cache["v"]` and writes them into your declared fields | runs once per block completion; purely side-effect writes |
-| `forward_indexer(q, o, cache, ctx)` | builds a per-page score and picks top-k pages | must terminate in `topK(score, o, ctx=ctx)` with `score.shape == [S, 1, 1]` |
+| `forward_indexer(q, o, cache, ctx)` | builds a per-page score and picks top-k pages | must terminate in `topK(score, o, ctx=ctx)` *or* `approxTopK(tolerate_ratio=…)(score, o, ctx=ctx)` with `score.shape == [S, 1, 1]` |
 
 **Rules of thumb**:
 
@@ -176,8 +184,9 @@ no Triton.
    `cache["k"]` / `cache["v"]` and persist them.
 3. **[`program_forward_indexer.md`](program_forward_indexer.md)** —
    how to write `forward_indexer`. Build a `[S, 1, 1]` score per
-   decode step and hand it to `topK`. Covers `Save` / `Load` for
-   cross-step persistent state.
+   decode step and hand it to `topK` (exact) or `approxTopK`
+   (faster, adaptive radix). Covers `Save` / `Load` for cross-step
+   persistent state.
 4. **[`cache_op.md`](cache_op.md)** — math reference for every op
    available in `vortex_torch.cache` (`CMean`, `CMax`, `CMin`,
    `CL2Norm`, `CGeMM`, `CAdd`, `CFill`, `MaskSlice`, …). One formula
@@ -185,7 +194,7 @@ no Triton.
 5. **[`indexer_op.md`](indexer_op.md)** — math reference for every op
    in `vortex_torch.indexer` (`GeMM`, the reductions, `Softmax`,
    `Add`, `Multiply`, `Maximum`, `MaskSlice`, `Save`, `Load`, `topK`,
-   …). Same format as `cache_op.md`.
+   `approxTopK`, …). Same format as `cache_op.md`.
 
 Plus two references you'll want once you're iterating:
 
@@ -223,7 +232,8 @@ spelled out there.
 2. Write `forward_cache` — how do you compute each summary from
    `cache["k"]` / `cache["v"]`?
 3. Write `forward_indexer` — how do you score pages using `q` + those
-   summaries? Make sure it ends in `topK(score, o)` with `score` of
+   summaries? Make sure it ends in `topK(score, o)` (exact) or
+   `approxTopK(tolerate_ratio=…)(score, o)` (faster) with `score` of
    shape `[S, 1, 1]`.
 4. Run `verify_flow_compilable(my_flow)` (or `check_engine_config` on
    your JSON) — fix whatever it complains about.

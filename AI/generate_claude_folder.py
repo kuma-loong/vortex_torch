@@ -63,8 +63,10 @@ CLAUDE_MD = dedent("""\
     fewer cache-side ops, fewer intermediate cache fields, narrower
     `vortex_layers_skip`, aggressive fp8 `kv_cache_dtype`, raise
     `mem_fraction_static` toward 0.9 (range [0.5, 0.95], default 0.8 —
-    higher = more KV-cache headroom = more throughput, but OOM risk).
-    When two variants both clear the floor, pick the faster one.
+    higher = more KV-cache headroom = more throughput, but OOM risk),
+    swap `topK()` for `approxTopK(tolerate_ratio=…)` (`0.0`=exact,
+    higher=cheaper-but-looser; sweet spot 0.05-0.15). When two
+    variants both clear the floor, pick the faster one.
 
     ## Where the instructions live
 
@@ -95,12 +97,20 @@ CLAUDE_MD = dedent("""\
       and `self.mul_b = Multiply()` — do not share.
     - **Do not declare `"k"` or `"v"`** in `create_cache`; they are
       auto-provided.
-    - **`forward_indexer` must end in `topK(score, o, ctx=ctx)`** with
-      `score.shape == [S, 1, 1]`.
+    - **`forward_indexer` must end in `topK(score, o, ctx=ctx)` or
+      `approxTopK(tolerate_ratio=...)(score, o, ctx=ctx)`** — the
+      score must be RAGGED `[S, 1, 1]`. `approxTopK` is a faster
+      adaptive 8-bit radix variant; `tolerate_ratio ∈ [0.0, 1.0]`
+      where `0.0` = exact, higher = cheaper but looser.
     - **Cache-side reductions support `dim ∈ {1, 2}` only.** Cross-block
       reductions (`dim=0`) belong on the indexer side.
     - **If a field is read+written across steps via `Load`/`Save`, zero
       it with `CFill(0.0)` in `forward_cache`.**
+    - **If `forward_indexer` uses `Save(...)`, the engine JSON MUST set
+      `"disable_radix_cache": true`** (default `false`). sglang's
+      prefix-radix cache otherwise shares per-request Save'd state
+      across requests with matching prompt prefixes, corrupting
+      Save/Load values. `check_engine_config` rejects the violation.
 
     ## Running the benchmark — policy
 
@@ -249,19 +259,27 @@ SUBMISSION_WRITER = dedent("""\
     buy throughput — tighten `vortex_topk_val` / `vortex_topk_ratio`,
     drop intermediate cache fields, narrow `vortex_layers_skip`, try fp8
     `kv_cache_dtype`, push `mem_fraction_static` from 0.8 toward 0.9
-    (bounded [0.5, 0.95]; higher = more KV-cache headroom but OOM risk).
+    (bounded [0.5, 0.95]; higher = more KV-cache headroom but OOM risk),
+    or swap `topK()` for `approxTopK(tolerate_ratio=…)` (adaptive
+    8-bit radix; `0.0` = exact, higher = cheaper-but-looser).
 
     ## Hard rules (AGENTS.md §2 — the framework will reject violations)
 
     1. No native torch ops anywhere in the three methods.
     2. Each op instance is for one call site — never shared.
     3. Never declare `"k"` or `"v"` in `create_cache`.
-    4. `forward_indexer` must end in `topK(score, o, ctx=ctx)` with
-       `score.shape == [S, 1, 1]`.
+    4. `forward_indexer` must end in `topK(score, o, ctx=ctx)` *or*
+       `approxTopK(tolerate_ratio=...)(score, o, ctx=ctx)` —
+       `score.shape == [S, 1, 1]`. `approxTopK` is the throughput-
+       oriented variant (adaptive 8-bit radix; `tolerate_ratio ∈
+       [0.0, 1.0]`, `0.0` = exact).
     5. Every declared cache field must have both a writer and a reader.
     6. Cache-side reductions support `dim ∈ {1, 2}` only.
     7. If a field is accumulated across steps via `Load`/`Save`,
        zero-initialise it in `forward_cache` with `CFill(0.0)`.
+    8. If `forward_indexer` uses `Save(...)`, the engine JSON MUST set
+       `"disable_radix_cache": true` (default `false`). Pre-flight
+       rejects the violation.
 
     ## Mandatory protocol — batches of exactly 8
 
@@ -368,8 +386,10 @@ SUBMISSION_REVIEWER = dedent("""\
        from more than one site.
     5. **`k`/`v` not declared** — `create_cache` must not return keys
        named `"k"` or `"v"`.
-    6. **`forward_indexer` ends in `topK(score, o, ctx=ctx)`** with a
-       visibly `[S, 1, 1]`-shaped score.
+    6. **`forward_indexer` ends in `topK(score, o, ctx=ctx)` or
+       `approxTopK(tolerate_ratio=...)(score, o, ctx=ctx)`** with a
+       visibly `[S, 1, 1]`-shaped score. If `approxTopK` is used,
+       the `tolerate_ratio` argument must be a float in `[0.0, 1.0]`.
     7. **Every declared cache field** has both a writer (in
        `forward_cache`) and a reader (in `forward_indexer` or
        `forward_cache`). No dead fields.
@@ -378,12 +398,19 @@ SUBMISSION_REVIEWER = dedent("""\
     9. **`Save`/`Load` fields are zero-initialised** — if the
        indexer reads-then-writes a cache field, `forward_cache` must
        `CFill(0.0)` it at block completion.
-    10. **JSON sanity** — `vortex_block_size` and
+    10. **`Save(...)` in indexer ⇒ `"disable_radix_cache": true` in
+        JSON.** Grep the .py for `Save(`. If present, the .json must
+        explicitly set `"disable_radix_cache": true`. Without it, the
+        framework's `check_engine_config` rejects the submission and
+        sglang's prefix cache would corrupt Save'd state. Default
+        `false`, so non-Save flows may omit the field.
+    11. **JSON sanity** — `vortex_block_size` and
         `vortex_workload_chunk_size` are positive powers of 2;
         `vortex_topk_val`, `vortex_block_reserved_bos`,
         `vortex_block_reserved_eos` are sensible ints;
         `vortex_dtype` / `kv_cache_dtype` are supported values;
-        `mem_fraction_static` (if present) is a float in [0.5, 0.95].
+        `mem_fraction_static` (if present) is a float in [0.5, 0.95];
+        `disable_radix_cache` (if present) is a bool.
 
     ## Output format
 

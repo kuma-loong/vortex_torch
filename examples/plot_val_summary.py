@@ -15,15 +15,21 @@ import matplotlib.pyplot as plt
 
 MODEL_ORDER = ["Qwen3-0.6B", "Qwen3-1.7B", "Qwen3-4B", "Qwen3-8B"]
 DATASETS = ["examples/amc23.jsonl", "examples/aime24.jsonl"]
-SPARSE_MODULES = ["block_sparse_attention", "gqa_quest_sparse_attention"]
+SPARSE_MODULES = [
+    "block_sparse_attention",
+    "gqa_quest_sparse_attention",
+    "gqa_block_sparse_attention",
+]
 MODULE_LABEL = {
     "block_sparse_attention": "block_sparse",
     "gqa_quest_sparse_attention": "gqa_quest",
+    "gqa_block_sparse_attention": "gqa_block_sparse",
     "full_attention": "full_attention",
 }
 MODULE_STYLE = {
     "block_sparse_attention": dict(color="#2E86DE", marker="o", linewidth=2.2, markersize=7),
     "gqa_quest_sparse_attention": dict(color="#EE5253", marker="s", linewidth=2.2, markersize=7),
+    "gqa_block_sparse_attention": dict(color="#8E44AD", marker="^", linewidth=2.2, markersize=8),
     "full_attention": dict(color="#10AC84"),
 }
 
@@ -62,22 +68,26 @@ def style_axes(ax):
     ax.minorticks_on()
 
 
-def load_latest(summary_dir):
+def load_latest(summary_dirs):
+    """Merge latest run per config across one or more summary directories."""
+    if isinstance(summary_dirs, str):
+        summary_dirs = [summary_dirs]
     best = {}
-    for f in sorted(glob.glob(os.path.join(summary_dir, "*.json"))):
-        with open(f) as fp:
-            d = json.load(fp)
-        a = d["args"]
-        key = (
-            os.path.basename(a["model_name"]),
-            a["vortex_module_name"],
-            a["trials"],
-            a["topk_val"],
-            a["data_path"],
-        )
-        ts = ts_re.search(f).group(1)
-        if key not in best or ts > best[key][0]:
-            best[key] = (ts, d)
+    for summary_dir in summary_dirs:
+        for f in sorted(glob.glob(os.path.join(summary_dir, "*.json"))):
+            with open(f) as fp:
+                d = json.load(fp)
+            a = d["args"]
+            key = (
+                os.path.basename(a["model_name"]),
+                a["vortex_module_name"],
+                a["trials"],
+                a["topk_val"],
+                a["data_path"],
+            )
+            ts = ts_re.search(f).group(1)
+            if key not in best or ts > best[key][0]:
+                best[key] = (ts, d)
     return best
 
 
@@ -230,8 +240,11 @@ def plot_pareto(agg, baseline, model, ds, title_suffix, savepath):
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--summary-dir", default="summary",
-                   help="Directory of sweep JSONs (default: summary)")
+    p.add_argument("--summary-dir", default=["summary"], nargs="+",
+                   help="One or more directories of topk_val sweep JSONs "
+                        "(default: summary). Runs are deduped by "
+                        "(model, module, trials, topk_val, dataset), keeping "
+                        "the latest timestamp across all dirs.")
     p.add_argument("--baseline-dir", default="summary",
                    help="Directory to read full_attention baseline from "
                         "(default: summary — same as figures_val)")

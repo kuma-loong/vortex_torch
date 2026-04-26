@@ -407,6 +407,53 @@ The framework also honours `vortex_block_reserved_bos` and
 every sequence are *always* selected regardless of score, so you don't
 need to add a positional bias for them.
 
+### `approxTopK(tolerate_ratio=0.0)` — approximate variant
+
+Drop-in replacement for `topK` that swaps the exact-selection kernel
+for an **adaptive 8-bit radix top-k** with a quality / cost knob.
+
+```python
+self.output_func = approxTopK(tolerate_ratio=0.25)
+...
+self.output_func(score, o, ctx=ctx)   # same call shape as topK
+```
+
+The kernel runs up to four 8-bit refinement rounds (32 bits total)
+on fp32-promoted scores. After each round, the threshold bin is
+found and `topk_remaining` is the number of slots still owed by
+that bin. The kernel **stops early** as soon as
+
+$$
+\text{topk\_remaining} \;\le\; \text{tolerate\_ratio} \cdot \text{target\_k}
+$$
+
+filling the remaining slots from the current candidate set in
+arrival order. The trade-off:
+
+- `tolerate_ratio = 0.0` → all four rounds run; result is the exact
+  top-k (only the output ordering is unsorted vs. classic `topK`).
+- `tolerate_ratio = 1.0` → kernel stops after round 0, cheapest
+  setting; selection is coarse.
+- `0 < tolerate_ratio < 1` → adaptive: cheap when scores are
+  well-separated, refines when they're tightly bunched.
+
+**Same contract as `topK`** — RAGGED `[S, 1, 1]` input, BOS/EOS
+preserved, exactly one call per `forward_indexer`. Only the
+*selection quality* is traded for speed; the output **slot count**
+is identical.
+
+**Practical guidance:**
+
+- When score distributions are heavy-tailed and `topK` cost
+  dominates the indexer path, this is a clean throughput win.
+- For tight score distributions where many candidates cluster near
+  the threshold, keep `tolerate_ratio ≤ 0.05`.
+- For distributions with a clear gap between selected and dropped
+  pages, push `tolerate_ratio` up to `0.2 - 0.5`.
+- Output indices are **unsorted within each segment** (this matches
+  the underlying `topk_output_v2` C kernel). Downstream consumers
+  must not assume sorted order.
+
 ---
 
 ## 10. Quick-reference cheat sheet
@@ -428,7 +475,8 @@ need to add a positional bias for them.
 | `MaskSlice(start, end, dim, α, β)(x)` | same shape | α inside range, β outside |
 | `Load()(F)` | `[S, D_0, D_1]` | read cache field |
 | `Save()(x, F)` | writes `F` | persist `x` into cache field |
-| `topK()(score, o)` | `[S, 1, 1] →` writes `o` | pick top-k pages |
+| `topK()(score, o)` | `[S, 1, 1] →` writes `o` | pick top-k pages (exact, sorted) |
+| `approxTopK(t)(score, o)` | `[S, 1, 1] →` writes `o` | pick top-k pages (adaptive radix; `t ∈ [0,1]` cheaper-but-looser at higher t; output unsorted) |
 
 ---
 

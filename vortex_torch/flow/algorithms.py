@@ -2,7 +2,7 @@ import torch
 from typing import Dict
 
 from .flow import vFlow
-from ..indexer import topK, GeMV, Softmax, Max, Sum, GeMM, Maximum, Multiply, Add, L2Norm, Save, Load, Mean, MaskSlice
+from ..indexer import topK, approxTopK, GeMV, Softmax, Max, Sum, GeMM, Maximum, Multiply, Add, L2Norm, Save, Load, Mean, MaskSlice
 from ..cache import Mean as CMean, Max as CMax, Min as CMin, L2Norm as CL2Norm, Fill as CFill
 from ..abs import ContextBase
 from .registry import register
@@ -676,7 +676,7 @@ class RunningAvgBlockSparse(vFlow):
     :meth:`forward_indexer` via ``Save``; :meth:`forward_cache` never
     touches it.
     """
-    ALPHA = 0.9
+    ALPHA = 0.5
 
     def __init__(self):
         super().__init__()

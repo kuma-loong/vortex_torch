@@ -129,6 +129,40 @@ def _check_registers_class(module_path: Path, module_name: str) -> None:
         )
 
 
+_INDEXER_SAVE_PATTERN = re.compile(r"\bSave\s*\(")
+
+
+def _flow_uses_indexer_save(module_path: Path) -> bool:
+    """Return True iff the submission file contains an indexer-side ``Save(``
+    call (the persistent state pattern paired with ``Load`` and
+    ``CFill(0.0)``). Cache side has no ``Save`` op, so this textual match
+    is unambiguous."""
+    try:
+        src = module_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return bool(_INDEXER_SAVE_PATTERN.search(src))
+
+
+def _check_disable_radix_cache(module_path: Path, config: Dict[str, Any]) -> None:
+    """If the flow uses ``Save(...)`` in the indexer, the engine config
+    must set ``disable_radix_cache: true``. Otherwise sglang's prefix
+    radix cache will share the Save'd per-request persistent state
+    across requests with matching prompt prefixes — silently corrupting
+    Save/Load values across decode batches."""
+    if not _flow_uses_indexer_save(module_path):
+        return
+    if config.get("disable_radix_cache", False) is not True:
+        raise EngineConfigError(
+            f"{module_path.name} uses `Save(...)` in the indexer "
+            f"(persistent per-request state via Save/Load), so the "
+            f"engine config must set `\"disable_radix_cache\": true`. "
+            f"Without it, sglang's radix cache will share Save'd state "
+            f"across requests with matching prompt prefixes and corrupt "
+            f"the values. Add `\"disable_radix_cache\": true` to the JSON."
+        )
+
+
 def _check_compilable(module_path: Path, module_name: str) -> None:
     """Load the user file, build the registered vFlow, and run a tiny
     compile sweep. Uses CPU-side metadata only — no CUDA required."""
@@ -191,6 +225,10 @@ def check_engine_config(config_path: Union[str, Path]) -> Dict[str, Any]:
       6. ``vortex_module_path`` resolves to an existing file.
       7. That file declares ``@register("<vortex_module_name>")``.
       8. The registered vFlow compiles on a 1-config smoke sweep.
+      9. If the flow uses ``Save(...)`` in the indexer, the JSON sets
+         ``"disable_radix_cache": true`` (otherwise sglang's prefix
+         cache would share per-request persistent state across
+         requests with matching prompt prefixes).
 
     Returns the parsed config dict on success. Raises
     :class:`EngineConfigError` with a descriptive message on the first
@@ -259,5 +297,8 @@ def check_engine_config(config_path: Union[str, Path]) -> Dict[str, Any]:
 
     # 8. registered class compiles
     _check_compilable(module_path, module_name)
+
+    # 9. Save() in indexer ⇒ disable_radix_cache must be true
+    _check_disable_radix_cache(module_path, config)
 
     return config

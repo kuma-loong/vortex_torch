@@ -390,6 +390,7 @@ def _build_initial_user_prompt(
         f"   `{submission_name}_v8` — each varying a different knob "
         f"   (topk_val, topk_ratio, layers_skip pattern, kv_cache_dtype, "
         f"   mem_fraction_static ∈ [0.5, 0.95], "
+        f"   topK vs approxTopK(tolerate_ratio ∈ [0.0, 1.0]), "
         f"   block_size, scoring op choice, etc.), NOT 8 copies of the "
         f"   same idea. State the theme and the 8 variants' knob "
         f"   matrix in one short paragraph before writing code.\n"

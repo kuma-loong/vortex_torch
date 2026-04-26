@@ -15,7 +15,7 @@ from ...matmul import GeMM
 from ...reduce import Reduce
 from ...elementwise_binary import Elementwise_Binary
 from ...elementwise import Elementwise
-from ...output_func import topK
+from ...output_func import topK, approxTopK
 from ...scan import Softmax, Normalize, Conv1d
 from ...transpose import Transpose
 from ...save_load import Save, Load
@@ -25,7 +25,7 @@ from .gemm import generate_gemm_impl
 from .reduce import generate_reduce_impl, generate_reduce_dim0_impl
 from .elementwise_binary import generate_elementwise_binary_impl
 from .elementwise import generate_elementwise_impl
-from .topk import generate_topk_impl
+from .topk import generate_topk_impl, generate_approx_topk_impl
 from .softmax import generate_softmax_impl
 from .normalize import generate_normalize_impl
 from .transpose import generate_transpose_impl
@@ -45,7 +45,8 @@ IMPL_REGISTRY = {
     (MaskSlice,          Schedule.W): generate_mask_slice_impl,
 
     # Schedule.S — standalone, each op launches its own kernel.
-    (topK,      Schedule.S): generate_topk_impl,
+    (topK,       Schedule.S): generate_topk_impl,
+    (approxTopK, Schedule.S): generate_approx_topk_impl,
     (Softmax,   Schedule.S): generate_softmax_impl,
     (Normalize, Schedule.S): generate_normalize_impl,
     (Conv1d,    Schedule.S): generate_conv1d_impl,
@@ -56,11 +57,28 @@ IMPL_REGISTRY = {
 
 
 def get_impl_func(op):
+    """Resolve an op instance to its codegen function.
+
+    Exact class match wins (so a subclass like ``approxTopK`` gets its
+    own generator instead of inheriting ``topK``'s). Falls back to an
+    MRO walk: the closest registered ancestor at the same schedule
+    provides the generator.
+    """
     schedule = op.schedule
-    for (op_type, sched), impl_func in IMPL_REGISTRY.items():
-        if sched == schedule and issubclass(op.__class__, op_type):
+    cls = op.__class__
+
+    # 1) Exact match: most specific entry, never shadowed by a superclass.
+    exact = IMPL_REGISTRY.get((cls, schedule))
+    if exact is not None:
+        return exact
+
+    # 2) MRO walk: closest registered ancestor at this schedule.
+    for parent in cls.__mro__[1:]:
+        impl_func = IMPL_REGISTRY.get((parent, schedule))
+        if impl_func is not None:
             return impl_func
+
     raise NotImplementedError(
-        f"No indexer codegen for op {op.__class__.__name__} "
+        f"No indexer codegen for op {cls.__name__} "
         f"with schedule {schedule}"
     )
