@@ -112,7 +112,15 @@ setup(
         "huggingface_hub==0.36.2",
         "inspect-ai==0.3.207",
         "transformers==4.57.6",
-        "s3fs==2025.9.0"
+        "s3fs==2025.9.0",
+        "wonderwords",
+        "langdetect",
+        "jsonlines",
+        "immutabledict",
+        "datasets",
+        "beautifulsoup4",
+        "accelerate",
+        "unitxt",
     ],
     ext_modules=[
         CUDAExtension(

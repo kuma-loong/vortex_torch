@@ -2,7 +2,7 @@
 
 Everything you need to turn a fresh idea into an AIME24 score, in one
 folder. All four files here are ready to run from the repo root
-(`/home/xun/vortex_torch`) and reference each other using
+(`vortex_torch`) and reference each other using
 `algorithm_scientist/…` paths.
 
 ## What lives here
