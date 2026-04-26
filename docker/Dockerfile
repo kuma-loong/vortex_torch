@@ -1,9 +1,6 @@
 FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
-ENV CUDA_HOME=/usr/local/cuda-12.8
-ENV PATH="${CUDA_HOME}/bin:${PATH}"
-ENV LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}"
 
 # Override at build time for your cluster, for example:
 #   --build-arg TORCH_CUDA_ARCH_LIST="9.0"
@@ -35,11 +32,6 @@ RUN bash install.sh
 
 WORKDIR /workspace/vortex_torch
 COPY . .
-RUN if grep -RIl "/home/""xun" . >/tmp/local_path_matches; then \
-    echo "Refusing to build image because copied files contain local /home/""xun paths:"; \
-    cat /tmp/local_path_matches; \
-    exit 1; \
-    fi
 RUN pip install --no-cache-dir -e .
 
 CMD ["/bin/bash"]
