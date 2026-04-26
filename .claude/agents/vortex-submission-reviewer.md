@@ -35,8 +35,10 @@ Read the submission's `.py` and `.json`, then verify:
    from more than one site.
 5. **`k`/`v` not declared** — `create_cache` must not return keys
    named `"k"` or `"v"`.
-6. **`forward_indexer` ends in `topK(score, o, ctx=ctx)`** with a
-   visibly `[S, 1, 1]`-shaped score.
+6. **`forward_indexer` ends in `topK(score, o, ctx=ctx)` or
+   `approxTopK(tolerate_ratio=...)(score, o, ctx=ctx)`** with a
+   visibly `[S, 1, 1]`-shaped score. If `approxTopK` is used,
+   the `tolerate_ratio` argument must be a float in `[0.0, 1.0]`.
 7. **Every declared cache field** has both a writer (in
    `forward_cache`) and a reader (in `forward_indexer` or
    `forward_cache`). No dead fields.
@@ -45,12 +47,19 @@ Read the submission's `.py` and `.json`, then verify:
 9. **`Save`/`Load` fields are zero-initialised** — if the
    indexer reads-then-writes a cache field, `forward_cache` must
    `CFill(0.0)` it at block completion.
-10. **JSON sanity** — `vortex_block_size` and
+10. **`Save(...)` in indexer ⇒ `"disable_radix_cache": true` in
+    JSON.** Grep the .py for `Save(`. If present, the .json must
+    explicitly set `"disable_radix_cache": true`. Without it, the
+    framework's `check_engine_config` rejects the submission and
+    sglang's prefix cache would corrupt Save'd state. Default
+    `false`, so non-Save flows may omit the field.
+11. **JSON sanity** — `vortex_block_size` and
     `vortex_workload_chunk_size` are positive powers of 2;
     `vortex_topk_val`, `vortex_block_reserved_bos`,
     `vortex_block_reserved_eos` are sensible ints;
     `vortex_dtype` / `kv_cache_dtype` are supported values;
-    `mem_fraction_static` (if present) is a float in [0.5, 0.95].
+    `mem_fraction_static` (if present) is a float in [0.5, 0.95];
+    `disable_radix_cache` (if present) is a bool.
 
 ## Output format
 

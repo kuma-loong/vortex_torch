@@ -1,0 +1,38 @@
+.git
+.gitignore
+.dockerignore
+
+# Local editor/agent metadata should never be copied into images.
+.claude/
+.codex/
+.vscode/
+.idea/
+
+# Python/build artifacts.
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+build/
+dist/
+.cache/
+.pytest_cache/
+.mypy_cache/
+.pyre/
+.tox/
+.nox/
+.venv/
+venv/
+env/
+
+# Local experiment outputs and logs.
+debug/
+debug*/
+logs/
+*.out
+*.err
+*.log
+experiments/
+
+# Local machine-specific helper files with absolute host paths.
+algorithm_scientist/*.slurm

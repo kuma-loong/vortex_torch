@@ -41,19 +41,27 @@ to maximise. Once it clears the floor, every further change should
 buy throughput — tighten `vortex_topk_val` / `vortex_topk_ratio`,
 drop intermediate cache fields, narrow `vortex_layers_skip`, try fp8
 `kv_cache_dtype`, push `mem_fraction_static` from 0.8 toward 0.9
-(bounded [0.5, 0.95]; higher = more KV-cache headroom but OOM risk).
+(bounded [0.5, 0.95]; higher = more KV-cache headroom but OOM risk),
+or swap `topK()` for `approxTopK(tolerate_ratio=…)` (adaptive
+8-bit radix; `0.0` = exact, higher = cheaper-but-looser).
 
 ## Hard rules (AGENTS.md §2 — the framework will reject violations)
 
 1. No native torch ops anywhere in the three methods.
 2. Each op instance is for one call site — never shared.
 3. Never declare `"k"` or `"v"` in `create_cache`.
-4. `forward_indexer` must end in `topK(score, o, ctx=ctx)` with
-   `score.shape == [S, 1, 1]`.
+4. `forward_indexer` must end in `topK(score, o, ctx=ctx)` *or*
+   `approxTopK(tolerate_ratio=...)(score, o, ctx=ctx)` —
+   `score.shape == [S, 1, 1]`. `approxTopK` is the throughput-
+   oriented variant (adaptive 8-bit radix; `tolerate_ratio ∈
+   [0.0, 1.0]`, `0.0` = exact).
 5. Every declared cache field must have both a writer and a reader.
 6. Cache-side reductions support `dim ∈ {1, 2}` only.
 7. If a field is accumulated across steps via `Load`/`Save`,
    zero-initialise it in `forward_cache` with `CFill(0.0)`.
+8. If `forward_indexer` uses `Save(...)`, the engine JSON MUST set
+   `"disable_radix_cache": true` (default `false`). Pre-flight
+   rejects the violation.
 
 ## Mandatory protocol — batches of exactly 8
 

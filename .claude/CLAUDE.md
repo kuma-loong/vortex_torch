@@ -16,8 +16,10 @@ for **more throughput**: tighter `vortex_topk_val` / `vortex_topk_ratio`,
 fewer cache-side ops, fewer intermediate cache fields, narrower
 `vortex_layers_skip`, aggressive fp8 `kv_cache_dtype`, raise
 `mem_fraction_static` toward 0.9 (range [0.5, 0.95], default 0.8 —
-higher = more KV-cache headroom = more throughput, but OOM risk).
-When two variants both clear the floor, pick the faster one.
+higher = more KV-cache headroom = more throughput, but OOM risk),
+swap `topK()` for `approxTopK(tolerate_ratio=…)` (`0.0`=exact,
+higher=cheaper-but-looser; sweet spot 0.05-0.15). When two
+variants both clear the floor, pick the faster one.
 
 ## Where the instructions live
 
@@ -48,12 +50,20 @@ modifying the compiler itself, not when writing a submission.
   and `self.mul_b = Multiply()` — do not share.
 - **Do not declare `"k"` or `"v"`** in `create_cache`; they are
   auto-provided.
-- **`forward_indexer` must end in `topK(score, o, ctx=ctx)`** with
-  `score.shape == [S, 1, 1]`.
+- **`forward_indexer` must end in `topK(score, o, ctx=ctx)` or
+  `approxTopK(tolerate_ratio=...)(score, o, ctx=ctx)`** — the
+  score must be RAGGED `[S, 1, 1]`. `approxTopK` is a faster
+  adaptive 8-bit radix variant; `tolerate_ratio ∈ [0.0, 1.0]`
+  where `0.0` = exact, higher = cheaper but looser.
 - **Cache-side reductions support `dim ∈ {1, 2}` only.** Cross-block
   reductions (`dim=0`) belong on the indexer side.
 - **If a field is read+written across steps via `Load`/`Save`, zero
   it with `CFill(0.0)` in `forward_cache`.**
+- **If `forward_indexer` uses `Save(...)`, the engine JSON MUST set
+  `"disable_radix_cache": true`** (default `false`). sglang's
+  prefix-radix cache otherwise shares per-request Save'd state
+  across requests with matching prompt prefixes, corrupting
+  Save/Load values. `check_engine_config` rejects the violation.
 
 ## Running the benchmark — policy
 
