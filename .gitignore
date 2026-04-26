@@ -7,6 +7,7 @@ debug*
 # C extensions
 *.so
 *compiled_func.py
+flashinfer_test.py
 # Distribution / packaging
 .Python
 build/
@@ -70,7 +71,7 @@ instance/
 
 # Scrapy stuff:
 .scrapy
-
+experiments/
 # Sphinx documentation
 docs/_build/
 
@@ -84,7 +85,9 @@ target/
 # IPython
 profile_default/
 ipython_config.py
-
+*.out
+*.err
+logs/
 # pyenv
 #   For a library or package, you might want to ignore these files since the code is
 #   intended to run in multiple environments; otherwise, check them in:
@@ -236,3 +239,11 @@ compile_commands.json
 
 # Rust lib
 Cargo.lock
+
+# Claude Code per-machine permissions (do not commit)
+.claude/settings.local.json
+*.jsonl
+RLG
+.codex
+.claude/.nfs*
+*.slurm
