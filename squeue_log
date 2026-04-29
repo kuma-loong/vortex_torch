@@ -1,0 +1,539 @@
+(base) xun@login-node-0:~/vortex_torch$ squeue
+             JOBID PARTITION     NAME     USER ST       TIME  NODES NODELIST(REASON)
+             29403      high       m5      xun  R      11:49      1 compute-node-29
+             29402      high       m4      xun  R      13:02      1 compute-node-30
+             29401      high       m9      xun  R      20:06      1 compute-node-27
+             29400      high       m7      xun  R      28:54      1 compute-node-1
+             29396      high       m8      xun  R      48:36      1 compute-node-43
+             29395      high       m6      xun  R      51:24      1 compute-node-16
+             29394      high       m3      xun  R      52:43      1 compute-node-24
+             29393      high    debug    yanke  R      53:55      1 compute-node-19
+             29392      high       m2      xun  R      54:50      1 compute-node-18
+             29383      high ego_pose     linz  R    2:12:08      4 compute-node-[2,4,9,20]
+             29363      high    debug      xun  R    4:19:11      1 compute-node-13
+             29295      high mind_ti2   yicong  R   10:18:12      2 compute-node-[8,22]
+             29290      high     stem      xun  R   11:43:11      4 compute-node-[17,44,46-47]
+             29281      high       m1      xun  R   12:35:33      1 compute-node-10
+             29277      high   q14tis      xun  R   13:19:28      4 compute-node-[11,26,41-42]
+             29262      high semantic     shuo  R   14:09:29      2 compute-node-[37,39]
+             29256      high     stem      xun  R   14:44:39      4 compute-node-[0,14,33-34]
+             29231      high rae_exp5     shuo  R   20:04:29      2 compute-node-[40,45]
+             29196      high    train      xun  R   23:11:36      2 compute-node-[5,21]
+             29155      high    train      xun  R 1-22:44:37      2 compute-node-[6,15]
+             29118      high   yq-exp   yongqi  R 2-12:54:41      1 compute-node-23
+             29011      high    abl_1     linz  R 3-01:52:54      1 compute-node-32
+             28966      high semantic     shuo  R 3-12:17:57      2 compute-node-[28,35]
+             28894      high wm1ego_b    yanke  R 3-21:31:10      4 compute-node-[3,25,31,38]
+             28805      high    train      xun  R 4-16:33:12      2 compute-node-[7,12]
+             27574      high ary-debu    aryan  R 18-14:57:38      1 compute-node-19
+             27293      high nan-debu      nan  R 22-00:13:38      1 compute-node-36
+             29268    medium vortex_b      xun PD       0:00      1 (Priority)
+             29269    medium vortex_b      xun PD       0:00      1 (Priority)
+             29291    medium     stem      xun PD       0:00      4 (Priority)
+             29303    medium vortex_t      xun PD       0:00      1 (Priority)
+             29304    medium vortex_t      xun PD       0:00      1 (Priority)
+             29305    medium vortex_t      xun PD       0:00      1 (Priority)
+             29306    medium vortex_t      xun PD       0:00      1 (Priority)
+             29307    medium vortex_t      xun PD       0:00      1 (Priority)
+             29308    medium vortex_t      xun PD       0:00      1 (Priority)
+             29309    medium vortex_t      xun PD       0:00      1 (Priority)
+             29310    medium vortex_t      xun PD       0:00      1 (Priority)
+             29311    medium vortex_t      xun PD       0:00      1 (Priority)
+             29312    medium vortex_t      xun PD       0:00      1 (Priority)
+             29313    medium vortex_t      xun PD       0:00      1 (Priority)
+             29314    medium vortex_t      xun PD       0:00      1 (Priority)
+             29315    medium vortex_t      xun PD       0:00      1 (Priority)
+             29316    medium vortex_t      xun PD       0:00      1 (Priority)
+             29317    medium vortex_t      xun PD       0:00      1 (Priority)
+             29318    medium vortex_t      xun PD       0:00      1 (Priority)
+             29319    medium vortex_t      xun PD       0:00      1 (Priority)
+             29320    medium vortex_t      xun PD       0:00      1 (Priority)
+             29321    medium vortex_t      xun PD       0:00      1 (Priority)
+             29322    medium vortex_t      xun PD       0:00      1 (Priority)
+             29323    medium vortex_t      xun PD       0:00      1 (Priority)
+             29324    medium vortex_t      xun PD       0:00      1 (Priority)
+             29325    medium vortex_t      xun PD       0:00      1 (Priority)
+             29326    medium vortex_t      xun PD       0:00      1 (Priority)
+             29327    medium vortex_t      xun PD       0:00      1 (Priority)
+             29328    medium vortex_t      xun PD       0:00      1 (Priority)
+             29329    medium vortex_t      xun PD       0:00      1 (Priority)
+             29330    medium vortex_t      xun PD       0:00      1 (Priority)
+             29331    medium vortex_t      xun PD       0:00      1 (Priority)
+             29332    medium vortex_t      xun PD       0:00      1 (Priority)
+             29333    medium vortex_t      xun PD       0:00      1 (Priority)
+             29334    medium vortex_t      xun PD       0:00      1 (Priority)
+             29335    medium vortex_t      xun PD       0:00      1 (Priority)
+             29336    medium vortex_t      xun PD       0:00      1 (Priority)
+             29337    medium vortex_t      xun PD       0:00      1 (Priority)
+             29338    medium vortex_t      xun PD       0:00      1 (Priority)
+             29339    medium vortex_t      xun PD       0:00      1 (Priority)
+             29340    medium vortex_t      xun PD       0:00      1 (Priority)
+             29341    medium vortex_t      xun PD       0:00      1 (Priority)
+             29342    medium vortex_t      xun PD       0:00      1 (Priority)
+             29353    medium vortex_t      xun PD       0:00      1 (Priority)
+             29354    medium vortex_t      xun PD       0:00      1 (Priority)
+             29355    medium vortex_t      xun PD       0:00      1 (Priority)
+             29356    medium vortex_t      xun PD       0:00      1 (Priority)
+             29352    medium vortex_t      xun PD       0:00      1 (Priority)
+             29351    medium vortex_t      xun PD       0:00      1 (Priority)
+             29350    medium vortex_t      xun PD       0:00      1 (Priority)
+             29349    medium vortex_t      xun PD       0:00      1 (Priority)
+             29348    medium vortex_t      xun PD       0:00      1 (Priority)
+             29347    medium vortex_t      xun PD       0:00      1 (Priority)
+             29346    medium vortex_t      xun PD       0:00      1 (Priority)
+             29345    medium vortex_t      xun PD       0:00      1 (Priority)
+             29344    medium vortex_t      xun PD       0:00      1 (Priority)
+             29343    medium vortex_t      xun PD       0:00      1 (Resources)
+(base) xun@login-node-0:~/vortex_torch$ squeue
+             JOBID PARTITION     NAME     USER ST       TIME  NODES NODELIST(REASON)
+             29403      high       m5      xun  R      12:27      1 compute-node-29
+             29402      high       m4      xun  R      13:40      1 compute-node-30
+             29401      high       m9      xun  R      20:44      1 compute-node-27
+             29400      high       m7      xun  R      29:32      1 compute-node-1
+             29396      high       m8      xun  R      49:14      1 compute-node-43
+             29395      high       m6      xun  R      52:02      1 compute-node-16
+             29394      high       m3      xun  R      53:21      1 compute-node-24
+             29393      high    debug    yanke  R      54:33      1 compute-node-19
+             29392      high       m2      xun  R      55:28      1 compute-node-18
+             29383      high ego_pose     linz  R    2:12:46      4 compute-node-[2,4,9,20]
+             29363      high    debug      xun  R    4:19:49      1 compute-node-13
+             29295      high mind_ti2   yicong  R   10:18:50      2 compute-node-[8,22]
+             29290      high     stem      xun  R   11:43:49      4 compute-node-[17,44,46-47]
+             29281      high       m1      xun  R   12:36:11      1 compute-node-10
+             29277      high   q14tis      xun  R   13:20:06      4 compute-node-[11,26,41-42]
+             29262      high semantic     shuo  R   14:10:07      2 compute-node-[37,39]
+             29256      high     stem      xun  R   14:45:17      4 compute-node-[0,14,33-34]
+             29231      high rae_exp5     shuo  R   20:05:07      2 compute-node-[40,45]
+             29196      high    train      xun  R   23:12:14      2 compute-node-[5,21]
+             29155      high    train      xun  R 1-22:45:15      2 compute-node-[6,15]
+             29118      high   yq-exp   yongqi  R 2-12:55:19      1 compute-node-23
+             29011      high    abl_1     linz  R 3-01:53:32      1 compute-node-32
+             28966      high semantic     shuo  R 3-12:18:35      2 compute-node-[28,35]
+             28894      high wm1ego_b    yanke  R 3-21:31:48      4 compute-node-[3,25,31,38]
+             28805      high    train      xun  R 4-16:33:50      2 compute-node-[7,12]
+             27574      high ary-debu    aryan  R 18-14:58:16      1 compute-node-19
+             27293      high nan-debu      nan  R 22-00:14:16      1 compute-node-36
+             29268    medium vortex_b      xun PD       0:00      1 (Priority)
+             29269    medium vortex_b      xun PD       0:00      1 (Priority)
+             29291    medium     stem      xun PD       0:00      4 (Priority)
+             29303    medium vortex_t      xun PD       0:00      1 (Priority)
+             29304    medium vortex_t      xun PD       0:00      1 (Priority)
+             29305    medium vortex_t      xun PD       0:00      1 (Priority)
+             29306    medium vortex_t      xun PD       0:00      1 (Priority)
+             29307    medium vortex_t      xun PD       0:00      1 (Priority)
+             29308    medium vortex_t      xun PD       0:00      1 (Priority)
+             29309    medium vortex_t      xun PD       0:00      1 (Priority)
+             29310    medium vortex_t      xun PD       0:00      1 (Priority)
+             29311    medium vortex_t      xun PD       0:00      1 (Priority)
+             29312    medium vortex_t      xun PD       0:00      1 (Priority)
+             29313    medium vortex_t      xun PD       0:00      1 (Priority)
+             29314    medium vortex_t      xun PD       0:00      1 (Priority)
+             29315    medium vortex_t      xun PD       0:00      1 (Priority)
+             29316    medium vortex_t      xun PD       0:00      1 (Priority)
+             29317    medium vortex_t      xun PD       0:00      1 (Priority)
+             29318    medium vortex_t      xun PD       0:00      1 (Priority)
+             29319    medium vortex_t      xun PD       0:00      1 (Priority)
+             29320    medium vortex_t      xun PD       0:00      1 (Priority)
+             29321    medium vortex_t      xun PD       0:00      1 (Priority)
+             29322    medium vortex_t      xun PD       0:00      1 (Priority)
+             29323    medium vortex_t      xun PD       0:00      1 (Priority)
+             29324    medium vortex_t      xun PD       0:00      1 (Priority)
+             29325    medium vortex_t      xun PD       0:00      1 (Priority)
+             29326    medium vortex_t      xun PD       0:00      1 (Priority)
+             29327    medium vortex_t      xun PD       0:00      1 (Priority)
+             29328    medium vortex_t      xun PD       0:00      1 (Priority)
+             29329    medium vortex_t      xun PD       0:00      1 (Priority)
+             29330    medium vortex_t      xun PD       0:00      1 (Priority)
+             29331    medium vortex_t      xun PD       0:00      1 (Priority)
+             29332    medium vortex_t      xun PD       0:00      1 (Priority)
+             29333    medium vortex_t      xun PD       0:00      1 (Priority)
+             29334    medium vortex_t      xun PD       0:00      1 (Priority)
+             29335    medium vortex_t      xun PD       0:00      1 (Priority)
+             29336    medium vortex_t      xun PD       0:00      1 (Priority)
+             29337    medium vortex_t      xun PD       0:00      1 (Priority)
+             29338    medium vortex_t      xun PD       0:00      1 (Priority)
+             29339    medium vortex_t      xun PD       0:00      1 (Priority)
+             29340    medium vortex_t      xun PD       0:00      1 (Priority)
+             29341    medium vortex_t      xun PD       0:00      1 (Priority)
+             29342    medium vortex_t      xun PD       0:00      1 (Priority)
+             29353    medium vortex_t      xun PD       0:00      1 (Priority)
+             29354    medium vortex_t      xun PD       0:00      1 (Priority)
+             29355    medium vortex_t      xun PD       0:00      1 (Priority)
+             29356    medium vortex_t      xun PD       0:00      1 (Priority)
+             29352    medium vortex_t      xun PD       0:00      1 (Priority)
+             29351    medium vortex_t      xun PD       0:00      1 (Priority)
+             29350    medium vortex_t      xun PD       0:00      1 (Priority)
+             29349    medium vortex_t      xun PD       0:00      1 (Priority)
+             29348    medium vortex_t      xun PD       0:00      1 (Priority)
+             29347    medium vortex_t      xun PD       0:00      1 (Priority)
+             29346    medium vortex_t      xun PD       0:00      1 (Priority)
+             29345    medium vortex_t      xun PD       0:00      1 (Priority)
+             29344    medium vortex_t      xun PD       0:00      1 (Priority)
+             29343    medium vortex_t      xun PD       0:00      1 (Resources)
+(base) xun@login-node-0:~/vortex_torch$ scancel $(seq 29303 29356)
+(base) xun@login-node-0:~/vortex_torch$ squeue
+             JOBID PARTITION     NAME     USER ST       TIME  NODES NODELIST(REASON)
+             29403      high       m5      xun  R      15:04      1 compute-node-29
+             29402      high       m4      xun  R      16:17      1 compute-node-30
+             29401      high       m9      xun  R      23:21      1 compute-node-27
+             29400      high       m7      xun  R      32:09      1 compute-node-1
+             29396      high       m8      xun  R      51:51      1 compute-node-43
+             29395      high       m6      xun  R      54:39      1 compute-node-16
+             29394      high       m3      xun  R      55:58      1 compute-node-24
+             29393      high    debug    yanke  R      57:10      1 compute-node-19
+             29392      high       m2      xun  R      58:05      1 compute-node-18
+             29383      high ego_pose     linz  R    2:15:23      4 compute-node-[2,4,9,20]
+             29363      high    debug      xun  R    4:22:26      1 compute-node-13
+             29295      high mind_ti2   yicong  R   10:21:27      2 compute-node-[8,22]
+             29290      high     stem      xun  R   11:46:26      4 compute-node-[17,44,46-47]
+             29281      high       m1      xun  R   12:38:48      1 compute-node-10
+             29277      high   q14tis      xun  R   13:22:43      4 compute-node-[11,26,41-42]
+             29262      high semantic     shuo  R   14:12:44      2 compute-node-[37,39]
+             29256      high     stem      xun  R   14:47:54      4 compute-node-[0,14,33-34]
+             29231      high rae_exp5     shuo  R   20:07:44      2 compute-node-[40,45]
+             29196      high    train      xun  R   23:14:51      2 compute-node-[5,21]
+             29155      high    train      xun  R 1-22:47:52      2 compute-node-[6,15]
+             29118      high   yq-exp   yongqi  R 2-12:57:56      1 compute-node-23
+             29011      high    abl_1     linz  R 3-01:56:09      1 compute-node-32
+             28966      high semantic     shuo  R 3-12:21:12      2 compute-node-[28,35]
+             28894      high wm1ego_b    yanke  R 3-21:34:25      4 compute-node-[3,25,31,38]
+             28805      high    train      xun  R 4-16:36:27      2 compute-node-[7,12]
+             27574      high ary-debu    aryan  R 18-15:00:53      1 compute-node-19
+             27293      high nan-debu      nan  R 22-00:16:53      1 compute-node-36
+             29268    medium vortex_b      xun PD       0:00      1 (Priority)
+             29269    medium vortex_b      xun PD       0:00      1 (Priority)
+             29291    medium     stem      xun PD       0:00      4 (Priority)
+(base) xun@login-node-0:~/vortex_torch$ conda deactivate
+xun@login-node-0:~/vortex_torch$ conda deactivate
+xun@login-node-0:~/vortex_torch$ source /home/xun/anaconda3/etc/profile.d/conda.sh
+conda activate vortex_o
+
+which python
+python --version
+/home/xun/anaconda3/envs/vortex_o/bin/python
+Python 3.12.0
+(vortex_o) xun@login-node-0:~/vortex_torch$ bash experiments/submit_tpot.sh 
+Submitted batch job 29404
+Submitted batch job 29405
+Submitted batch job 29406
+Submitted batch job 29407
+(vortex_o) xun@login-node-0:~/vortex_torch$ scancel $(seq 29404 29407)
+(vortex_o) xun@login-node-0:~/vortex_torch$ bash experiments/submit_tpot.sh 
+Submitted batch job 29408
+Submitted batch job 29409
+Submitted batch job 29410
+Submitted batch job 29411
+(vortex_o) xun@login-node-0:~/vortex_torch$ squeue
+             JOBID PARTITION     NAME     USER ST       TIME  NODES NODELIST(REASON)
+             29411      high vortex_t      xun PD       0:00      1 (Priority)
+             29410      high vortex_t      xun PD       0:00      1 (Priority)
+             29409      high vortex_t      xun PD       0:00      1 (Priority)
+             29408      high vortex_t      xun PD       0:00      1 (Resources)
+             29403      high       m5      xun  R      18:00      1 compute-node-29
+             29402      high       m4      xun  R      19:13      1 compute-node-30
+             29401      high       m9      xun  R      26:17      1 compute-node-27
+             29400      high       m7      xun  R      35:05      1 compute-node-1
+             29396      high       m8      xun  R      54:47      1 compute-node-43
+             29395      high       m6      xun  R      57:35      1 compute-node-16
+             29394      high       m3      xun  R      58:54      1 compute-node-24
+             29393      high    debug    yanke  R    1:00:06      1 compute-node-19
+             29392      high       m2      xun  R    1:01:01      1 compute-node-18
+             29383      high ego_pose     linz  R    2:18:19      4 compute-node-[2,4,9,20]
+             29363      high    debug      xun  R    4:25:22      1 compute-node-13
+             29295      high mind_ti2   yicong  R   10:24:23      2 compute-node-[8,22]
+             29290      high     stem      xun  R   11:49:22      4 compute-node-[17,44,46-47]
+             29281      high       m1      xun  R   12:41:44      1 compute-node-10
+             29277      high   q14tis      xun  R   13:25:39      4 compute-node-[11,26,41-42]
+             29262      high semantic     shuo  R   14:15:40      2 compute-node-[37,39]
+             29256      high     stem      xun  R   14:50:50      4 compute-node-[0,14,33-34]
+             29231      high rae_exp5     shuo  R   20:10:40      2 compute-node-[40,45]
+             29196      high    train      xun  R   23:17:47      2 compute-node-[5,21]
+             29155      high    train      xun  R 1-22:50:48      2 compute-node-[6,15]
+             29118      high   yq-exp   yongqi  R 2-13:00:52      1 compute-node-23
+             29011      high    abl_1     linz  R 3-01:59:05      1 compute-node-32
+             28966      high semantic     shuo  R 3-12:24:08      2 compute-node-[28,35]
+             28894      high wm1ego_b    yanke  R 3-21:37:21      4 compute-node-[3,25,31,38]
+             28805      high    train      xun  R 4-16:39:23      2 compute-node-[7,12]
+             27574      high ary-debu    aryan  R 18-15:03:49      1 compute-node-19
+             27293      high nan-debu      nan  R 22-00:19:49      1 compute-node-36
+             29291    medium     stem      xun PD       0:00      4 (Priority)
+             29269    medium vortex_b      xun PD       0:00      1 (Priority)
+             29268    medium vortex_b      xun PD       0:00      1 (Nodes required for job are DOWN, DRAINED or reserved for jobs in higher priority partitions)
+(vortex_o) xun@login-node-0:~/vortex_torch$ squeue
+             JOBID PARTITION     NAME     USER ST       TIME  NODES NODELIST(REASON)
+             29411      high vortex_t      xun PD       0:00      1 (Priority)
+             29410      high vortex_t      xun PD       0:00      1 (Priority)
+             29409      high vortex_t      xun PD       0:00      1 (Priority)
+             29408      high vortex_t      xun PD       0:00      1 (Resources)
+             29403      high       m5      xun  R      18:13      1 compute-node-29
+             29402      high       m4      xun  R      19:26      1 compute-node-30
+             29401      high       m9      xun  R      26:30      1 compute-node-27
+             29400      high       m7      xun  R      35:18      1 compute-node-1
+             29396      high       m8      xun  R      55:00      1 compute-node-43
+             29395      high       m6      xun  R      57:48      1 compute-node-16
+             29394      high       m3      xun  R      59:07      1 compute-node-24
+             29393      high    debug    yanke  R    1:00:19      1 compute-node-19
+             29392      high       m2      xun  R    1:01:14      1 compute-node-18
+             29383      high ego_pose     linz  R    2:18:32      4 compute-node-[2,4,9,20]
+             29363      high    debug      xun  R    4:25:35      1 compute-node-13
+             29295      high mind_ti2   yicong  R   10:24:36      2 compute-node-[8,22]
+             29290      high     stem      xun  R   11:49:35      4 compute-node-[17,44,46-47]
+             29281      high       m1      xun  R   12:41:57      1 compute-node-10
+             29277      high   q14tis      xun  R   13:25:52      4 compute-node-[11,26,41-42]
+             29262      high semantic     shuo  R   14:15:53      2 compute-node-[37,39]
+             29256      high     stem      xun  R   14:51:03      4 compute-node-[0,14,33-34]
+             29231      high rae_exp5     shuo  R   20:10:53      2 compute-node-[40,45]
+             29196      high    train      xun  R   23:18:00      2 compute-node-[5,21]
+             29155      high    train      xun  R 1-22:51:01      2 compute-node-[6,15]
+             29118      high   yq-exp   yongqi  R 2-13:01:05      1 compute-node-23
+             29011      high    abl_1     linz  R 3-01:59:18      1 compute-node-32
+             28966      high semantic     shuo  R 3-12:24:21      2 compute-node-[28,35]
+             28894      high wm1ego_b    yanke  R 3-21:37:34      4 compute-node-[3,25,31,38]
+             28805      high    train      xun  R 4-16:39:36      2 compute-node-[7,12]
+             27574      high ary-debu    aryan  R 18-15:04:02      1 compute-node-19
+             27293      high nan-debu      nan  R 22-00:20:02      1 compute-node-36
+             29291    medium     stem      xun PD       0:00      4 (Priority)
+             29269    medium vortex_b      xun PD       0:00      1 (Priority)
+             29268    medium vortex_b      xun PD       0:00      1 (Nodes required for job are DOWN, DRAINED or reserved for jobs in higher priority partitions)
+(vortex_o) xun@login-node-0:~/vortex_torch$ squeue
+             JOBID PARTITION     NAME     USER ST       TIME  NODES NODELIST(REASON)
+             29411      high vortex_t      xun PD       0:00      1 (Priority)
+             29410      high vortex_t      xun PD       0:00      1 (Priority)
+             29409      high vortex_t      xun PD       0:00      1 (Priority)
+             29408      high vortex_t      xun PD       0:00      1 (Resources)
+             29403      high       m5      xun  R      20:22      1 compute-node-29
+             29402      high       m4      xun  R      21:35      1 compute-node-30
+             29401      high       m9      xun  R      28:39      1 compute-node-27
+             29400      high       m7      xun  R      37:27      1 compute-node-1
+             29396      high       m8      xun  R      57:09      1 compute-node-43
+             29395      high       m6      xun  R      59:57      1 compute-node-16
+             29394      high       m3      xun  R    1:01:16      1 compute-node-24
+             29393      high    debug    yanke  R    1:02:28      1 compute-node-19
+             29392      high       m2      xun  R    1:03:23      1 compute-node-18
+             29383      high ego_pose     linz  R    2:20:41      4 compute-node-[2,4,9,20]
+             29363      high    debug      xun  R    4:27:44      1 compute-node-13
+             29295      high mind_ti2   yicong  R   10:26:45      2 compute-node-[8,22]
+             29290      high     stem      xun  R   11:51:44      4 compute-node-[17,44,46-47]
+             29281      high       m1      xun  R   12:44:06      1 compute-node-10
+             29277      high   q14tis      xun  R   13:28:01      4 compute-node-[11,26,41-42]
+             29262      high semantic     shuo  R   14:18:02      2 compute-node-[37,39]
+             29256      high     stem      xun  R   14:53:12      4 compute-node-[0,14,33-34]
+             29231      high rae_exp5     shuo  R   20:13:02      2 compute-node-[40,45]
+             29196      high    train      xun  R   23:20:09      2 compute-node-[5,21]
+             29155      high    train      xun  R 1-22:53:10      2 compute-node-[6,15]
+             29118      high   yq-exp   yongqi  R 2-13:03:14      1 compute-node-23
+             29011      high    abl_1     linz  R 3-02:01:27      1 compute-node-32
+             28966      high semantic     shuo  R 3-12:26:30      2 compute-node-[28,35]
+             28894      high wm1ego_b    yanke  R 3-21:39:43      4 compute-node-[3,25,31,38]
+             28805      high    train      xun  R 4-16:41:45      2 compute-node-[7,12]
+             27574      high ary-debu    aryan  R 18-15:06:11      1 compute-node-19
+             27293      high nan-debu      nan  R 22-00:22:11      1 compute-node-36
+             29291    medium     stem      xun PD       0:00      4 (Priority)
+             29269    medium vortex_b      xun PD       0:00      1 (Priority)
+             29268    medium vortex_b      xun PD       0:00      1 (Nodes required for job are DOWN, DRAINED or reserved for jobs in higher priority partitions)
+(vortex_o) xun@login-node-0:~/vortex_torch$ scancel 29269 29268
+(vortex_o) xun@login-node-0:~/vortex_torch$ bash experiments/submit.sh 
+Submitted batch job 29414
+Submitted batch job 29415
+Submitted batch job 29416
+Submitted batch job 29417
+Submitted batch job 29418
+Submitted batch job 29419
+(vortex_o) xun@login-node-0:~/vortex_torch$ squeue
+             JOBID PARTITION     NAME     USER ST       TIME  NODES NODELIST(REASON)
+             29413      high     stem      xun PD       0:00      4 (Priority)
+             29411      high vortex_t      xun PD       0:00      1 (Priority)
+             29410      high vortex_t      xun PD       0:00      1 (Priority)
+             29409      high vortex_t      xun PD       0:00      1 (Priority)
+             29408      high vortex_t      xun PD       0:00      1 (Resources)
+             29403      high       m5      xun  R      26:23      1 compute-node-29
+             29402      high       m4      xun  R      27:36      1 compute-node-30
+             29401      high       m9      xun  R      34:40      1 compute-node-27
+             29400      high       m7      xun  R      43:28      1 compute-node-1
+             29396      high       m8      xun  R    1:03:10      1 compute-node-43
+             29395      high       m6      xun  R    1:05:58      1 compute-node-16
+             29394      high       m3      xun  R    1:07:17      1 compute-node-24
+             29393      high    debug    yanke  R    1:08:29      1 compute-node-19
+             29392      high       m2      xun  R    1:09:24      1 compute-node-18
+             29383      high ego_pose     linz  R    2:26:42      4 compute-node-[2,4,9,20]
+             29363      high    debug      xun  R    4:33:45      1 compute-node-13
+             29295      high mind_ti2   yicong  R   10:32:46      2 compute-node-[8,22]
+             29290      high     stem      xun  R   11:57:45      4 compute-node-[17,44,46-47]
+             29281      high       m1      xun  R   12:50:07      1 compute-node-10
+             29277      high   q14tis      xun  R   13:34:02      4 compute-node-[11,26,41-42]
+             29262      high semantic     shuo  R   14:24:03      2 compute-node-[37,39]
+             29256      high     stem      xun  R   14:59:13      4 compute-node-[0,14,33-34]
+             29231      high rae_exp5     shuo  R   20:19:03      2 compute-node-[40,45]
+             29196      high    train      xun  R   23:26:10      2 compute-node-[5,21]
+             29155      high    train      xun  R 1-22:59:11      2 compute-node-[6,15]
+             29118      high   yq-exp   yongqi  R 2-13:09:15      1 compute-node-23
+             29011      high    abl_1     linz  R 3-02:07:28      1 compute-node-32
+             28966      high semantic     shuo  R 3-12:32:31      2 compute-node-[28,35]
+             28894      high wm1ego_b    yanke  R 3-21:45:44      4 compute-node-[3,25,31,38]
+             28805      high    train      xun  R 4-16:47:46      2 compute-node-[7,12]
+             27574      high ary-debu    aryan  R 18-15:12:12      1 compute-node-19
+             27293      high nan-debu      nan  R 22-00:28:12      1 compute-node-36
+             29291    medium     stem      xun PD       0:00      4 (Nodes required for job are DOWN, DRAINED or reserved for jobs in higher priority partitions)
+             29416    medium vortex_s      xun PD       0:00      1 (Priority)
+             29417    medium vortex_s      xun PD       0:00      1 (Priority)
+             29418    medium vortex_q      xun PD       0:00      1 (Priority)
+             29419    medium vortex_q      xun PD       0:00      1 (Priority)
+             29415    medium vortex_b      xun PD       0:00      1 (Priority)
+             29414    medium vortex_b      xun PD       0:00      1 (Priority)
+(vortex_o) xun@login-node-0:~/vortex_torch$ scancel $(seq 29414 29419)
+(vortex_o) xun@login-node-0:~/vortex_torch$ bash experiments/submit.sh 
+Submitted batch job 29420
+Submitted batch job 29421
+Submitted batch job 29422
+Submitted batch job 29423
+Submitted batch job 29424
+Submitted batch job 29425
+(vortex_o) xun@login-node-0:~/vortex_torch$ squeue
+             JOBID PARTITION     NAME     USER ST       TIME  NODES NODELIST(REASON)
+             29413      high     stem      xun PD       0:00      4 (Priority)
+             29411      high vortex_t      xun PD       0:00      1 (Priority)
+             29410      high vortex_t      xun PD       0:00      1 (Priority)
+             29409      high vortex_t      xun PD       0:00      1 (Priority)
+             29408      high vortex_t      xun PD       0:00      1 (Resources)
+             29425      high vortex_q      xun PD       0:00      1 (Priority)
+             29424      high vortex_q      xun PD       0:00      1 (Priority)
+             29423      high vortex_s      xun PD       0:00      1 (Priority)
+             29422      high vortex_s      xun PD       0:00      1 (Priority)
+             29421      high vortex_b      xun PD       0:00      1 (Priority)
+             29420      high vortex_b      xun PD       0:00      1 (Priority)
+             29403      high       m5      xun  R      27:38      1 compute-node-29
+             29402      high       m4      xun  R      28:51      1 compute-node-30
+             29401      high       m9      xun  R      35:55      1 compute-node-27
+             29400      high       m7      xun  R      44:43      1 compute-node-1
+             29396      high       m8      xun  R    1:04:25      1 compute-node-43
+             29395      high       m6      xun  R    1:07:13      1 compute-node-16
+             29394      high       m3      xun  R    1:08:32      1 compute-node-24
+             29393      high    debug    yanke  R    1:09:44      1 compute-node-19
+             29392      high       m2      xun  R    1:10:39      1 compute-node-18
+             29383      high ego_pose     linz  R    2:27:57      4 compute-node-[2,4,9,20]
+             29363      high    debug      xun  R    4:35:00      1 compute-node-13
+             29295      high mind_ti2   yicong  R   10:34:01      2 compute-node-[8,22]
+             29290      high     stem      xun  R   11:59:00      4 compute-node-[17,44,46-47]
+             29281      high       m1      xun  R   12:51:22      1 compute-node-10
+             29277      high   q14tis      xun  R   13:35:17      4 compute-node-[11,26,41-42]
+             29262      high semantic     shuo  R   14:25:18      2 compute-node-[37,39]
+             29256      high     stem      xun  R   15:00:28      4 compute-node-[0,14,33-34]
+             29231      high rae_exp5     shuo  R   20:20:18      2 compute-node-[40,45]
+             29196      high    train      xun  R   23:27:25      2 compute-node-[5,21]
+             29155      high    train      xun  R 1-23:00:26      2 compute-node-[6,15]
+             29118      high   yq-exp   yongqi  R 2-13:10:30      1 compute-node-23
+             29011      high    abl_1     linz  R 3-02:08:43      1 compute-node-32
+             28966      high semantic     shuo  R 3-12:33:46      2 compute-node-[28,35]
+             28894      high wm1ego_b    yanke  R 3-21:46:59      4 compute-node-[3,25,31,38]
+             28805      high    train      xun  R 4-16:49:01      2 compute-node-[7,12]
+             27574      high ary-debu    aryan  R 18-15:13:27      1 compute-node-19
+             27293      high nan-debu      nan  R 22-00:29:27      1 compute-node-36
+             29291    medium     stem      xun PD       0:00      4 (Nodes required for job are DOWN, DRAINED or reserved for jobs in higher priority partitions)
+(vortex_o) xun@login-node-0:~/vortex_torch$ squeue
+             JOBID PARTITION     NAME     USER ST       TIME  NODES NODELIST(REASON)
+             29420      high vortex_b      xun  R       7:17      1 compute-node-30
+             29421      high vortex_b      xun  R       7:17      1 compute-node-16
+             29408      high vortex_t      xun  R      11:23      1 compute-node-17
+             29409      high vortex_t      xun  R      11:23      1 compute-node-44
+             29410      high vortex_t      xun  R      11:23      1 compute-node-46
+             29411      high vortex_t      xun  R      11:23      1 compute-node-47
+             29394      high       m3      xun  R    1:24:14      1 compute-node-24
+             29393      high    debug    yanke  R    1:25:26      1 compute-node-19
+             29392      high       m2      xun  R    1:26:21      1 compute-node-18
+             29383      high ego_pose     linz  R    2:43:39      4 compute-node-[2,4,9,20]
+             29363      high    debug      xun  R    4:50:42      1 compute-node-13
+             29295      high mind_ti2   yicong  R   10:49:43      2 compute-node-[8,22]
+             29281      high       m1      xun  R   13:07:04      1 compute-node-10
+             29277      high   q14tis      xun  R   13:50:59      4 compute-node-[11,26,41-42]
+             29262      high semantic     shuo  R   14:41:00      2 compute-node-[37,39]
+             29256      high     stem      xun  R   15:16:10      4 compute-node-[0,14,33-34]
+             29231      high rae_exp5     shuo  R   20:36:00      2 compute-node-[40,45]
+             29196      high    train      xun  R   23:43:07      2 compute-node-[5,21]
+             29155      high    train      xun  R 1-23:16:08      2 compute-node-[6,15]
+             29118      high   yq-exp   yongqi  R 2-13:26:12      1 compute-node-23
+             29011      high    abl_1     linz  R 3-02:24:25      1 compute-node-32
+             28966      high semantic     shuo  R 3-12:49:28      2 compute-node-[28,35]
+             28894      high wm1ego_b    yanke  R 3-22:02:41      4 compute-node-[3,25,31,38]
+             28805      high    train      xun  R 4-17:04:43      2 compute-node-[7,12]
+             27574      high ary-debu    aryan  R 18-15:29:09      1 compute-node-19
+             27293      high nan-debu      nan  R 22-00:45:09      1 compute-node-36
+(vortex_o) xun@login-node-0:~/vortex_torch$ squeue
+             JOBID PARTITION     NAME     USER ST       TIME  NODES NODELIST(REASON)
+             29420      high vortex_b      xun  R      11:10      1 compute-node-30
+             29421      high vortex_b      xun  R      11:10      1 compute-node-16
+             29410      high vortex_t      xun  R      15:16      1 compute-node-46
+             29411      high vortex_t      xun  R      15:16      1 compute-node-47
+             29394      high       m3      xun  R    1:28:07      1 compute-node-24
+             29393      high    debug    yanke  R    1:29:19      1 compute-node-19
+             29392      high       m2      xun  R    1:30:14      1 compute-node-18
+             29383      high ego_pose     linz  R    2:47:32      4 compute-node-[2,4,9,20]
+             29363      high    debug      xun  R    4:54:35      1 compute-node-13
+             29295      high mind_ti2   yicong  R   10:53:36      2 compute-node-[8,22]
+             29281      high       m1      xun  R   13:10:57      1 compute-node-10
+             29277      high   q14tis      xun  R   13:54:52      4 compute-node-[11,26,41-42]
+             29262      high semantic     shuo  R   14:44:53      2 compute-node-[37,39]
+             29256      high     stem      xun  R   15:20:03      4 compute-node-[0,14,33-34]
+             29231      high rae_exp5     shuo  R   20:39:53      2 compute-node-[40,45]
+             29196      high    train      xun  R   23:47:00      2 compute-node-[5,21]
+             29155      high    train      xun  R 1-23:20:01      2 compute-node-[6,15]
+             29118      high   yq-exp   yongqi  R 2-13:30:05      1 compute-node-23
+             29011      high    abl_1     linz  R 3-02:28:18      1 compute-node-32
+             28966      high semantic     shuo  R 3-12:53:21      2 compute-node-[28,35]
+             28894      high wm1ego_b    yanke  R 3-22:06:34      4 compute-node-[3,25,31,38]
+             28805      high    train      xun  R 4-17:08:36      2 compute-node-[7,12]
+             27574      high ary-debu    aryan  R 18-15:33:02      1 compute-node-19
+             27293      high nan-debu      nan  R 22-00:49:02      1 compute-node-36
+(vortex_o) xun@login-node-0:~/vortex_torch$ squeue
+             JOBID PARTITION     NAME     USER ST       TIME  NODES NODELIST(REASON)
+             29429      high       v1      xun  R       0:15      1 compute-node-1
+             29428      high     stem      xun  R       0:45      2 compute-node-[43-44]
+             29420      high vortex_b      xun  R      15:11      1 compute-node-30
+             29421      high vortex_b      xun  R      15:11      1 compute-node-16
+             29411      high vortex_t      xun  R      19:17      1 compute-node-47
+             29394      high       m3      xun  R    1:32:08      1 compute-node-24
+             29393      high    debug    yanke  R    1:33:20      1 compute-node-19
+             29392      high       m2      xun  R    1:34:15      1 compute-node-18
+             29383      high ego_pose     linz  R    2:51:33      4 compute-node-[2,4,9,20]
+             29363      high    debug      xun  R    4:58:36      1 compute-node-13
+             29295      high mind_ti2   yicong  R   10:57:37      2 compute-node-[8,22]
+             29281      high       m1      xun  R   13:14:58      1 compute-node-10
+             29277      high   q14tis      xun  R   13:58:53      4 compute-node-[11,26,41-42]
+             29262      high semantic     shuo  R   14:48:54      2 compute-node-[37,39]
+             29256      high     stem      xun  R   15:24:04      4 compute-node-[0,14,33-34]
+             29231      high rae_exp5     shuo  R   20:43:54      2 compute-node-[40,45]
+             29196      high    train      xun  R   23:51:01      2 compute-node-[5,21]
+             29155      high    train      xun  R 1-23:24:02      2 compute-node-[6,15]
+             29118      high   yq-exp   yongqi  R 2-13:34:06      1 compute-node-23
+             29011      high    abl_1     linz  R 3-02:32:19      1 compute-node-32
+             28966      high semantic     shuo  R 3-12:57:22      2 compute-node-[28,35]
+             28894      high wm1ego_b    yanke  R 3-22:10:35      4 compute-node-[3,25,31,38]
+             28805      high    train      xun  R 4-17:12:37      2 compute-node-[7,12]
+             27574      high ary-debu    aryan  R 18-15:37:03      1 compute-node-19
+             27293      high nan-debu      nan  R 22-00:53:03      1 compute-node-36
+(vortex_o) xun@login-node-0:~/vortex_torch$ squeue
+             JOBID PARTITION     NAME     USER ST       TIME  NODES NODELIST(REASON)
+             29433      high     stem      xun  R       3:12      2 compute-node-[0,14]
+             29428      high     stem      xun  R       9:40      2 compute-node-[43-44]
+             29420      high vortex_b      xun  R      24:06      1 compute-node-30
+             29421      high vortex_b      xun  R      24:06      1 compute-node-16
+             29411      high vortex_t      xun  R      28:12      1 compute-node-47
+             29394      high       m3      xun  R    1:41:03      1 compute-node-24
+             29393      high    debug    yanke  R    1:42:15      1 compute-node-19
+             29392      high       m2      xun  R    1:43:10      1 compute-node-18
+             29383      high ego_pose     linz  R    3:00:28      4 compute-node-[2,4,9,20]
+             29363      high    debug      xun  R    5:07:31      1 compute-node-13
+             29295      high mind_ti2   yicong  R   11:06:32      2 compute-node-[8,22]
+             29281      high       m1      xun  R   13:23:53      1 compute-node-10
+             29277      high   q14tis      xun  R   14:07:48      4 compute-node-[11,26,41-42]
+             29262      high semantic     shuo  R   14:57:49      2 compute-node-[37,39]
+             29231      high rae_exp5     shuo  R   20:52:49      2 compute-node-[40,45]
+             29196      high    train      xun  R   23:59:56      2 compute-node-[5,21]
+             29155      high    train      xun  R 1-23:32:57      2 compute-node-[6,15]
+             29118      high   yq-exp   yongqi  R 2-13:43:01      1 compute-node-23
+             29011      high    abl_1     linz  R 3-02:41:14      1 compute-node-32
+             28966      high semantic     shuo  R 3-13:06:17      2 compute-node-[28,35]
+             28894      high wm1ego_b    yanke  R 3-22:19:30      4 compute-node-[3,25,31,38]
+             28805      high    train      xun  R 4-17:21:32      2 compute-node-[7,12]
+             27574      high ary-debu    aryan  R 18-15:45:58      1 compute-node-19
+             27293      high nan-debu      nan  R 22-01:01:58      1 compute-node-36
+(vortex_o) xun@login-node-0:~/vortex_torch$ 
