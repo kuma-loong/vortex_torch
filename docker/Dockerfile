@@ -1,16 +1,18 @@
 FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
-
-# Override at build time, for example:
-#   --build-arg TORCH_CUDA_ARCH_LIST="9.0"
-# A100: 8.0, RTX 4090/L40: 8.9, H100/H200: 9.0
-ARG TORCH_CUDA_ARCH_LIST="9.0"
-ENV TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}"
-
-# Use bash so venv/path behavior is predictable
 SHELL ["/bin/bash", "-c"]
 
+ARG TORCH_CUDA_ARCH_LIST="9.0"
+ARG VORTEX_TORCH_REF="v0.3"
+ARG AWS_EFA_INSTALLER_URL="https://efa-installer.amazonaws.com/aws-efa-installer-latest.tar.gz"
+
+ENV TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" \
+    VIRTUAL_ENV="/opt/venv" \
+    PATH="/opt/venv/bin:/opt/amazon/efa/bin:${PATH}" \
+    LD_LIBRARY_PATH="/opt/amazon/efa/lib:/opt/amazon/ofi-nccl/lib/x86_64-linux-gnu:/opt/amazon/ofi-nccl/lib:/opt/aws-ofi-nccl/lib:${LD_LIBRARY_PATH}"
+
+# Base system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-dev \
@@ -23,35 +25,85 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     ninja-build \
     wget \
+    tar \
+    unzip \
+    cpio \
+    iproute2 \
+    pciutils \
+    environment-modules \
+    tcl \
+    libnuma1 \
+    libnuma-dev \
+    libhwloc15 \
     && ln -sf /usr/bin/python3 /usr/bin/python \
     && rm -rf /var/lib/apt/lists/*
 
-# Create isolated Python environment to avoid Ubuntu 24.04 PEP 668 error
-RUN python3 -m venv /opt/venv
+# Optional AWS kernel headers/packages; don't fail build if unavailable
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    linux-aws \
+    linux-headers-aws \
+    || true \
+    && rm -rf /var/lib/apt/lists/*
 
-ENV PATH="/opt/venv/bin:${PATH}"
-ENV VIRTUAL_ENV="/opt/venv"
-
-RUN python -m pip install --upgrade pip setuptools wheel
-
-ARG VORTEX_TORCH_REF=v0.3
+# Python virtual environment
+RUN python3 -m venv /opt/venv \
+    && python -m pip install --upgrade pip setuptools wheel
 
 WORKDIR /workspace
 
+# Clone vortex_torch
 RUN git clone -b "${VORTEX_TORCH_REF}" --recursive \
     https://github.com/Infini-AI-Lab/vortex_torch.git
 
-# Install SGLang first
+# Install SGLang
 WORKDIR /workspace/vortex_torch/third_party/sglang
-
 RUN bash install.sh
 
 # Install vortex_torch
 WORKDIR /workspace/vortex_torch
-
 RUN pip install --no-cache-dir -e .
 
-# Optional: verify Python environment
-RUN which python && python --version && which pip && pip --version
+# Install AWS EFA without kernel module / MPI
+WORKDIR /workspace
+RUN curl -fsSL -o aws-efa-installer-latest.tar.gz "${AWS_EFA_INSTALLER_URL}" \
+    && tar --no-same-owner -xf aws-efa-installer-latest.tar.gz \
+    && cd aws-efa-installer \
+    && ./efa_installer.sh -y --skip-kmod --disable-ngc --skip-mpi \
+    && cd /workspace \
+    && rm -rf aws-efa-installer aws-efa-installer-latest.tar.gz
+
+# Install AWS CLI v2
+RUN curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" \
+    -o "/tmp/awscliv2.zip" \
+    && unzip -q /tmp/awscliv2.zip -d /tmp \
+    && /tmp/aws/install \
+    && rm -rf /tmp/aws /tmp/awscliv2.zip
+
+# Runtime checks
+RUN which python \
+    && python --version \
+    && which pip \
+    && pip --version \
+    && python - <<'PY'
+import ctypes
+ctypes.CDLL("libnuma.so.1")
+print("OK: libnuma.so.1 loaded")
+PY
+
+# Verify NCCL OFI plugin if installed
+RUN plugin_path="$(find /opt/amazon /opt/aws-ofi-nccl -name 'libnccl-net.so' -print -quit 2>/dev/null || true)" \
+    && if [[ -n "${plugin_path}" ]]; then \
+        ldconfig; \
+        for required_lib in libhwloc.so.15 libfabric.so.1 libefa.so.1 libibverbs.so.1; do \
+            ldconfig -p | grep -q "${required_lib}" || exit 1; \
+        done; \
+        ldd "${plugin_path}"; \
+        ! ldd "${plugin_path}" | grep -q "not found"; \
+        echo "Found NCCL net plugin at ${plugin_path}"; \
+    else \
+        echo "WARNING: libnccl-net.so not found"; \
+    fi
+
+WORKDIR /workspace/vortex_torch
 
 CMD ["/bin/bash"]
