@@ -57,7 +57,10 @@ Bootstrap (do these in order; each file once):
 Iterate loop (repeat until I say stop):
 
 4. Design the next batch.
-   - N = `nvidia-smi -L | wc -l`  (one variant per local GPU).
+   - Detect the free GPU set:
+     `FREE_GPUS=($(algorithm_scientist/free_gpus.sh)) || { echo "no free GPUs — wait"; exit 1; }`
+     `N=${#FREE_GPUS[@]}`  (one variant per *free* GPU; not the
+     physical count — other users may share this host).
    - State the theme in one short paragraph.
    - List the knob matrix — one knob varied per variant.
    - **At least one variant must be off-catalog** (papers/guide.md §16):
@@ -78,14 +81,18 @@ Iterate loop (repeat until I say stop):
        "vortex_module_name": "<tag>_batch_<x>_id<y>_cls"
 
 6. Pre-flight all N locally (CPU-only):
-       for i in $(seq 0 $((N - 1))); do
-         python -c "from vortex_torch.engine.sgl import check_engine_config; check_engine_config('submissions/<tag>/batch_<x>_id${i}.json')"
+       for y in $(seq 0 $((N - 1))); do
+         python -c "from vortex_torch.engine.sgl import check_engine_config; check_engine_config('submissions/<tag>/batch_<x>_id${y}.json')"
        done
    Drop or fix any failing variant before launch.
 
-7. Launch via the /batch-benchmark slash command, passing the N
-   names: `batch_<x>_id0 batch_<x>_id1 ... batch_<x>_id<N-1>`.
-   Add a row to memory.md §1.
+7. Re-detect free GPUs immediately before launch (the set may have
+   shifted during pre-flight). If FREE_GPUS shrank, drop trailing
+   variants from the launch list. Launch via the /batch-benchmark
+   slash command, passing the N names:
+   `batch_<x>_id0 batch_<x>_id1 ... batch_<x>_id<N-1>`. The slash
+   command pins each variant to FREE_GPUS[y], not to GPU y. Add a
+   row to memory.md §1.
 
 8. While the batch runs (8+ hours), on each polling cycle do
    exactly ONE of:

@@ -17,8 +17,10 @@ naming convention is:
 - `submissions/<tag>/batch_<x>_id<y>.json`
 
 where `<x>` is the batch index (0-indexed, incrementing across
-batches you launch this session) and `<y>` is the per-GPU variant
-index within that batch (`0 … N-1`, `N = nvidia-smi -L | wc -l`).
+batches you launch this session) and `<y>` is the variant slot
+within that batch (`0 … N-1`, where `N` is the count of
+*currently-free* GPUs returned by
+`algorithm_scientist/free_gpus.sh` — not the physical GPU count).
 
 ### Tag — your agent identifier
 
@@ -524,16 +526,28 @@ variants that both clear the floor, pick the one with higher
 
 ---
 
-## 5c. Batched benchmarking — fill every local GPU per batch
+## 5c. Batched benchmarking — fill every *free* local GPU per batch
 
-The workflow **requires every batch to fill every local GPU** — one
-variant per GPU. The exact batch size depends on the host: detect it
-at the start of every batch and treat that number as `N`:
+The workflow **requires every batch to fill every locally-free
+GPU** — one variant per free GPU. The host may share GPUs with
+other users or jobs, so the batch size depends on what's actually
+available *now*, not on `nvidia-smi -L | wc -l`. Detect free GPUs
+at the start of every batch with the helper:
 
 ```bash
-NUM_GPUS=$(nvidia-smi -L | wc -l)   # or: python -c "import torch; print(torch.cuda.device_count())"
-echo "this host has $NUM_GPUS GPUs"
+FREE_GPUS=($(algorithm_scientist/free_gpus.sh)) || {
+    echo "no free GPUs — wait, do not launch" >&2
+    exit 1
+}
+N=${#FREE_GPUS[@]}
+echo "free GPUs: ${FREE_GPUS[*]}   (N=$N)"
 ```
+
+`free_gpus.sh` excludes any GPU that has a running compute process
+*or* has memory.used ≥ 1024 MiB (override threshold via
+`free_gpus.sh <mib>`). It exits non-zero when nothing is free —
+treat that as a hard "wait" signal, identical to the
+"concurrency cap" rule.
 
 Single-variant runs are not part of the protocol. If you have only
 one core idea, fill the other `N - 1` slots with orthogonal knob
@@ -541,24 +555,29 @@ sweeps (different `vortex_topk_val`, different `kv_cache_dtype`,
 different `vortex_layers_skip`, different `vortex_block_size`, etc.).
 
 Launch the `N` variants by forking `N` background `python`
-processes, each pinned to its own GPU via `CUDA_VISIBLE_DEVICES`:
+processes, each pinned to one of the *free* GPU indices via
+`CUDA_VISIBLE_DEVICES`:
 
 ```bash
 TAG=claude_opus_4_7                      # ← your agent identifier
 BATCH=$(ls -d submissions/$TAG/batch_*_id0.json 2>/dev/null | wc -l)   # next batch index
-NUM_GPUS=$(nvidia-smi -L | wc -l)
+FREE_GPUS=($(algorithm_scientist/free_gpus.sh)) || { echo "no free GPUs"; exit 1; }
+N=${#FREE_GPUS[@]}
 LOGDIR="logs/submission/${TAG}_batch_${BATCH}_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$LOGDIR"
 
 # Variants for this batch live at submissions/<tag>/batch_<x>_id<y>.{py,json},
-# one per GPU (id 0 … NUM_GPUS-1).
-for i in $(seq 0 $((NUM_GPUS - 1))); do
-    cfg="submissions/${TAG}/batch_${BATCH}_id${i}.json"
+# one per free GPU (id 0 … N-1, where N tracks the free count, not the
+# physical GPU count). The y index is the variant slot, NOT the GPU index;
+# CUDA_VISIBLE_DEVICES is set from FREE_GPUS[$y] below.
+for y in $(seq 0 $((N - 1))); do
+    cfg="submissions/${TAG}/batch_${BATCH}_id${y}.json"
+    gpu="${FREE_GPUS[$y]}"
     stem=$(basename "$cfg" .json)
-    CUDA_VISIBLE_DEVICES=$i \
+    CUDA_VISIBLE_DEVICES=$gpu \
         python algorithm_scientist/run_submission_aime24.py --config "$cfg" \
-        > "$LOGDIR/gpu${i}_${stem}.out" \
-        2> "$LOGDIR/gpu${i}_${stem}.err" &
+        > "$LOGDIR/gpu${gpu}_${stem}.out" \
+        2> "$LOGDIR/gpu${gpu}_${stem}.err" &
 done
 wait
 ```
@@ -586,13 +605,18 @@ The runner (`run_submission_aime24.py`) automatically records
 `cat summary_submissions/<tag>/*/INDEX.jsonl | jq -c` tells you
 which variant landed on which GPU.
 
-### Concurrency cap — one batch at a time
+### Concurrency cap — one batch at a time on the free GPUs
 
-A batch consumes every local GPU. **Do not launch a second batch
-while the first is still running** — it would contend for GPU memory
-and either OOM or thrash. The natural cadence is: launch a batch,
-`wait`, read the `N` summary JSONs, then design and launch the
-next batch.
+A batch consumes every GPU `free_gpus.sh` returned. **Do not launch
+a second batch while the first is still running**, and **do not try
+to "fill the gaps" by launching extra variants on GPUs another user
+freed mid-batch** — both contend for GPU memory and either OOM or
+thrash. The natural cadence is: detect free GPUs, launch a batch
+sized to that count, `wait`, read the `N` summary JSONs, then
+re-detect (the free set may have changed) and launch the next batch.
+
+If `free_gpus.sh` returns an empty set (exit code 1), do not
+launch — wait, and use the time on the §5d activities.
 
 ### Novelty budget — at least one off-catalog variant per batch
 

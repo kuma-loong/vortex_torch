@@ -134,12 +134,21 @@ CLAUDE_MD = dedent("""\
     ## Running the benchmark — policy
 
     **The only allowed unit of work is one batch that fills every
-    local GPU.** Detect the GPU count at the start of every batch and
-    treat that number as `N`:
+    *free* local GPU.** The host may share GPUs with other users; the
+    batch size depends on what's actually available *now*, not on the
+    physical GPU count. Detect free GPUs at the start of every batch:
 
     ```bash
-    NUM_GPUS=$(nvidia-smi -L | wc -l)   # or: python -c "import torch; print(torch.cuda.device_count())"
+    FREE_GPUS=($(algorithm_scientist/free_gpus.sh)) || {
+        echo "no free GPUs — wait, do not launch" >&2; exit 1
+    }
+    N=${#FREE_GPUS[@]}
+    echo "free GPUs: ${FREE_GPUS[*]}  (N=$N)"
     ```
+
+    `free_gpus.sh` excludes GPUs that have a compute process running
+    on them or memory.used ≥ 1024 MiB (override via
+    `free_gpus.sh <mib>`). Empty result (exit 1) ⇒ hard wait.
 
     **File layout.** All submissions you write live under
     `submissions/<tag>/`, where `<tag>` is your agent identifier
@@ -152,31 +161,36 @@ CLAUDE_MD = dedent("""\
     1. **`N` orthogonal variants** —
        `submissions/<tag>/batch_<x>_id0.{py,json}` …
        `submissions/<tag>/batch_<x>_id<N-1>.{py,json}` — varying
-       different knobs.
+       different knobs. `N = ${#FREE_GPUS[@]}`, the number of
+       currently-free GPUs (NOT the physical GPU count).
     2. **Cheap local pre-flight first** for all `N` (CPU, no GPU):
        ```bash
        TAG=<your_agent_tag>; BATCH=<batch_index>
-       for i in $(seq 0 $((NUM_GPUS - 1))); do
-         python -c "from vortex_torch.engine.sgl import check_engine_config; check_engine_config('submissions/${TAG}/batch_${BATCH}_id${i}.json')"
+       for y in $(seq 0 $((N - 1))); do
+         python -c "from vortex_torch.engine.sgl import check_engine_config; check_engine_config('submissions/${TAG}/batch_${BATCH}_id${y}.json')"
        done
        ```
        Refuse to launch any variant whose pre-flight fails.
-    3. **Launch `N` background `python` processes**, one per GPU
-       `0 … N-1`, and `wait` for them all to finish:
+    3. **Launch `N` background `python` processes**, one per *free*
+       GPU (pinned via `CUDA_VISIBLE_DEVICES=${FREE_GPUS[$y]}`), and
+       `wait` for them all to finish:
        ```bash
        LOGDIR="logs/submission/${TAG}_batch_${BATCH}_$(date +%Y%m%d_%H%M%S)"
        mkdir -p "$LOGDIR"
-       for i in $(seq 0 $((NUM_GPUS - 1))); do
-           cfg="submissions/${TAG}/batch_${BATCH}_id${i}.json"
+       for y in $(seq 0 $((N - 1))); do
+           cfg="submissions/${TAG}/batch_${BATCH}_id${y}.json"
+           gpu="${FREE_GPUS[$y]}"
            stem=$(basename "$cfg" .json)
-           CUDA_VISIBLE_DEVICES=$i \\
+           CUDA_VISIBLE_DEVICES=$gpu \\
                python algorithm_scientist/run_submission_aime24.py --config "$cfg" \\
-               > "$LOGDIR/gpu${i}_${stem}.out" \\
-               2> "$LOGDIR/gpu${i}_${stem}.err" &
+               > "$LOGDIR/gpu${gpu}_${stem}.out" \\
+               2> "$LOGDIR/gpu${gpu}_${stem}.err" &
        done
        wait
        ```
-       Each child writes its result into
+       The id `<y>` is the variant slot (0…N-1), NOT a GPU index —
+       the actual GPU comes from `FREE_GPUS[$y]`. Each child writes
+       its result into
        `summary_submissions/<tag>/<stem>/<timestamp>__<hash>.json`
        and updates `latest.json` on its own. The runner mirrors the
        config's path under `submissions/` into `summary_submissions/`,
@@ -185,10 +199,13 @@ CLAUDE_MD = dedent("""\
        isolation, no collisions between agents that happen to use
        the same `batch_x_idy` stem.
 
-    4. **One batch at a time.** Every local GPU is consumed by the
-       running batch — do not launch a second batch in parallel.
-       Use `jobs` (or `ls -lt summary_submissions/<tag>/*/latest.json`)
-       to see how many children are still alive while you wait.
+    4. **One batch at a time on the free GPUs.** Do not launch a
+       second batch while the first is still running, and do not
+       try to "fill the gaps" by launching extra variants on GPUs
+       another user freed mid-batch — both contend for memory and
+       either OOM or thrash. Use `jobs` (or `ls -lt
+       summary_submissions/<tag>/*/latest.json`) to see how many
+       children are still alive while you wait.
 
     ## While you wait (8+ hrs per batch)
 
@@ -253,7 +270,7 @@ CLAUDE_MD = dedent("""\
 
     - `/new-submission <name>` — scaffold a new submission pair.
     - `/preflight <name>`      — run the cheap local pre-flight.
-    - `/batch-benchmark <n1> … <nN>` — launch exactly `N` variants in parallel, where `N = nvidia-smi -L | wc -l` (the only sanctioned benchmark command).
+    - `/batch-benchmark <n1> … <nN>` — launch exactly `N` variants in parallel on the *currently-free* GPUs (`N = $(algorithm_scientist/free_gpus.sh | wc -w)`; the only sanctioned benchmark command).
     - `/review <name>`         — audit a submission against AGENTS.md rules.
     - `/iterate <name>`        — kick off a full auto-iteration loop (batches that fill every local GPU, one batch at a time, updates memory.md).
     - `/benchmark <name>`      — *debug only*: run a single variant directly. Do not use in normal workflow.
@@ -302,8 +319,11 @@ SUBMISSION_WRITER = dedent("""\
     For batched runs (the standard `/batch-benchmark` and `/iterate`
     workflow), `<name>` follows the convention `batch_<x>_id<y>`
     where `<x>` is the batch index (0-indexed, increments with each
-    batch you launch this session) and `<y>` is the per-GPU variant
-    index (`0 … N-1`, `N = nvidia-smi -L | wc -l`).
+    batch you launch this session) and `<y>` is the variant slot
+    (`0 … N-1`, where `N` is the count of *currently-free* GPUs
+    returned by `algorithm_scientist/free_gpus.sh` — not the
+    physical GPU count). The actual GPU each variant pins to is
+    `FREE_GPUS[$y]`, not `$y` itself.
 
     ### First action of every session — pick your tag
 
@@ -365,14 +385,22 @@ SUBMISSION_WRITER = dedent("""\
        `"disable_radix_cache": true` (default `false`). Pre-flight
        rejects the violation.
 
-    ## Mandatory protocol — one batch fills every local GPU
+    ## Mandatory protocol — one batch fills every *free* local GPU
 
     Every batch contains exactly `N` variants, where `N` is the
-    number of GPUs on this host. Detect it once at the start of every
-    batch and reuse the value:
+    number of GPUs that `algorithm_scientist/free_gpus.sh` reports as
+    free *right now*. The host may share GPUs with other users; never
+    assume the full physical count is yours. Detect at the start of
+    every batch and reuse the array:
     ```bash
-    NUM_GPUS=$(nvidia-smi -L | wc -l)   # or: python -c "import torch; print(torch.cuda.device_count())"
+    FREE_GPUS=($(algorithm_scientist/free_gpus.sh)) || {
+        echo "no free GPUs — wait, do not launch" >&2; exit 1
+    }
+    N=${#FREE_GPUS[@]}
     ```
+    `free_gpus.sh` excludes any GPU with a running compute process
+    or memory.used ≥ 1024 MiB. Empty result (exit 1) is a hard
+    "wait" signal — go to the wait-time activities, do not launch.
 
     1. **Open `algorithm_scientist/memory.md`.** Skim §1 (in-flight
        batches), §2 (completed), §3 (open hypotheses), §6 (backlog).
@@ -401,28 +429,36 @@ SUBMISSION_WRITER = dedent("""\
     4. **Pre-flight all `N` locally** (CPU-only, fast):
        ```bash
        TAG=<your_tag>; BATCH=<x>
-       for i in $(seq 0 $((NUM_GPUS - 1))); do
-         python -c "from vortex_torch.engine.sgl import check_engine_config; check_engine_config('submissions/${TAG}/batch_${BATCH}_id${i}.json')"
+       for y in $(seq 0 $((N - 1))); do
+         python -c "from vortex_torch.engine.sgl import check_engine_config; check_engine_config('submissions/${TAG}/batch_${BATCH}_id${y}.json')"
        done
        ```
        Drop or fix any failing variant before step 6.
-    5. **Check the concurrency cap.** Only **one** batch may run at a
-       time — every local GPU is fully consumed. If `jobs` (or any
-       prior background `wait` you started) shows children still
-       alive, DO NOT launch — work on the wait-time activities
-       below until they finish.
+    5. **Re-check free GPUs and the concurrency cap.** Only **one**
+       batch may run at a time on the GPUs you launched on. Re-run
+       `algorithm_scientist/free_gpus.sh` immediately before launch
+       (state may have changed during pre-flight) and reconcile:
+       - If your `${FREE_GPUS[@]}` shrank, drop the trailing variants
+         from the launch list (or fail and re-design with the new
+         smaller `N`).
+       - If `jobs` shows children from a previous `wait` you started
+         are still alive, DO NOT launch — work on the wait-time
+         activities below until they finish.
+       - If `free_gpus.sh` returns nothing (exit 1), DO NOT launch —
+         hard wait.
     6. **Launch the batch** (the ONLY sanctioned benchmark form):
        ```bash
        TAG=<your_tag>; BATCH=<x>
        LOGDIR="logs/submission/${TAG}_batch_${BATCH}_$(date +%Y%m%d_%H%M%S)"
        mkdir -p "$LOGDIR"
-       for i in $(seq 0 $((NUM_GPUS - 1))); do
-           cfg="submissions/${TAG}/batch_${BATCH}_id${i}.json"
+       for y in $(seq 0 $((N - 1))); do
+           cfg="submissions/${TAG}/batch_${BATCH}_id${y}.json"
+           gpu="${FREE_GPUS[$y]}"
            stem=$(basename "$cfg" .json)
-           CUDA_VISIBLE_DEVICES=$i \\
+           CUDA_VISIBLE_DEVICES=$gpu \\
                python algorithm_scientist/run_submission_aime24.py --config "$cfg" \\
-               > "$LOGDIR/gpu${i}_${stem}.out" \\
-               2> "$LOGDIR/gpu${i}_${stem}.err" &
+               > "$LOGDIR/gpu${gpu}_${stem}.out" \\
+               2> "$LOGDIR/gpu${gpu}_${stem}.err" &
        done
        wait
        ```
@@ -686,13 +722,13 @@ CMD_BENCHMARK = dedent("""\
 
 CMD_BATCH_BENCHMARK = dedent("""\
     ---
-    description: Launch one submission per local GPU in parallel (the only sanctioned benchmark form). Pass exactly N submission names where N = `nvidia-smi -L | wc -l`.
-    argument-hint: <name1> <name2> ... <nameN>   (N = number of local GPUs)
+    description: Launch one submission per *free* local GPU in parallel (the only sanctioned benchmark form). Pass exactly N submission names, where N is the count returned by algorithm_scientist/free_gpus.sh.
+    argument-hint: <name1> <name2> ... <nameN>   (N = number of currently-free GPUs)
     ---
 
-    Run **one submission per local GPU**, in parallel, against the
-    AIME24 benchmark. This is the *only* benchmark command sanctioned
-    by the protocol — single-variant runs are debug-only.
+    Run **one submission per *free* local GPU**, in parallel, against
+    the AIME24 benchmark. This is the *only* benchmark command
+    sanctioned by the protocol — single-variant runs are debug-only.
 
     The user passes **submission names** (not JSON paths); this command
     expands each `<nameI>` into `submissions/<tag>/<nameI>.json`,
@@ -700,32 +736,36 @@ CMD_BATCH_BENCHMARK = dedent("""\
     iterate-loop layout, the names look like
     `batch_<x>_id0 batch_<x>_id1 … batch_<x>_idN-1`.
 
-    Step 0 — resolve `<tag>` and detect the local GPU count, then
-    count arguments:
+    Step 0 — resolve `<tag>`, detect *free* GPUs (not the physical
+    count — other users may be sharing this host), then count
+    arguments:
     ```bash
     TAG=<your_agent_tag>           # sanitized model name, set once per session
-    NUM_GPUS=$(nvidia-smi -L | wc -l)
+    FREE_GPUS=($(algorithm_scientist/free_gpus.sh)) || {
+        echo "no free GPUs — wait, do not launch" >&2; exit 1
+    }
+    N=${#FREE_GPUS[@]}
     NAMES=($ARGUMENTS)
-    if [ "${#NAMES[@]}" -ne "$NUM_GPUS" ]; then
-        echo "expected $NUM_GPUS variants (one per GPU), got ${#NAMES[@]}" >&2
+    if [ "${#NAMES[@]}" -ne "$N" ]; then
+        echo "expected $N variants (one per FREE GPU: ${FREE_GPUS[*]}), got ${#NAMES[@]}" >&2
         exit 1
     fi
     ```
     If the user supplied a different number, refuse and explain:
-    "Batches must contain exactly `$NUM_GPUS` variants — one per local
-    GPU. Fill the remaining slots with orthogonal knob sweeps
-    (different topk, kv_dtype, layers_skip, block_size, …) before
-    re-invoking." Do not silently shrink or pad the batch.
+    "Batches must contain exactly `$N` variants — one per *currently-
+    free* GPU (`${FREE_GPUS[*]}`). The number of free GPUs can change
+    between batches; re-detect and re-design before re-invoking."
+    Do not silently shrink or pad the batch.
 
-    Step 1 — check the concurrency cap. Only **one** batch may run at
-    a time on the local GPUs:
+    Step 1 — concurrency cap. Only **one** batch may run at a time
+    on the GPUs you target:
     ```bash
     jobs -r | wc -l
     ```
-    If background jobs from a previous batch are still alive (or
-    `nvidia-smi` shows the GPUs busy with another user's processes),
-    refuse to launch — tell the user to wait, or to use the
-    wait-time activities in `algorithm_scientist/memory.md`.
+    If background jobs from a previous batch are still alive, refuse
+    to launch — tell the user to wait, or to use the wait-time
+    activities in `algorithm_scientist/memory.md`. (Other users'
+    processes are already filtered out by `free_gpus.sh`.)
 
     Step 2 — pre-flight every config locally first (cheap, no GPU):
     ```bash
@@ -737,17 +777,18 @@ CMD_BATCH_BENCHMARK = dedent("""\
     Refuse to launch any submission whose preflight failed — fix the
     failing variant first.
 
-    Step 3 — fork `NUM_GPUS` background `python` processes pinned to
-    GPUs `0 … NUM_GPUS-1` and `wait` for them all:
+    Step 3 — fork `N` background `python` processes pinned to the
+    *free* GPU indices (NOT 0…N-1) and `wait` for them all:
     ```bash
     LOGDIR="logs/submission/${TAG}_$(date +%Y%m%d_%H%M%S)"
     mkdir -p "$LOGDIR"
-    for i in $(seq 0 $((NUM_GPUS - 1))); do
-        name="${NAMES[$i]}"
-        CUDA_VISIBLE_DEVICES=$i \\
+    for y in $(seq 0 $((N - 1))); do
+        name="${NAMES[$y]}"
+        gpu="${FREE_GPUS[$y]}"
+        CUDA_VISIBLE_DEVICES=$gpu \\
             python algorithm_scientist/run_submission_aime24.py --config "submissions/${TAG}/${name}.json" \\
-            > "$LOGDIR/gpu${i}_${name}.out" \\
-            2> "$LOGDIR/gpu${i}_${name}.err" &
+            > "$LOGDIR/gpu${gpu}_${name}.out" \\
+            2> "$LOGDIR/gpu${gpu}_${name}.err" &
     done
     wait
     ```
@@ -821,8 +862,10 @@ CMD_ITERATE = dedent("""\
     - Reads / appends to `algorithm_scientist/memory.md` for persistent
       state across sessions (in-flight ledger, completed-batch table,
       hypotheses, anti-patterns, reading log).
-    - Detects the local GPU count `N` (`nvidia-smi -L | wc -l`) at
-      the start of every batch and writes submission pairs
+    - Detects the *currently-free* GPU set at the start of every
+      batch via `algorithm_scientist/free_gpus.sh` and uses
+      `N = len(FREE_GPUS)` (NOT the physical GPU count — other users
+      may share this host). Writes submission pairs
       `submissions/<tag>/batch_<x>_id<y>.{py,json}` for `<y> ∈ {0
       … N-1}`, where `<tag>` is the agent's identifier and `<x>` is
       the batch index (0-indexed, increments per batch this
@@ -831,9 +874,11 @@ CMD_ITERATE = dedent("""\
       tag is auto-detected from the model name).
     - Pre-flights all `N` locally, then forks `N` background
       `python algorithm_scientist/run_submission_aime24.py` processes
-      pinned to GPUs `0 … N-1` and `wait`s for them all.
-    - Honours the concurrency cap: **one** batch at a time (every
-      local GPU is fully consumed by a running batch).
+      pinned to the free GPU indices (`CUDA_VISIBLE_DEVICES=${FREE_GPUS[$y]}`)
+      and `wait`s for them all. Re-detects free GPUs immediately
+      before launch in case the set shifted during pre-flight.
+    - Honours the concurrency cap: **one** batch at a time on the
+      GPUs it targets; if `free_gpus.sh` returns nothing, hard wait.
     - During the 8+ hr wait, alternates between reading source,
       designing the next batch (without launching), and analysing
       children whose `latest.json` has already landed.
