@@ -370,10 +370,25 @@ Read them in increasing complexity:
 | `centered_block_sparse_attention` | demonstrates the `Reduce(dim=0)` mechanism — note: a constant per-sequence shift before `topK` is order-preserving, so this flow's picked set equals `block_sparse_attention`'s; useful pedagogically, not as a recipe |
 | `running_avg_block_sparse` | persistent across-step state via `Save` / `Load` + `CFill(0.0)` |
 
-The existing submission
-[`submissions/example_block_sparse_attention.py`](../submissions/example_block_sparse_attention.py)
-plus its JSON is a **complete working pair** — use it as the template
-for your file layout.
+### Submission examples — copy from any of these as a starting template
+
+`submissions/` ships **complete working `(py, json)` pairs** at the
+top level (the `<tag>/` subdirectories are agent-tagged work product
+and should not be treated as references). The committed examples
+cover different points in the design space:
+
+| example | flavour |
+|---|---|
+| [`submissions/example_block_sparse_attention.{py,json}`](../submissions/example_block_sparse_attention.py) | the canonical minimal flow — single centroid per block, `q · centroid` score |
+| [`submissions/gqa_quest_approx.{py,json}`](../submissions/gqa_quest_approx.py) | QUEST envelope (`CMin` + `CMax`), GQA-aware reduction, paired with `approxTopK` for cheaper selection |
+| [`submissions/kimi_v0.{py,json}`](../submissions/kimi_v0.py) | tight throughput config (`topk_val=29`, `topk_ratio=0.0625`, `block_size=32`) over a Kimi-style flow |
+| [`submissions/oai_v0.{py,json}`](../submissions/oai_v0.py) | wider-budget config (`topk_val=253`, `topk_ratio=0.25`) with aggressive `vortex_layers_skip=[0,4,8,12,16,20,24,28,32]` (every 4th layer dense, rest sparse) |
+
+Pick the example that's *closest* to the flow you intend to write,
+copy it into `submissions/<tag>/<name>.{py,json}`, then customise.
+All four are tracked in git via the `!submissions/*.json` whitelist
+in `.gitignore`; agent-tagged batches under `submissions/<tag>/` are
+not.
 
 ---
 

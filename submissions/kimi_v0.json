@@ -1,0 +1,13 @@
+{
+  "vortex_module_path": "submissions/kimi_v0.py",
+  "vortex_module_name": "kimi_v0_cls",
+  "vortex_block_size": 32,
+  "vortex_workload_chunk_size": 32,
+  "vortex_topk_val": 29,
+  "vortex_topk_ratio": 0.0625,
+  "vortex_block_reserved_bos": 1,
+  "vortex_block_reserved_eos": 2,
+  "vortex_layers_skip": [0],
+  "vortex_dtype": "bfloat16",
+  "kv_cache_dtype": "auto"
+}
