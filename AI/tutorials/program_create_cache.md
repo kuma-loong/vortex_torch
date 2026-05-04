@@ -127,8 +127,11 @@ def create_cache(self, block_size, head_dim):
 ```
 
 Same single-field declaration as the plain block-sparse flow — the
-per-sequence centering happens entirely on the indexer side via
-`Mean(dim=0)` and doesn't need a new cache field.
+per-sequence summary is computed entirely on the indexer side via
+`Mean(dim=0)` and doesn't need a new cache field. (See
+[`program_forward_indexer.md` §8](program_forward_indexer.md) for the
+caveat that simply *subtracting* the per-sequence mean before `topK`
+is a no-op; useful flows consume it through a non-monotonic op.)
 
 ---
 

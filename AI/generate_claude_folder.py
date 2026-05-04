@@ -68,6 +68,21 @@ CLAUDE_MD = dedent("""\
     higher=cheaper-but-looser; sweet spot 0.05-0.15). When two
     variants both clear the floor, pick the faster one.
 
+    ## Inventing beyond the literature
+
+    The `papers/` folder and [papers/guide.md](papers/guide.md) cover
+    what's already published — sinks, heavy hitters, channel sparsity,
+    low-rank K, LSH sampling, dual-band centroids. Treat them as
+    **seeds, not a menu.** A winning flow does not need a citation.
+    Every paper in there started by noticing a gap; the framework you
+    have (page-level selection, fused per-block kernel, Save/Load,
+    `Kron`, `MeanInterleave`) opens combinations and knobs no paper
+    here has explored. **Every batch must reserve at least one slot
+    for an off-catalog variant** — see `papers/guide.md` §16 for
+    prompts (paper combinations, knobs nobody has tried, claims worth
+    inverting, first-principles questions). Replicating a paper or
+    sweeping a single knob does not count.
+
     ## Where the instructions live
 
     All authoritative content lives under [AI/](AI/). Read in order:
@@ -82,6 +97,10 @@ CLAUDE_MD = dedent("""\
        op math reference.
     7. [AI/tutorials/indexer_op.md](AI/tutorials/indexer_op.md) — cache-side
        op math reference.
+    8. [papers/guide.md](papers/guide.md) — synthesis of the ten
+       sparse-attention papers in `papers/`. §14 = catalog of
+       known-good submission ideas; **§16 = prompts for inventing
+       flows that no paper here explores.**
 
     Framework-internal deep dives live in
     [AI/developer_guides/](AI/developer_guides/) — needed only if you are
@@ -114,61 +133,86 @@ CLAUDE_MD = dedent("""\
 
     ## Running the benchmark — policy
 
-    **The only allowed unit of work is a batch of 8.** Single-variant
-    runs (`run_submission.slurm`) are debug-only and off-limits to the
-    automated workflow. Each batch:
+    **The only allowed unit of work is one batch that fills every
+    local GPU.** Detect the GPU count at the start of every batch and
+    treat that number as `N`:
 
-    1. **8 orthogonal variants** — `submissions/<tag>_v1.{py,json}` …
-       `submissions/<tag>_v8.{py,json}` — varying different knobs.
-    2. **Cheap local pre-flight first** for all 8 (CPU, no GPU):
+    ```bash
+    NUM_GPUS=$(nvidia-smi -L | wc -l)   # or: python -c "import torch; print(torch.cuda.device_count())"
+    ```
+
+    **File layout.** All submissions you write live under
+    `submissions/<tag>/`, where `<tag>` is your agent identifier
+    (default: a sanitized lowercase form of your model name, e.g.
+    `claude_opus_4_7`). Within that dir, batched runs use the
+    convention `batch_<x>_id<y>.{py,json}` (`<x>` = batch index,
+    `<y>` = per-GPU variant index). Single-variant runs are
+    debug-only. Each batch:
+
+    1. **`N` orthogonal variants** —
+       `submissions/<tag>/batch_<x>_id0.{py,json}` …
+       `submissions/<tag>/batch_<x>_id<N-1>.{py,json}` — varying
+       different knobs.
+    2. **Cheap local pre-flight first** for all `N` (CPU, no GPU):
        ```bash
-       for i in 1 2 3 4 5 6 7 8; do
-         python -c "from vortex_torch.engine.sgl import check_engine_config; check_engine_config('submissions/<tag>_v${i}.json')"
+       TAG=<your_agent_tag>; BATCH=<batch_index>
+       for i in $(seq 0 $((NUM_GPUS - 1))); do
+         python -c "from vortex_torch.engine.sgl import check_engine_config; check_engine_config('submissions/${TAG}/batch_${BATCH}_id${i}.json')"
        done
        ```
-       Refuse to sbatch any variant whose pre-flight fails.
-    3. **Submit on Slurm** — the host has no GPU, so direct invocation
-       of `algorithm_scientist/run_submission_aime24.py` will fail.
-       Always use the batched slurm file (whole 8-GPU node, each child
-       pinned to its own `CUDA_VISIBLE_DEVICES=0..7`):
+       Refuse to launch any variant whose pre-flight fails.
+    3. **Launch `N` background `python` processes**, one per GPU
+       `0 … N-1`, and `wait` for them all to finish:
        ```bash
-       sbatch algorithm_scientist/run_submission_batch.slurm \\
-           submissions/<tag>_v1.json submissions/<tag>_v2.json \\
-           submissions/<tag>_v3.json submissions/<tag>_v4.json \\
-           submissions/<tag>_v5.json submissions/<tag>_v6.json \\
-           submissions/<tag>_v7.json submissions/<tag>_v8.json
+       LOGDIR="logs/submission/${TAG}_batch_${BATCH}_$(date +%Y%m%d_%H%M%S)"
+       mkdir -p "$LOGDIR"
+       for i in $(seq 0 $((NUM_GPUS - 1))); do
+           cfg="submissions/${TAG}/batch_${BATCH}_id${i}.json"
+           stem=$(basename "$cfg" .json)
+           CUDA_VISIBLE_DEVICES=$i \\
+               python algorithm_scientist/run_submission_aime24.py --config "$cfg" \\
+               > "$LOGDIR/gpu${i}_${stem}.out" \\
+               2> "$LOGDIR/gpu${i}_${stem}.err" &
+       done
+       wait
        ```
-       Per-child logs land under
-       `logs/submission/batch_<JOBID>/gpu<i>_<stem>.{out,err}`.
+       Each child writes its result into
+       `summary_submissions/<tag>/<stem>/<timestamp>__<hash>.json`
+       and updates `latest.json` on its own. The runner mirrors the
+       config's path under `submissions/` into `summary_submissions/`,
+       so `submissions/<tag>/batch_<x>_id<y>.json` becomes
+       `summary_submissions/<tag>/batch_<x>_id<y>/...` — per-agent
+       isolation, no collisions between agents that happen to use
+       the same `batch_x_idy` stem.
 
-    4. **In-flight ceiling = 24 experiments (3 batches).** Before every
-       sbatch:
-       ```bash
-       squeue -u $USER -h -o '%i %j %T'
-       ```
-       If 3 `vortex_submission_batch` rows are already PENDING/RUNNING,
-       do not submit — work on the wait-time protocol below until a
-       slot frees up.
-
-    5. Poll:
-       ```bash
-       sacct -j <JOBID> --format=JobID,State,ExitCode -X -n -P
-       ```
+    4. **One batch at a time.** Every local GPU is consumed by the
+       running batch — do not launch a second batch in parallel.
+       Use `jobs` (or `ls -lt summary_submissions/<tag>/*/latest.json`)
+       to see how many children are still alive while you wait.
 
     ## While you wait (8+ hrs per batch)
 
     Idle is not an option. Each polling cycle, do one of:
 
     - **Read.** Priority: `AI/tutorials/` → `AI/developer_guides/` →
-      `vortex_torch/flow/algorithms.py` →
+      `papers/` → `vortex_torch/flow/algorithms.py` →
       `vortex_torch/{indexer,cache}/*` → `csrc/`. After each file,
       append one insight to `algorithm_scientist/memory.md` §7.
-    - **Prepare the next batch.** If fewer than 3 batches in flight,
-      design 8 orthogonal variants for a different theme, pre-flight
-      them, submit, record in `algorithm_scientist/memory.md` §1.
-    - **Analyse.** For any terminal batch, read all 8 `latest.json`
-      files, fill a §2 sub-section (table + takeaway), remove the §1
-      row, update §3 (hypotheses) / §4 (anti-patterns) / §5 (winners).
+    - **Invent.** Open `papers/guide.md` §16 and pick one prompt —
+      a paper combination, a knob no paper has tried, a claim
+      worth inverting, or a first-principles question. Sketch a
+      one-sentence hypothesis + cache/indexer ops. This fills the
+      mandatory off-catalog slot in the next batch.
+    - **Design (don't launch) the rest of the next batch.**
+      Pre-flight the `N` candidates so they're ready to fire the
+      moment `wait` returns. Concurrent batches would OOM the
+      shared GPUs.
+    - **Analyse children early.** As individual `latest.json` files
+      appear (children finish at slightly different times), pull
+      their `mean@16` / `throughput` and start filling a §2
+      sub-section in memory.md. Close the §1 row when all `N` are
+      in, then update §3 (hypotheses) / §4 (anti-patterns) / §5
+      (winners).
 
     ## Persistent state — `algorithm_scientist/memory.md`
 
@@ -188,17 +232,31 @@ CLAUDE_MD = dedent("""\
        The content hash is `sha256(config.json || module.py)` truncated
        to 12 chars — same code → same hash → you can see re-runs
        at a glance. Read `summary_submissions/<name>/latest.json`
-       after a run, and on failure read
-       `logs/submission/vortex_submission_<JOBID>.{out,err}`.
+       after a run, and on failure read the per-child log under
+       `logs/submission/batch_<TS>/gpu<i>_<stem>.{out,err}` (or the
+       `logs/submission/single_<TS>/<stem>.{out,err}` produced by
+       `/benchmark`).
+
+    ## Kickoff prompt for new sessions
+
+    To boot a fresh Claude Code session straight into the long-horizon
+    iterate loop, paste the prompt block from
+    [algorithm_scientist/iterate_kickoff.md](algorithm_scientist/iterate_kickoff.md)
+    into the new session's first message. The agent will identify
+    its tag, bootstrap from this primer + AGENTS.md + tutorials +
+    papers/guide.md + memory.md, and start the first batch
+    autonomously. State lives in `algorithm_scientist/memory.md` and
+    the `submissions/<tag>/` / `summary_submissions/<tag>/` trees,
+    so any later session resumes cleanly from the same prompt.
 
     ## Slash commands available in this session
 
     - `/new-submission <name>` — scaffold a new submission pair.
     - `/preflight <name>`      — run the cheap local pre-flight.
-    - `/batch-benchmark <n1> … <n8>` — sbatch exactly 8 variants on one node (the only sanctioned benchmark command).
+    - `/batch-benchmark <n1> … <nN>` — launch exactly `N` variants in parallel, where `N = nvidia-smi -L | wc -l` (the only sanctioned benchmark command).
     - `/review <name>`         — audit a submission against AGENTS.md rules.
-    - `/iterate <name>`        — kick off a full auto-iteration loop (batches of 8, ≤ 24 in flight, updates memory.md).
-    - `/benchmark <name>`      — *debug only*: sbatch a single-variant AIME24 run. Do not use in normal workflow.
+    - `/iterate <name>`        — kick off a full auto-iteration loop (batches that fill every local GPU, one batch at a time, updates memory.md).
+    - `/benchmark <name>`      — *debug only*: run a single variant directly. Do not use in normal workflow.
 
     ## Subagents available
 
@@ -221,20 +279,40 @@ SUBMISSION_WRITER = dedent("""\
     description: >-
       Use this subagent to design, write, and iterate on a vortex_torch
       sparse-attention submission. The agent reads AI/AGENTS.md +
-      AI/tutorials/, writes the submission pair in submissions/, runs the
-      local pre-flight, and (when asked) submits the AIME24 benchmark to
-      Slurm. Invoke whenever the user asks to "write a new submission",
-      "try a sparse-attention idea", or "iterate on this flow".
+      AI/tutorials/, writes the submission pair in submissions/, runs
+      the local pre-flight, and (when asked) launches the AIME24
+      benchmark directly via python — one variant per local GPU,
+      detected at runtime. Invoke whenever the user asks to "write a
+      new submission", "try a sparse-attention idea", or "iterate on
+      this flow".
     tools: Read, Write, Edit, Bash, Grep, Glob
     ---
 
     You are an expert at writing sparse-attention submissions for the
     `vortex_torch` framework. Your deliverable is always a pair of files
-    placed in `submissions/`:
+    placed under your **agent tag** subfolder of `submissions/`:
 
-    - `submissions/<name>.py`   — a `vFlow` subclass, with a single
-      `@register("<name>_cls")` decorator.
-    - `submissions/<name>.json` — the engine config pointing at that .py.
+    - `submissions/<tag>/<name>.py`   — a `vFlow` subclass, with a
+      single `@register("<unique>_cls")` decorator (the register
+      name must be globally unique — include `<tag>` and the file
+      stem).
+    - `submissions/<tag>/<name>.json` — the engine config pointing
+      at that .py via `vortex_module_path`.
+
+    For batched runs (the standard `/batch-benchmark` and `/iterate`
+    workflow), `<name>` follows the convention `batch_<x>_id<y>`
+    where `<x>` is the batch index (0-indexed, increments with each
+    batch you launch this session) and `<y>` is the per-GPU variant
+    index (`0 … N-1`, `N = nvidia-smi -L | wc -l`).
+
+    ### First action of every session — pick your tag
+
+    Before doing anything else, set your `<tag>` once and keep it for
+    the whole session. Default to a sanitized lowercase form of your
+    model name (e.g. `claude_opus_4_7`, `claude_sonnet_4_6`,
+    `claude_haiku_4_5`, `gpt_5`). If `submissions/<tag>/` does not
+    yet exist, create it; otherwise resume into it. Confirm the tag
+    with the user only if you cannot determine your model name.
 
     ## Read these before writing code
 
@@ -250,6 +328,12 @@ SUBMISSION_WRITER = dedent("""\
     7. [AI/tutorials/indexer_op.md](AI/tutorials/indexer_op.md)
     8. [vortex_torch/flow/algorithms.py](vortex_torch/flow/algorithms.py) — six
        reference flows; your best source of pattern examples.
+    9. [papers/guide.md](papers/guide.md) — synthesis of the ten
+       sparse-attention papers in `papers/`. §14 is the catalog of
+       known-good submission ideas; **§16 is the prompt for inventing
+       flows that no paper here explores.** You're expected to use
+       both — every batch reserves at least one slot for an
+       off-catalog variant.
 
     ## Objective
 
@@ -281,57 +365,98 @@ SUBMISSION_WRITER = dedent("""\
        `"disable_radix_cache": true` (default `false`). Pre-flight
        rejects the violation.
 
-    ## Mandatory protocol — batches of exactly 8
+    ## Mandatory protocol — one batch fills every local GPU
+
+    Every batch contains exactly `N` variants, where `N` is the
+    number of GPUs on this host. Detect it once at the start of every
+    batch and reuse the value:
+    ```bash
+    NUM_GPUS=$(nvidia-smi -L | wc -l)   # or: python -c "import torch; print(torch.cuda.device_count())"
+    ```
 
     1. **Open `algorithm_scientist/memory.md`.** Skim §1 (in-flight
        batches), §2 (completed), §3 (open hypotheses), §6 (backlog).
        This is your persistent state across sessions.
-    2. **Decide the theme of the next batch of 8.** State it plus the
-       knob matrix (one knob varied per variant) in one short paragraph
-       before writing code. The 8 variants must be ORTHOGONAL — not
-       eight copies of the same idea.
-    3. **Write 16 files** — for each `vI ∈ {v1..v8}`:
-       - `submissions/<tag>_vI.py`  with `@register("<tag>_vI_cls")`.
-       - `submissions/<tag>_vI.json` pointing at the .py.
-    4. **Pre-flight all 8 locally** (CPU-only, fast):
+    2. **Decide the theme of the next batch.** State it plus the
+       knob matrix (one knob varied per variant) in one short
+       paragraph before writing code. The `N` variants must be
+       ORTHOGONAL — not `N` copies of the same idea. **At least
+       one variant in every batch must be off-catalog**: an idea
+       that does not trace cleanly to any single paper in
+       `papers/`, drawn from `papers/guide.md` §16 or invented from
+       the codebase itself (a paper combination, a knob no paper
+       has tried, an inversion, or a first-principles answer).
+       Pure parameter sweeps and paper replications do not count.
+       Pre-register the off-catalog hypothesis in one sentence in
+       `algorithm_scientist/memory.md` §3 the moment the batch
+       launches.
+    3. **Write `2 * N` files.** Pick the next batch index
+       `<x>` = number of existing `submissions/<tag>/batch_*_id0.json`.
+       For each `<y> ∈ {0 … N-1}`:
+       - `submissions/<tag>/batch_<x>_id<y>.py` with
+         `@register("<tag>_batch_<x>_id<y>_cls")` (globally unique).
+       - `submissions/<tag>/batch_<x>_id<y>.json` with
+         `vortex_module_path: "submissions/<tag>/batch_<x>_id<y>.py"`
+         and `vortex_module_name: "<tag>_batch_<x>_id<y>_cls"`.
+    4. **Pre-flight all `N` locally** (CPU-only, fast):
        ```bash
-       for i in 1 2 3 4 5 6 7 8; do
-         python -c "from vortex_torch.engine.sgl import check_engine_config; check_engine_config('submissions/<tag>_v${i}.json')"
+       TAG=<your_tag>; BATCH=<x>
+       for i in $(seq 0 $((NUM_GPUS - 1))); do
+         python -c "from vortex_torch.engine.sgl import check_engine_config; check_engine_config('submissions/${TAG}/batch_${BATCH}_id${i}.json')"
        done
        ```
        Drop or fix any failing variant before step 6.
-    5. **Check the in-flight ceiling.** If `squeue -u $USER -h -o '%j'`
-       already shows 3 `vortex_submission_batch` rows, DO NOT submit —
-       work on the wait-time activities below until a slot frees up.
-    6. **Submit the batch of 8** (the ONLY sanctioned benchmark form):
+    5. **Check the concurrency cap.** Only **one** batch may run at a
+       time — every local GPU is fully consumed. If `jobs` (or any
+       prior background `wait` you started) shows children still
+       alive, DO NOT launch — work on the wait-time activities
+       below until they finish.
+    6. **Launch the batch** (the ONLY sanctioned benchmark form):
        ```bash
-       sbatch algorithm_scientist/run_submission_batch.slurm \\
-           submissions/<tag>_v1.json submissions/<tag>_v2.json \\
-           submissions/<tag>_v3.json submissions/<tag>_v4.json \\
-           submissions/<tag>_v5.json submissions/<tag>_v6.json \\
-           submissions/<tag>_v7.json submissions/<tag>_v8.json
+       TAG=<your_tag>; BATCH=<x>
+       LOGDIR="logs/submission/${TAG}_batch_${BATCH}_$(date +%Y%m%d_%H%M%S)"
+       mkdir -p "$LOGDIR"
+       for i in $(seq 0 $((NUM_GPUS - 1))); do
+           cfg="submissions/${TAG}/batch_${BATCH}_id${i}.json"
+           stem=$(basename "$cfg" .json)
+           CUDA_VISIBLE_DEVICES=$i \\
+               python algorithm_scientist/run_submission_aime24.py --config "$cfg" \\
+               > "$LOGDIR/gpu${i}_${stem}.out" \\
+               2> "$LOGDIR/gpu${i}_${stem}.err" &
+       done
+       wait
        ```
-       Add a row to memory.md §1 with the new JOBID.
-       **Never use `algorithm_scientist/run_submission.slurm`** — that
-       single-variant slurm file is debug-only and forbidden in this
-       workflow.
-    7. **While Slurm is running (8+ hrs)**, on every poll cycle do ONE of:
+       Add a row to memory.md §1 with the batch tag and `$LOGDIR`.
+       **Never run `python algorithm_scientist/run_submission_aime24.py`
+       on a single config from this workflow** — that single-variant
+       form is debug-only.
+    7. **While the `N` children run (8+ hrs)**, on every poll cycle
+       do ONE of:
        (a) **Read** the next file in priority order
-       (`AI/tutorials/` → `AI/developer_guides/` →
+       (`AI/tutorials/` → `AI/developer_guides/` → `papers/` →
        `vortex_torch/flow/algorithms.py` →
        `vortex_torch/{indexer,cache}/*` → `csrc/`); append the
        insight to memory.md §7.
-       (b) **Prepare another batch** if < 3 are in flight: pick a new
-       theme, write 16 files, pre-flight, submit, record in §1.
-       (c) **Analyse** any terminal batch: read 8 `latest.json`
-       files, fill a §2 sub-section, remove the §1 row, update
-       §3/§4/§5.
+       (b) **Invent.** Open `papers/guide.md` §16 and pick one
+       prompt — a paper combination, a knob no paper has tried, a
+       claim worth inverting, or a first-principles question.
+       Sketch a one-sentence hypothesis + cache/indexer ops. This
+       fills the off-catalog slot of the next batch (step 2). Do
+       this at least once per wait cycle.
+       (c) **Design** the rest of the next batch (pre-flight `N`
+       candidates) so it's ready to launch the moment `wait`
+       returns. Don't launch — concurrent batches OOM the shared
+       GPUs.
+       (d) **Analyse children early.** Each child writes its
+       `summary_submissions/<tag>/<stem>/latest.json` as soon as
+       it finishes; read those that have landed and start filling §2.
+       Close the §1 row once all `N` are in; update §3/§4/§5.
     8. **Failure handling.** If pre-flight fails for a variant, fix
-       it in place. If the Slurm job's `sacct` state is
-       FAILED/TIMEOUT/etc., open
-       `logs/submission/batch_<JOBID>/gpu<i>_<stem>.err` for the
-       failing children, diagnose, and incorporate the lesson into
-       memory.md §4 before respinning.
+       it in place. If a child's `*.err` log shows a traceback or
+       its summary JSON is missing after `wait`, open
+       `$LOGDIR/gpu<i>_<stem>.err` for the failing child, diagnose,
+       and incorporate the lesson into memory.md §4 before
+       respinning.
 
     ## Output format
 
@@ -353,7 +478,8 @@ SUBMISSION_REVIEWER = dedent("""\
     name: vortex-submission-reviewer
     description: >-
       Use this subagent to audit an existing vortex_torch submission
-      pair (submissions/<name>.py + .json) against the AGENTS.md
+      pair (submissions/<tag>/<name>.py + .json, or
+      submissions/<name>.{py,json} for top-level examples) against the AGENTS.md
       contract, without modifying any code. Returns a structured
       review listing rule violations and suggestions. Invoke whenever
       the user asks to "review", "audit", or "check" a submission.
@@ -417,7 +543,7 @@ SUBMISSION_REVIEWER = dedent("""\
     Respond with exactly this structure — nothing else:
 
     ```
-    ## Review of submissions/<name>
+    ## Review of submissions/<tag>/<name>  (or submissions/<name> for examples)
 
     ### Blockers  (framework will reject)
     - <rule #, file:line, one-sentence description>  | or: none
@@ -442,22 +568,31 @@ CMD_NEW_SUBMISSION = dedent("""\
     ---
 
     Scaffold a new submission named **$1** by invoking the
-    `vortex-submission-writer` subagent.
+    `vortex-submission-writer` subagent. The new files land at
+    `submissions/<tag>/$1.{py,json}`, where `<tag>` is your
+    session's agent identifier (sanitized model name, e.g.
+    `claude_opus_4_7`). Examples stay flat at `submissions/example_*`.
 
     Steps the subagent should perform:
 
-    1. Copy [submissions/example_block_sparse_attention.py](submissions/example_block_sparse_attention.py)
+    1. Determine `<tag>` for this session (default: sanitized
+       lowercase model name) and `mkdir -p submissions/<tag>`.
+    2. Copy [submissions/example_block_sparse_attention.py](submissions/example_block_sparse_attention.py)
        and [submissions/example_block_sparse_attention.json](submissions/example_block_sparse_attention.json)
-       to `submissions/$1.py` and `submissions/$1.json`.
-    2. Rename the class, the `@register("...")` string, and the JSON's
-       `vortex_module_name` / `vortex_module_path` to match **$1**.
-    3. Ask the user (in one short message) what sparse-attention idea
+       to `submissions/<tag>/$1.py` and `submissions/<tag>/$1.json`.
+    3. Rename the class, the `@register("...")` string (must be
+       globally unique — include `<tag>` and `$1`), and the JSON's
+       `vortex_module_name` / `vortex_module_path` to match the new
+       location.
+    4. Ask the user (in one short message) what sparse-attention idea
        they want in the flow, then customise `create_cache`,
        `forward_cache`, `forward_indexer` accordingly.
-    4. Run the cheap local pre-flight:
-       `python -c "from vortex_torch.engine.sgl import check_engine_config; check_engine_config('submissions/$1.json')"`
-    5. Report the result. Do NOT submit to Slurm automatically —
-       that's `/benchmark $1`.
+    5. Run the cheap local pre-flight:
+       `python -c "from vortex_torch.engine.sgl import check_engine_config; check_engine_config('submissions/<tag>/$1.json')"`
+    6. Report the result. Do NOT launch the benchmark automatically —
+       that's `/benchmark $1` (debug, single variant) or
+       `/batch-benchmark` (the sanctioned batch that fills every
+       local GPU).
 
     Follow every rule in [AI/AGENTS.md](AI/AGENTS.md). Never use native
     torch ops inside the three vFlow methods.
@@ -470,10 +605,14 @@ CMD_PREFLIGHT = dedent("""\
     argument-hint: <submission-name>
     ---
 
-    Run the cheap pre-flight check for `submissions/$1.json`:
+    Resolve `$1` to a config path. Most submissions live under your
+    agent tag, so try in order: `submissions/<tag>/$1.json`,
+    `submissions/$1.json` (top-level for examples), or treat `$1`
+    itself as a path if it ends in `.json`. Then run the cheap
+    pre-flight check:
 
     ```bash
-    python -c "from vortex_torch.engine.sgl import check_engine_config; check_engine_config('submissions/$1.json')"
+    python -c "from vortex_torch.engine.sgl import check_engine_config; check_engine_config('<resolved path>')"
     ```
 
     Capture the output. If it raises, paste the relevant traceback line
@@ -482,128 +621,169 @@ CMD_PREFLIGHT = dedent("""\
     pass, but do **not** edit files unless the user asks you to.
 
     If it passes, remind the user that the next step is `/benchmark $1`
-    (which submits to Slurm — no GPU needed here).
+    (debug, single variant) or `/batch-benchmark` (the sanctioned
+    batch that fills every local GPU, launched directly via python).
 """)
 
 
 CMD_BENCHMARK = dedent("""\
     ---
-    description: (DEBUG ONLY) sbatch a single-variant AIME24 run. Forbidden in the standard agent workflow — use /batch-benchmark instead.
+    description: (DEBUG ONLY) Run a single-variant AIME24 benchmark directly via python. Forbidden in the standard agent workflow — use /batch-benchmark instead.
     argument-hint: <submission-name>
     ---
 
     > **Debug-only command.** The sanctioned benchmark protocol runs
-    > exclusively in batches of 8 via `/batch-benchmark`. Use this
-    > single-variant form ONLY for human debugging (e.g. confirming a
-    > new flow boots end-to-end). Do not chain it as part of an
-    > automated workflow.
+    > exclusively as a batch that fills every local GPU, via
+    > `/batch-benchmark`. Use this single-variant form ONLY for human
+    > debugging (e.g. confirming a new flow boots end-to-end). Do
+    > not chain it as part of an automated workflow.
 
-    Submit `submissions/$1.json` to the AIME24 benchmark via Slurm.
+    Resolve `$1` to a config path: try
+    `submissions/<tag>/$1.json` first, then `submissions/$1.json`,
+    or treat `$1` as a literal path if it ends in `.json`. The
+    runner **mirrors** the config's location under `submissions/`
+    into `summary_submissions/`, so
+    `submissions/<tag>/batch_3_id5.json` produces
+    `summary_submissions/<tag>/batch_3_id5/`.
 
-    **Do not run `python algorithm_scientist/run_submission_aime24.py` directly** —
-    the host environment has no GPU. Use Slurm:
-
-    Step 1 — submit:
+    Step 1 — pre-flight (CPU-only):
     ```bash
-    sbatch algorithm_scientist/run_submission.slurm submissions/$1.json
+    CFG=<resolved path to submissions/.../$1.json>
+    python -c "from vortex_torch.engine.sgl import check_engine_config; check_engine_config('$CFG')"
     ```
-    Capture the returned `Submitted batch job <JOBID>` and echo the
-    JOBID back to the user.
+    Refuse to run the benchmark if pre-flight fails.
 
-    Step 2 — poll every ~60s until the job reaches a terminal state
-    (`COMPLETED` / `FAILED` / `TIMEOUT` / `CANCELLED` / `OUT_OF_MEMORY`):
+    Step 2 — launch directly. Pin to one GPU (default GPU 0; pick a
+    free one if 0 is busy) and capture stdout/stderr to a log file:
     ```bash
-    sacct -j <JOBID> --format=JobID,State,ExitCode -X -n -P
+    STEM=$(basename "$CFG" .json)                             # filename stem only
+    SUMMARY_REL="${CFG#submissions/}"; SUMMARY_REL="${SUMMARY_REL%.json}"   # tag/stem (or just stem for top-level configs)
+    LOGDIR="logs/submission/single_$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$LOGDIR"
+    CUDA_VISIBLE_DEVICES=0 \\
+        python algorithm_scientist/run_submission_aime24.py --config "$CFG" \\
+        > "$LOGDIR/${STEM}.out" \\
+        2> "$LOGDIR/${STEM}.err"
     ```
+    The runner writes its summary into
+    `summary_submissions/${SUMMARY_REL}/<timestamp>__<hash>.json`
+    and updates `summary_submissions/${SUMMARY_REL}/latest.json`
+    itself; no further polling needed.
 
-    Step 3 — once terminal:
+    Step 3 — read the result:
 
-    - **Success** → Read `summary_submissions/$1/latest.json` (a
-      symlink to the newest run). Print `mean@16`, `pass@16`,
-      `e2e_time`, `total_tokens`, `throughput`, and the
-      `content_hash`. For run-to-run comparisons, `cat
-      summary_submissions/$1/INDEX.jsonl | jq -c '{finished_at,
-      content_hash, "mean@16", throughput}'`.
-    - **Failure** → Read `logs/submission/vortex_submission_<JOBID>.err`
-      (and `.out` if needed). Summarise the error in 1-2 sentences and
-      recommend a fix. Do NOT re-submit without pre-flight passing first.
+    - **Success** → Open `summary_submissions/${SUMMARY_REL}/latest.json`
+      and print `mean@16`, `pass@16`, `e2e_time`, `total_tokens`,
+      `throughput`, and `content_hash`. For run-to-run comparisons:
+      `cat summary_submissions/${SUMMARY_REL}/INDEX.jsonl | jq -c
+      '{finished_at, content_hash, "mean@16", throughput}'`.
+    - **Failure** (non-zero exit, or no new `latest.json` was
+      written) → Open `$LOGDIR/${STEM}.err` (and `.out` if needed),
+      summarise the error in 1-2 sentences, and recommend a fix. Do
+      NOT re-launch without pre-flight passing first.
 """)
 
 
 CMD_BATCH_BENCHMARK = dedent("""\
     ---
-    description: Submit exactly 8 submissions in parallel on a single 8-GPU node (the only sanctioned benchmark form).
-    argument-hint: <name1> <name2> <name3> <name4> <name5> <name6> <name7> <name8>
+    description: Launch one submission per local GPU in parallel (the only sanctioned benchmark form). Pass exactly N submission names where N = `nvidia-smi -L | wc -l`.
+    argument-hint: <name1> <name2> ... <nameN>   (N = number of local GPUs)
     ---
 
-    Submit **exactly 8 submissions** to the AIME24 benchmark as one
-    batched Slurm job. This is the *only* benchmark command sanctioned
+    Run **one submission per local GPU**, in parallel, against the
+    AIME24 benchmark. This is the *only* benchmark command sanctioned
     by the protocol — single-variant runs are debug-only.
 
     The user passes **submission names** (not JSON paths); this command
-    expands each `<nameI>` into `submissions/<nameI>.json`.
+    expands each `<nameI>` into `submissions/<tag>/<nameI>.json`,
+    where `<tag>` is the session's agent identifier. For the standard
+    iterate-loop layout, the names look like
+    `batch_<x>_id0 batch_<x>_id1 … batch_<x>_idN-1`.
 
-    Step 0 — count arguments. If the user supplied fewer than 8 names,
-    refuse and explain: "Batches must contain exactly 8 variants. Fill
-    the remaining slots with orthogonal knob sweeps (different topk,
-    kv_dtype, layers_skip, block_size, …) before re-invoking." Do
-    not silently shrink the batch.
-
-    Step 1 — check the in-flight ceiling (≤ 24 experiments, i.e. ≤ 3
-    concurrent batches):
+    Step 0 — resolve `<tag>` and detect the local GPU count, then
+    count arguments:
     ```bash
-    squeue -u $USER -h -o '%j' | grep -c '^vortex_submission_batch$'
+    TAG=<your_agent_tag>           # sanitized model name, set once per session
+    NUM_GPUS=$(nvidia-smi -L | wc -l)
+    NAMES=($ARGUMENTS)
+    if [ "${#NAMES[@]}" -ne "$NUM_GPUS" ]; then
+        echo "expected $NUM_GPUS variants (one per GPU), got ${#NAMES[@]}" >&2
+        exit 1
+    fi
     ```
-    If the count is already 3, refuse to submit — tell the user to
-    wait for one to finish (or to use the wait-time activities in
-    `algorithm_scientist/memory.md`).
+    If the user supplied a different number, refuse and explain:
+    "Batches must contain exactly `$NUM_GPUS` variants — one per local
+    GPU. Fill the remaining slots with orthogonal knob sweeps
+    (different topk, kv_dtype, layers_skip, block_size, …) before
+    re-invoking." Do not silently shrink or pad the batch.
+
+    Step 1 — check the concurrency cap. Only **one** batch may run at
+    a time on the local GPUs:
+    ```bash
+    jobs -r | wc -l
+    ```
+    If background jobs from a previous batch are still alive (or
+    `nvidia-smi` shows the GPUs busy with another user's processes),
+    refuse to launch — tell the user to wait, or to use the
+    wait-time activities in `algorithm_scientist/memory.md`.
 
     Step 2 — pre-flight every config locally first (cheap, no GPU):
     ```bash
-    for name in $ARGUMENTS; do
-        python -c "from vortex_torch.engine.sgl import check_engine_config; check_engine_config('submissions/${name}.json')" \\
-            || echo "[preflight] FAILED: ${name}"
+    for name in "${NAMES[@]}"; do
+        python -c "from vortex_torch.engine.sgl import check_engine_config; check_engine_config('submissions/${TAG}/${name}.json')" \\
+            || echo "[preflight] FAILED: ${TAG}/${name}"
     done
     ```
-    Refuse to sbatch any submission whose preflight failed — fix the
+    Refuse to launch any submission whose preflight failed — fix the
     failing variant first.
 
-    Step 3 — build the argument list and submit (exactly 8 paths):
+    Step 3 — fork `NUM_GPUS` background `python` processes pinned to
+    GPUs `0 … NUM_GPUS-1` and `wait` for them all:
     ```bash
-    CFGS=()
-    for name in $ARGUMENTS; do
-        CFGS+=("submissions/${name}.json")
+    LOGDIR="logs/submission/${TAG}_$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$LOGDIR"
+    for i in $(seq 0 $((NUM_GPUS - 1))); do
+        name="${NAMES[$i]}"
+        CUDA_VISIBLE_DEVICES=$i \\
+            python algorithm_scientist/run_submission_aime24.py --config "submissions/${TAG}/${name}.json" \\
+            > "$LOGDIR/gpu${i}_${name}.out" \\
+            2> "$LOGDIR/gpu${i}_${name}.err" &
     done
-    sbatch algorithm_scientist/run_submission_batch.slurm "${CFGS[@]}"
+    wait
     ```
-    Capture the returned `Submitted batch job <JOBID>`.
+    Each child writes its result into
+    `summary_submissions/<tag>/<name>/<timestamp>__<hash>.json` and
+    updates `summary_submissions/<tag>/<name>/latest.json` itself.
+    (The runner mirrors the config's path under `submissions/` into
+    `summary_submissions/`, so `submissions/<tag>/batch_<x>_id<y>.json`
+    becomes `summary_submissions/<tag>/batch_<x>_id<y>/...` — per-agent
+    isolation, no collisions across agents that pick the same stem.)
 
     Step 4 — append a row to `algorithm_scientist/memory.md` §1
-    *In-flight batches*:
-    `| <batch_id> | <UTC time> | <JOBID> | <name1>,…,<name8> | PENDING |`
+    *In-flight batches* the moment you launch:
+    `| <tag> | <batch_id> | <UTC time> | <LOGDIR> | <name1>,…,<nameN> | RUNNING |`
 
-    Step 5 — poll:
-    ```bash
-    sacct -j <JOBID> --format=JobID,State,ExitCode -X -n -P
-    ```
-    Each batch may run **8+ hours**. While polling, do NOT idle —
-    spend the time reading tutorials / developer guides / source, or
-    designing the next batch (subject to the ≤ 3 in-flight ceiling),
-    or analysing earlier completed batches. See AGENTS.md §5d.
+    Step 5 — while waiting (the batch takes **8+ hours**), do NOT
+    idle. Spend the time reading tutorials / developer guides /
+    source, or designing the next batch (don't launch — concurrent
+    batches OOM the shared GPUs), or analysing children that have
+    already produced their `latest.json`. See AGENTS.md §5d.
 
-    Step 6 — once terminal:
+    Step 6 — once `wait` returns:
 
     - **Success** → for each `<nameI>`, read
-      `summary_submissions/<nameI>/latest.json`. Produce a comparison
+      `summary_submissions/<tag>/<nameI>/latest.json`. Produce a comparison
       table with columns: `name | content_hash | mean@16 | pass@16 |
       throughput | e2e_time`. Recommend the one with the highest
       `throughput` **that also clears the quality floor**. Append the
       table + a 1-3 sentence takeaway to `algorithm_scientist/memory.md`
       §2 *Completed batches*; remove the row you added in step 4 from §1.
-    - **Failure** → any child that failed wrote its traceback to
-      `logs/submission/batch_<JOBID>/gpu<i>_<stem>.err`. Open the
-      failing child's `.err`, summarise the error, and record the
-      lesson in `algorithm_scientist/memory.md` §4 *Anti-patterns*.
+    - **Failure** → any child whose process exited non-zero (or
+      whose `latest.json` is missing / older than `$LOGDIR`'s
+      timestamp) wrote its traceback to
+      `$LOGDIR/gpu<i>_<name>.err`. Open the failing child's `.err`,
+      summarise the error, and record the lesson in
+      `algorithm_scientist/memory.md` §4 *Anti-patterns*.
 """)
 
 
@@ -613,9 +793,12 @@ CMD_REVIEW = dedent("""\
     argument-hint: <submission-name>
     ---
 
-    Invoke the `vortex-submission-reviewer` subagent to audit
-    `submissions/$1.py` and `submissions/$1.json` against the
-    [AI/AGENTS.md](AI/AGENTS.md) contract.
+    Invoke the `vortex-submission-reviewer` subagent to audit a
+    submission pair against the [AI/AGENTS.md](AI/AGENTS.md) contract.
+
+    Resolve `$1` to a path: try `submissions/<tag>/$1.{py,json}`
+    first (the standard agent-tagged location), then
+    `submissions/$1.{py,json}` as a fallback for top-level examples.
 
     The reviewer will produce a structured report with sections:
     **Blockers**, **Warnings**, **Suggestions**, **Summary**. It does
@@ -626,7 +809,7 @@ CMD_REVIEW = dedent("""\
 
 CMD_ITERATE = dedent("""\
     ---
-    description: Launch the long-horizon auto-iteration loop (batches of 8, ≤ 24 in flight, persists state in memory.md).
+    description: Launch the long-horizon auto-iteration loop (one batch fills every local GPU, one batch at a time, persists state in memory.md).
     argument-hint: <theme-tag> [--min-mean-at-16 <float>] [--max-iterations <int>] [--baseline-throughput <float>]
     ---
 
@@ -638,13 +821,22 @@ CMD_ITERATE = dedent("""\
     - Reads / appends to `algorithm_scientist/memory.md` for persistent
       state across sessions (in-flight ledger, completed-batch table,
       hypotheses, anti-patterns, reading log).
-    - Writes submission pairs `submissions/$1_v1..v8.{py,json}`.
-    - Pre-flights all 8 locally, then sbatches the **batch of 8** via
-      `algorithm_scientist/run_submission_batch.slurm`.
-    - Honours the in-flight ceiling: ≤ 3 concurrent batches (≤ 24
-      experiments).
-    - During Slurm's 8+ hr wait, alternates between reading source,
-      preparing the next batch, and analysing completed batches.
+    - Detects the local GPU count `N` (`nvidia-smi -L | wc -l`) at
+      the start of every batch and writes submission pairs
+      `submissions/<tag>/batch_<x>_id<y>.{py,json}` for `<y> ∈ {0
+      … N-1}`, where `<tag>` is the agent's identifier and `<x>` is
+      the batch index (0-indexed, increments per batch this
+      session). The positional `$1` argument is the *theme tag* for
+      memory.md attribution; it is **not** the agent tag (the agent
+      tag is auto-detected from the model name).
+    - Pre-flights all `N` locally, then forks `N` background
+      `python algorithm_scientist/run_submission_aime24.py` processes
+      pinned to GPUs `0 … N-1` and `wait`s for them all.
+    - Honours the concurrency cap: **one** batch at a time (every
+      local GPU is fully consumed by a running batch).
+    - During the 8+ hr wait, alternates between reading source,
+      designing the next batch (without launching), and analysing
+      children whose `latest.json` has already landed.
     - Reads `summary_submissions/<name>/latest.json` and updates
       memory.md.
 

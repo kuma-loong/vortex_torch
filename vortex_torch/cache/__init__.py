@@ -28,6 +28,9 @@ pipelines (e.g., to maintain centroids, envelopes, or other summaries).
 
 from .context import Context, ctx, get_ctx
 from .reduce import Mean, Max, Min, L2Norm
+from .reduce_interleave import (
+    MeanInterleave, MaxInterleave, MinInterleave, L2NormInterleave,
+)
 from .matmul import GeMM
 from .elementwise import Relu, Silu, Sigmoid, Abs, Add_Mul, Log, Exp
 from .elementwise_binary import (
@@ -46,6 +49,7 @@ __all__ = [
     "set_kv_buffer_fp8_e4m3_launcher",
     "set_kv_buffer_fp8_e5m2_launcher",
     "Mean", "Max", "Min", "L2Norm",
+    "MeanInterleave", "MaxInterleave", "MinInterleave", "L2NormInterleave",
     "GeMM",
     "Relu", "Silu", "Sigmoid", "Abs", "Add_Mul", "Log", "Exp",
     "Maximum", "Minimum", "Multiply", "Add",

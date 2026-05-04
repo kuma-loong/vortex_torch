@@ -69,6 +69,45 @@ Most common use: **collapse `cache["k"]`'s block-size axis** —
 `CMean(dim=1)(cache["k"], cache["centroids"])` takes `[1, block_size, D]`
 and writes `[1, 1, D]` per-block summaries.
 
+### `MeanInterleave(dim=k, k=group)` / `MaxInterleave` / `MinInterleave` / `L2NormInterleave`
+
+The same reductions, but **fold consecutive groups of `group` elements**
+along the reduced axis instead of collapsing it to size 1. The reduced
+axis size must be divisible by `group`; the output keeps
+`axis_size // group` rows along that axis.
+
+For `dim=1` (group along the `D_0` axis):
+
+$$
+\text{MeanInterleave}(X)[0, m, d_1]
+  = \tfrac{1}{k} \sum_{j=0}^{k-1} X[0, m \cdot k + j, d_1]
+$$
+$$
+\text{MaxInterleave}(X)[0, m, d_1]
+  = \max_{0 \le j < k} X[0, m \cdot k + j, d_1]
+$$
+$$
+\text{L2NormInterleave}(X)[0, m, d_1]
+  = \sqrt{\sum_{j=0}^{k-1} X[0, m \cdot k + j, d_1]^2}
+$$
+
+For `dim=2`: symmetric (group along the `D_1` axis).
+
+| input shape | `dim` | `k` | output shape |
+|---|---|---|---|
+| `[1, D_0, D_1]` | 1 | `g` | `[1, D_0/g, D_1]` |
+| `[1, D_0, D_1]` | 2 | `g` | `[1, D_0,   D_1/g]` |
+
+Edge cases: `k=1` is an identity (one element per group); `k` equal to
+the full reduced-axis length recovers the plain `Mean / Max / Min /
+L2Norm` (one group covering the whole axis).
+
+Useful for **multi-resolution block summaries** without paying for an
+extra reduction: e.g. instead of one `[1, 1, D]` centroid per block,
+emit `[1, block_size/g, D]` mini-centroids that downstream indexer ops
+can score independently and then aggregate (`Max / Mean` along the
+mini-centroid axis).
+
 ---
 
 ## 2. Matrix multiply — `GeMM()`
@@ -357,6 +396,7 @@ This gives the indexer a per-token importance vector per block.
 | op | shape transformation | math |
 |---|---|---|
 | `Mean/Max/Min/L2Norm(dim=k)(x, output)` | collapses axis `k`, keepdim | reduction |
+| `MeanInterleave/MaxInterleave/MinInterleave/L2NormInterleave(dim=k, k=g)(x, output)` | folds groups of `g` along axis `k` (`size → size/g`) | grouped reduction |
 | `GeMM()(x, y, output)` | `[1, N_x, K], [1, N_y, K] → [1, N_y, N_x]` | `Y @ Xᵀ` |
 | `Multiply()(x, y, output)` | broadcast | `x * y` |
 | `Add(α, β)(x, y, output)` | broadcast | `α·x + β·y` |
@@ -378,6 +418,8 @@ verbatim.)
 | "centroid per block" | `CMean(dim=1)(cache["k"], cache["centroids"])` |
 | "QUEST envelope" | `CMax(dim=1)(cache["k"], cache["max"])` + `CMin(dim=1)(cache["k"], cache["min"])` |
 | "per-block L2 norm of keys" | `CL2Norm(dim=1)(cache["k"], cache["norm"])` |
+| "g mini-centroids per block (multi-resolution)" | `CMeanInterleave(dim=1, k=block_size/g)(cache["k"], cache["mini_centroids"])` — `[1, block_size, D] → [1, g, D]` |
+| "halve the feature dimension of a summary" | `CMeanInterleave(dim=2, k=2)(cache["centroids"], cache["centroids_lo"])` — `[1, 1, D] → [1, 1, D/2]` |
 | "signed-magnitude centroid" (mean of \|k\|) | `CAbs` → `CMean(dim=1)` |
 | "projected centroid" | `CMean(dim=1)` → `CGeMM` with a fixed learned weight |
 | "ignore first few tokens of a block" | `MaskSlice(start, end, dim=1, α=0, β=1)` → `Multiply` → `CMean` |

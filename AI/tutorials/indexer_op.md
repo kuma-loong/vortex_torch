@@ -108,13 +108,27 @@ $$
 | `dim=0` | `[S, D_0, D_1]` | `[1, D_0, D_1]` |
 
 The output broadcasts back against the `S` axis in any subsequent
-elementwise binary op. Typical use: **z-score-like centering**:
+elementwise binary op. Typical use: **per-page gating against a
+sequence-level statistic**:
 
 ```python
 score    = ...                                       # [S, 1, 1]
 mean_all = self.mean_all(score, ctx=ctx)             # [1, 1, 1]  (Mean(dim=0))
-centered = self.center(score, mean_all, ctx=ctx)     # Add(α=1, β=-1) → [S, 1, 1]
+gate     = self.cmp(score, mean_all, ctx=ctx)        # WhereGreater → 0 / -inf [S, 1, 1]
+gated    = self.add(score, gate, ctx=ctx)            # Add(α=1, β=1) → masks below-mean to -inf
+self.topk(gated, o, ctx=ctx)
 ```
+
+> **Caveat — `topK` is invariant to monotonic transforms.** Piping
+> `Reduce(dim=0)(score)` directly into `Add(α=1, β=-1)` and then
+> `topK` is a *no-op*: subtracting one scalar from every page is
+> order-preserving, and `topK` selects by order. To make
+> per-sequence statistics actually change the picked set, combine
+> them with a *non-monotonic* op (the `WhereGreater`-then-`Add`
+> threshold above), or use them as a per-page **multiplier**
+> against a different signal (e.g. multiply the score by
+> `score / mean_all` to amplify above-mean pages and damp below-
+> mean ones).
 
 ---
 
@@ -153,6 +167,60 @@ $$
 $$
 
 Elementwise. Used heavily in QUEST-style envelope bounds.
+
+### `Kron(dim=(1, 2))`
+
+Per-page Kronecker product over a configurable subset of the inner
+axes. Axes listed in `dim` get the Kron expansion (output size = product
+of input sizes); the remaining inner axis follows ordinary broadcast
+(equal sizes or one of them is `1`). The leading `S` axis is always
+elementwise (with `BATCHED` partners broadcasting).
+
+For `dim=(1, 2)` (full Kron):
+
+$$
+\text{Kron}(X, Y)[s,\, i \cdot y_1 + j,\, k \cdot y_2 + l]
+  = X[s, i, k] \cdot Y[s, j, l]
+$$
+
+For `dim=1` (row-Kron; the `D_1` axis is elementwise, sizes must agree
+or be 1):
+
+$$
+\text{Kron}_{\text{dim}=1}(X, Y)[s,\, i \cdot y_1 + j,\, d]
+  = X[s, i, d] \cdot Y[s, j, d]
+$$
+
+For `dim=2` (col-Kron; the `D_0` axis is elementwise, sizes must agree
+or be 1):
+
+$$
+\text{Kron}_{\text{dim}=2}(X, Y)[s,\, c,\, k \cdot y_2 + l]
+  = X[s, c, k] \cdot Y[s, c, l]
+$$
+
+| `dim` | `x` shape | `y` shape | output shape |
+|---|---|---|---|
+| `(1, 2)` | `[S, x_1, x_2]` | `[S, y_1, y_2]` | `[S, x_1·y_1, x_2·y_2]` |
+| `1`     | `[S, x_1, D]`   | `[S, y_1, D]`   | `[S, x_1·y_1, D]`       |
+| `2`     | `[S, C, x_2]`   | `[S, C, y_2]`   | `[S, C, x_2·y_2]`       |
+
+`dim` accepts an int or any iterable of ints in `{1, 2}`. Each
+contributing axis size should be a power of 2 (Triton tile constraint).
+Format dispatch: any `RAGGED` or `PAGED` participant yields a `RAGGED`
+output; `BATCHED ⊗ BATCHED` yields a `BATCHED` output (one tile per
+`(batch, head)`); `BATCHED` inputs broadcast along the workload axis so
+they pair cleanly with `RAGGED`/`PAGED` partners.
+
+Typical uses:
+
+- **Multi-head × multi-centroid score grid**: Kron a per-head q-summary
+  `[S, H, 1]` with a per-page multi-centroid field `[S, 1, C]` to get
+  `[S, H, C]` scores, then fold the `H` axis with `Max(dim=1)` /
+  `Mean(dim=1)` before `topK`.
+- **Cartesian feature combinations**: combine two per-page feature
+  vectors `[S, 1, A]` and `[S, 1, B]` into `[S, A, B]` cross-features,
+  then reduce to a scalar score.
 
 ### `WhereEqual()` / `WhereNotEqual()` / `WhereGreater()` / `WhereGreaterEqual()` / `WhereLess()` / `WhereLessEqual()`
 
@@ -466,6 +534,7 @@ is identical.
 | `Multiply()(x, y)` | broadcast | `x * y` |
 | `Add(α, β)(x, y)` | broadcast | `α·x + β·y` |
 | `Maximum/Minimum()(x, y)` | broadcast | elementwise |
+| `Kron(dim)(x, y)` | Kron-expand `dim` axes, broadcast the rest | `x_1·y_1` × `x_2·y_2` (full) or one axis only |
 | `Where*()(x, y)` | broadcast | 0 if predicate, else `-∞` |
 | `Relu/Sigmoid/Silu/... (α, β)(x)` | same shape | (see §4) |
 | `Softmax(dim, scale)(x)` | same shape | `exp(scale·x) / Σ exp(scale·x)` |
@@ -488,11 +557,14 @@ is identical.
 | multi-head dot product | `GeMM(q, centroid)` → `Max(dim=2)` or `Mean(dim=2)` over `H_q` |
 | QUEST envelope | `Multiply` ×2, `Maximum`, `Sum(dim=2)`, `Max(dim=1)` |
 | masked features | `MaskSlice(dim=2, α=0, β=1)` → `Multiply` |
-| centered per-sequence | score → `Mean(dim=0)` → `Add(α=1, β=-1)` |
+| gate by per-sequence threshold | score → `Mean(dim=0)` → `WhereGreater` → `Add(α=1, β=1)` (plain `Add(α=1, β=-1)` into `topK` is a **no-op**: `topK` is invariant to constant shifts) |
 | softmax over pages | `Softmax(dim=0, scale)` |
 | running average across steps | `Load` → `Add(α=momentum, β=1)` → `Save` |
 | learned-kernel smoothing | `Conv1d(weight=[...], dim=0)` |
 | top-k of multiple centroids | `GeMM` with `N_x=C` centroids → `Max(dim=2)` |
+| multi-head × multi-centroid score grid | `Kron(dim=(1,2))` on `[S, H, 1]` × `[S, 1, C]` → `[S, H, C]` → `Max(dim=1)` |
+| Cartesian cross-features per page | `Kron(dim=(1,2))` on `[S, 1, A]` × `[S, 1, B]` → `[S, A, B]` → reduce |
+| row-Kron of two centroid sets sharing a feature dim | `Kron(dim=1)` on `[S, x_1, D]` × `[S, y_1, D]` → `[S, x_1·y_1, D]` |
 
 When in doubt, walk the shapes in your head op by op; every op in this
 doc is a pure, side-effect-free transform of the shapes in the table

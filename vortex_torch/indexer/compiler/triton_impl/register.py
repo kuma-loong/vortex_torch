@@ -20,6 +20,7 @@ from ...scan import Softmax, Normalize, Conv1d
 from ...transpose import Transpose
 from ...save_load import Save, Load
 from ...mask import MaskSlice
+from ...kron import Kron
 
 from .gemm import generate_gemm_impl
 from .reduce import generate_reduce_impl, generate_reduce_dim0_impl
@@ -32,6 +33,7 @@ from .transpose import generate_transpose_impl
 from .conv1d import generate_conv1d_impl
 from .save_load import generate_save_impl, generate_load_impl
 from .mask import generate_mask_slice_impl
+from .kron import generate_kron_impl
 
 IMPL_REGISTRY = {
     # Schedule.W — fused inline into the per-workload kernel.
@@ -43,6 +45,7 @@ IMPL_REGISTRY = {
     (Save,               Schedule.W): generate_save_impl,
     (Load,               Schedule.W): generate_load_impl,
     (MaskSlice,          Schedule.W): generate_mask_slice_impl,
+    (Kron,               Schedule.W): generate_kron_impl,
 
     # Schedule.S — standalone, each op launches its own kernel.
     (topK,       Schedule.S): generate_topk_impl,

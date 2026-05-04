@@ -13,6 +13,7 @@ from ...elementwise import Elementwise
 from ...elementwise_binary import Elementwise_Binary
 from ...matmul import GeMM
 from ...reduce import Reduce
+from ...reduce_interleave import ReduceInterleave
 from ...fill import Fill
 from ...mask import MaskSlice
 
@@ -20,6 +21,7 @@ from .elementwise import generate_elementwise_impl
 from .elementwise_binary import generate_elementwise_binary_impl
 from .gemm import generate_gemm_impl
 from .reduce import generate_reduce_impl
+from .reduce_interleave import generate_reduce_interleave_impl
 from .fill import generate_fill_impl
 from .mask import generate_mask_slice_impl
 
@@ -28,6 +30,11 @@ IMPL_REGISTRY = {
     (Elementwise,        Schedule.W): generate_elementwise_impl,
     (Elementwise_Binary, Schedule.W): generate_elementwise_binary_impl,
     (GeMM,               Schedule.W): generate_gemm_impl,
+    # ReduceInterleave must come before Reduce — ``get_impl_func`` matches by
+    # ``issubclass``, and a more specific subclass would otherwise be eaten
+    # by a broader match. (They are unrelated classes today, but registry
+    # order keeps this future-proof.)
+    (ReduceInterleave,   Schedule.W): generate_reduce_interleave_impl,
     (Reduce,             Schedule.W): generate_reduce_impl,
     (Fill,               Schedule.W): generate_fill_impl,
     (MaskSlice,          Schedule.W): generate_mask_slice_impl,

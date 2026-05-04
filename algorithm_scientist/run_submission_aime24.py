@@ -295,18 +295,43 @@ def _append_index(
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def _summary_subpath(config_path: Path) -> Path:
+    """Mirror the config's location under ``submissions/`` into the summary tree.
+
+    ``submissions/example_x.json``                       → ``example_x``
+    ``submissions/<tag>/batch_3_id5.json``               → ``<tag>/batch_3_id5``
+    ``submissions/<tag>/<sub>/<stem>.json`` (nested)     → ``<tag>/<sub>/<stem>``
+    Configs not under ``submissions/`` fall back to just the file stem
+    (preserving the old single-level layout for ad-hoc paths).
+
+    The agent-tagged path (``submissions/<tag>/...``) preserves per-agent
+    isolation in ``summary_submissions/`` so two agents producing the
+    same ``batch_x_idy`` stem never clobber each other's ``latest.json``.
+    """
+    parts = config_path.with_suffix("").parts  # drop the .json
+    if "submissions" in parts:
+        idx = parts.index("submissions")
+        tail = parts[idx + 1:]
+        if tail:
+            return Path(*tail)
+    return Path(config_path.stem)
+
+
 def _write_summary(summary: Dict[str, Any], config_path: Path) -> str:
     """Write the summary into a per-submission subfolder with a content-hashed name.
 
-    Layout:
+    Layout (mirrors the config's location relative to ``submissions/``):
         summary_submissions/
-            <config_stem>/
-                <timestamp>__<hash12>.json     — full summary + embedded artifacts
-                INDEX.jsonl                    — one row per run (headline metrics)
-                latest.json                    — symlink to the most recent run
+            <tag>/<config_stem>/                          — agent-tagged batches
+                <timestamp>__<hash12>.json                — full summary + embedded artifacts
+                INDEX.jsonl                               — one row per run (headline metrics)
+                latest.json                               — symlink to the most recent run
+            <config_stem>/                                — top-level examples / ad-hoc
+                ...
     """
-    tag = config_path.stem
-    run_dir = Path(SUMMARY_DIR) / tag
+    rel = _summary_subpath(config_path)
+    tag = str(rel)                            # used downstream as the "submission" label
+    run_dir = Path(SUMMARY_DIR) / rel
     run_dir.mkdir(parents=True, exist_ok=True)
 
     config_text, module_text, content_hash = _read_submission_artifacts(config_path)

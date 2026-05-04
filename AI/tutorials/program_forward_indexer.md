@@ -206,22 +206,37 @@ it with any tensor you've already built up — here, the QUEST envelope
 ## 8. Worked example: `centered_block_sparse_attention` — per-sequence summary
 
 Sometimes a page's score should depend on *all* the pages of the
-sequence — e.g. "score each page relative to the sequence mean". That's
-the one case where the single-sequence fiction needs one extra op:
-**`Reduce(dim=0)`** (`Mean(dim=0)` / `Max(dim=0)` / etc.).
+sequence — e.g. "drop pages whose score is below the sequence mean".
+That's the one case where the single-sequence fiction needs one extra
+op: **`Reduce(dim=0)`** (`Mean(dim=0)` / `Max(dim=0)` / etc.).
 
 `Reduce(dim=0)` collapses the `S` axis, giving you a `[1, D_0, D_1]`
 logical tensor that broadcasts back against any per-page tensor in
-normal binary ops (`Add`, `Multiply`, …). Concrete example:
+normal binary ops (`Add`, `Multiply`, `WhereGreater`, …).
+
+> **Important — `topK` is invariant to monotonic transforms.** Doing
+> `score - mean_seq` (an `Add(α=1, β=-1)` against a `[1,1,1]` shift)
+> and feeding the result straight to `topK` picks the **same pages**
+> as feeding `score` directly. Subtracting one scalar from every page
+> is order-preserving. The reference flow
+> `centered_block_sparse_attention` was written that way and is
+> equivalent to plain `block_sparse_attention` — useful as a pedagogical
+> illustration of `Reduce(dim=0)`'s machinery, *not* a recommended
+> recipe.
+
+To make a per-sequence statistic actually change the picked set, thread
+it through a **non-monotonic** op (a threshold gate, a per-page
+multiplier from a different signal, etc.):
 
 ```python
 def forward_indexer(self, q, o, cache, ctx):
     s        = self.mul(q, cache["centroids"], ctx=ctx)   # [S, H_q, D]
     score_d  = self.sum_d(s, ctx=ctx)                     # Sum(dim=2) → [S, H_q, 1]
     score    = self.mean_h(score_d, ctx=ctx)              # Mean(dim=1) → [S, 1, 1]
-    mean_seq = self.mean_seq(score, ctx=ctx)              # Mean(dim=0) → [1, 1, 1]  (per-sequence)
-    centered = self.center(score, mean_seq, ctx=ctx)      # Add(α=1, β=-1) → [S, 1, 1]
-    self.output_func(centered, o, ctx=ctx)
+    mean_seq = self.mean_seq(score, ctx=ctx)              # Mean(dim=0) → [1, 1, 1]
+    above    = self.cmp(score, mean_seq, ctx=ctx)         # WhereGreater → 0 / -1e30  [S, 1, 1]
+    gated    = self.add_gate(score, above, ctx=ctx)       # Add(α=1, β=1) → masks below-mean to ~-inf
+    self.output_func(gated, o, ctx=ctx)
 ```
 
 Reading line-by-line:
@@ -230,13 +245,17 @@ Reading line-by-line:
   `Sum` over `D`.
 - Collapse query heads with `Mean(dim=1)` → one score per page `[S, 1, 1]`.
 - `Mean(dim=0)` on that → one scalar for the whole sequence `[1, 1, 1]`.
-- `Add(α=1, β=-1)`: `score - mean_seq`, broadcasting the sequence mean
-  against the `S` axis → per-page centered score `[S, 1, 1]`.
-- Hand to `topK`.
+- `WhereGreater(score, mean_seq)`: `0` for pages above the sequence
+  mean, `-1e30` for the rest. This is a **per-page** decision, not a
+  constant shift.
+- `Add(α=1, β=1)` adds the mask to the score, sending below-mean
+  pages to ~`-inf` while leaving above-mean pages unchanged.
+- Hand to `topK` — now the picked set genuinely depends on the
+  per-sequence statistic.
 
-This gives you the normalisation patterns sparse-attention papers rely
-on: **z-score-like centering**, **softmax-approximation shifts**, etc.,
-all expressed in two or three lines.
+`Reduce(dim=0)` is a real and valuable primitive; the only caveat is
+that you have to consume it through something that changes order,
+not just shifts it.
 
 ---
 
@@ -502,7 +521,7 @@ re-read the op you wanted and see whether its logical semantics on
 | "dot product with a centroid" | `Multiply` → `Sum(dim=2)` (or a single `GeMM`) |
 | "envelope bound" (QUEST) | `Multiply` twice + `Maximum` + `Sum(dim=2)` + `Max(dim=1)` |
 | "cosine-like on multiple centroids" (top-k among C centroids) | `GeMM` → `Max(dim=1)` over the centroid axis |
-| "centered score" (subtract per-sequence mean) | per-page score → `Reduce(dim=0)` → `Add(α=1, β=-1)` |
+| "gate by per-sequence threshold" (mask below-mean pages to `-inf`) | score → `Reduce(dim=0)` → `WhereGreater` → `Add(α=1, β=1)`. NB: a plain `Add(α=1, β=-1)` *into* `topK` is a **no-op** — `topK` is invariant to constant shifts |
 | "softmax over pages" | `Softmax(dim=0)` |
 | "mask out a positional range of the query heads" | `MaskSlice(start, end, dim=1, α, β)` then `Multiply` with the score |
 | "bias the first/last few pages" (BOS/EOS) | the framework already handles this via `block_reserved_bos` / `block_reserved_eos`; don't recode it |

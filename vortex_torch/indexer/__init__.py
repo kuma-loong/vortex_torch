@@ -64,9 +64,10 @@ from .elementwise_binary import (
 from .elementwise import Relu, Sigmoid, Silu, Add_Mul, Abs, Log, Exp
 from .save_load import Save, Load
 from .mask import MaskSlice
+from .kron import Kron
 from . import utils_sglang, compiler
 from .context import Context, get_ctx
-__all__ = [ 
+__all__ = [
     "GeMM", "GeMV",
     "topK", "approxTopK",
     "Max", "Mean", "Min", "L2Norm", "Sum",
@@ -78,6 +79,7 @@ __all__ = [
     "Relu", "Sigmoid", "Silu", "Add_Mul", "Abs", "Log", "Exp",
     "Save", "Load",
     "MaskSlice",
+    "Kron",
     "utils_sglang",
     "Context",
     "get_ctx",
