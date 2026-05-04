@@ -10,7 +10,7 @@ while [[ $# -gt 0 ]]; do
     -d|--data)   data_path="$2"; shift 2 ;;
     -h|--help)
       echo "usage: $0 [-p <summary-prefix>] [-d <data-path>] <model-name> [trial ...]" >&2
-      echo "  e.g.  $0 -p runs/expt1 -d examples/lcbv5.jsonl Qwen/Qwen3-4B 8 16 32" >&2
+      echo "  e.g.  $0 -p runs/expt1 -d examples/lcbv5.jsonl Qwen/Qwen3-4B 1 2 4" >&2
       exit 0
       ;;
     -*) echo "unknown flag: $1" >&2; exit 1 ;;
@@ -20,7 +20,7 @@ done
 
 if [[ $# -lt 1 ]]; then
   echo "usage: $0 [-p <summary-prefix>] [-d <data-path>] <model-name> [trial ...]" >&2
-  echo "  e.g.  $0 -p runs/expt1 -d examples/lcbv5.jsonl Qwen/Qwen3-4B 8 16 32" >&2
+  echo "  e.g.  $0 -p runs/expt1 -d examples/lcbv5.jsonl Qwen/Qwen3-4B 1 2 4" >&2
   exit 1
 fi
 
@@ -31,7 +31,7 @@ algo="gqa_quest_sparse_attention"
 if [[ $# -gt 0 ]]; then
   trials=("$@")
 else
-  trials=(8 16 32)
+  trials=(1 2 4)
 fi
 topk_val=(
   29
@@ -58,7 +58,7 @@ for trial in "${trials[@]}"; do
     stem="${algo}_t${trial}_k${k_val}"
     echo ">>> [gpu${gpu}] ${stem}  (model=${model})"
     CUDA_VISIBLE_DEVICES="${gpu}" \
-    python examples/verify_algo.py \
+    python examples/run_lcb.py \
         --trials ${trial} \
         --topk-val ${k_val} \
         --page-size 16 \
