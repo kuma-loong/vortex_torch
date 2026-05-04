@@ -186,6 +186,10 @@ tmp*.txt
 *.png
 *.pdf
 
+# Sparse-attention reference papers — track them despite the global *.pdf rule.
+!papers/*.pdf
+!papers/**/*.pdf
+
 # personnal
 work_dirs/
 *.csv
