@@ -2,7 +2,8 @@
 name: vortex-submission-reviewer
 description: >-
   Use this subagent to audit an existing vortex_torch submission
-  pair (submissions/<name>.py + .json) against the AGENTS.md
+  pair (submissions/<tag>/<name>.py + .json, or
+  submissions/<name>.{py,json} for top-level examples) against the AGENTS.md
   contract, without modifying any code. Returns a structured
   review listing rule violations and suggestions. Invoke whenever
   the user asks to "review", "audit", or "check" a submission.
@@ -66,7 +67,7 @@ Read the submission's `.py` and `.json`, then verify:
 Respond with exactly this structure — nothing else:
 
 ```
-## Review of submissions/<name>
+## Review of submissions/<tag>/<name>  (or submissions/<name> for examples)
 
 ### Blockers  (framework will reject)
 - <rule #, file:line, one-sentence description>  | or: none

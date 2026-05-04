@@ -1,40 +1,54 @@
 ---
-description: (DEBUG ONLY) sbatch a single-variant AIME24 run. Forbidden in the standard agent workflow — use /batch-benchmark instead.
+description: (DEBUG ONLY) Run a single-variant AIME24 benchmark directly via python. Forbidden in the standard agent workflow — use /batch-benchmark instead.
 argument-hint: <submission-name>
 ---
 
 > **Debug-only command.** The sanctioned benchmark protocol runs
-> exclusively in batches of 8 via `/batch-benchmark`. Use this
-> single-variant form ONLY for human debugging (e.g. confirming a
-> new flow boots end-to-end). Do not chain it as part of an
-> automated workflow.
+> exclusively as a batch that fills every local GPU, via
+> `/batch-benchmark`. Use this single-variant form ONLY for human
+> debugging (e.g. confirming a new flow boots end-to-end). Do
+> not chain it as part of an automated workflow.
 
-Submit `submissions/$1.json` to the AIME24 benchmark via Slurm.
+Resolve `$1` to a config path: try
+`submissions/<tag>/$1.json` first, then `submissions/$1.json`,
+or treat `$1` as a literal path if it ends in `.json`. The
+runner **mirrors** the config's location under `submissions/`
+into `summary_submissions/`, so
+`submissions/<tag>/batch_3_id5.json` produces
+`summary_submissions/<tag>/batch_3_id5/`.
 
-**Do not run `python algorithm_scientist/run_submission_aime24.py` directly** —
-the host environment has no GPU. Use Slurm:
-
-Step 1 — submit:
+Step 1 — pre-flight (CPU-only):
 ```bash
-sbatch algorithm_scientist/run_submission.slurm submissions/$1.json
+CFG=<resolved path to submissions/.../$1.json>
+python -c "from vortex_torch.engine.sgl import check_engine_config; check_engine_config('$CFG')"
 ```
-Capture the returned `Submitted batch job <JOBID>` and echo the
-JOBID back to the user.
+Refuse to run the benchmark if pre-flight fails.
 
-Step 2 — poll every ~60s until the job reaches a terminal state
-(`COMPLETED` / `FAILED` / `TIMEOUT` / `CANCELLED` / `OUT_OF_MEMORY`):
+Step 2 — launch directly. Pin to one GPU (default GPU 0; pick a
+free one if 0 is busy) and capture stdout/stderr to a log file:
 ```bash
-sacct -j <JOBID> --format=JobID,State,ExitCode -X -n -P
+STEM=$(basename "$CFG" .json)                             # filename stem only
+SUMMARY_REL="${CFG#submissions/}"; SUMMARY_REL="${SUMMARY_REL%.json}"   # tag/stem (or just stem for top-level configs)
+LOGDIR="logs/submission/single_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$LOGDIR"
+CUDA_VISIBLE_DEVICES=0 \
+    python algorithm_scientist/run_submission_aime24.py --config "$CFG" \
+    > "$LOGDIR/${STEM}.out" \
+    2> "$LOGDIR/${STEM}.err"
 ```
+The runner writes its summary into
+`summary_submissions/${SUMMARY_REL}/<timestamp>__<hash>.json`
+and updates `summary_submissions/${SUMMARY_REL}/latest.json`
+itself; no further polling needed.
 
-Step 3 — once terminal:
+Step 3 — read the result:
 
-- **Success** → Read `summary_submissions/$1/latest.json` (a
-  symlink to the newest run). Print `mean@16`, `pass@16`,
-  `e2e_time`, `total_tokens`, `throughput`, and the
-  `content_hash`. For run-to-run comparisons, `cat
-  summary_submissions/$1/INDEX.jsonl | jq -c '{finished_at,
-  content_hash, "mean@16", throughput}'`.
-- **Failure** → Read `logs/submission/vortex_submission_<JOBID>.err`
-  (and `.out` if needed). Summarise the error in 1-2 sentences and
-  recommend a fix. Do NOT re-submit without pre-flight passing first.
+- **Success** → Open `summary_submissions/${SUMMARY_REL}/latest.json`
+  and print `mean@16`, `pass@16`, `e2e_time`, `total_tokens`,
+  `throughput`, and `content_hash`. For run-to-run comparisons:
+  `cat summary_submissions/${SUMMARY_REL}/INDEX.jsonl | jq -c
+  '{finished_at, content_hash, "mean@16", throughput}'`.
+- **Failure** (non-zero exit, or no new `latest.json` was
+  written) → Open `$LOGDIR/${STEM}.err` (and `.out` if needed),
+  summarise the error in 1-2 sentences, and recommend a fix. Do
+  NOT re-launch without pre-flight passing first.

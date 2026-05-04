@@ -3,10 +3,14 @@ description: Run check_engine_config locally (CPU-only) on a submission.
 argument-hint: <submission-name>
 ---
 
-Run the cheap pre-flight check for `submissions/$1.json`:
+Resolve `$1` to a config path. Most submissions live under your
+agent tag, so try in order: `submissions/<tag>/$1.json`,
+`submissions/$1.json` (top-level for examples), or treat `$1`
+itself as a path if it ends in `.json`. Then run the cheap
+pre-flight check:
 
 ```bash
-python -c "from vortex_torch.engine.sgl import check_engine_config; check_engine_config('submissions/$1.json')"
+python -c "from vortex_torch.engine.sgl import check_engine_config; check_engine_config('<resolved path>')"
 ```
 
 Capture the output. If it raises, paste the relevant traceback line
@@ -15,4 +19,5 @@ and cross-reference it with [AI/AGENTS.md §5](AI/AGENTS.md)
 pass, but do **not** edit files unless the user asks you to.
 
 If it passes, remind the user that the next step is `/benchmark $1`
-(which submits to Slurm — no GPU needed here).
+(debug, single variant) or `/batch-benchmark` (the sanctioned
+batch that fills every local GPU, launched directly via python).

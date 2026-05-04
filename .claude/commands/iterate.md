@@ -1,5 +1,5 @@
 ---
-description: Launch the long-horizon auto-iteration loop (batches of 8, ≤ 24 in flight, persists state in memory.md).
+description: Launch the long-horizon auto-iteration loop (one batch fills every local GPU, one batch at a time, persists state in memory.md).
 argument-hint: <theme-tag> [--min-mean-at-16 <float>] [--max-iterations <int>] [--baseline-throughput <float>]
 ---
 
@@ -11,13 +11,26 @@ This drives a dedicated Claude agent that:
 - Reads / appends to `algorithm_scientist/memory.md` for persistent
   state across sessions (in-flight ledger, completed-batch table,
   hypotheses, anti-patterns, reading log).
-- Writes submission pairs `submissions/$1_v1..v8.{py,json}`.
-- Pre-flights all 8 locally, then sbatches the **batch of 8** via
-  `algorithm_scientist/run_submission_batch.slurm`.
-- Honours the in-flight ceiling: ≤ 3 concurrent batches (≤ 24
-  experiments).
-- During Slurm's 8+ hr wait, alternates between reading source,
-  preparing the next batch, and analysing completed batches.
+- Detects the *currently-free* GPU set at the start of every
+  batch via `algorithm_scientist/free_gpus.sh` and uses
+  `N = len(FREE_GPUS)` (NOT the physical GPU count — other users
+  may share this host). Writes submission pairs
+  `submissions/<tag>/batch_<x>_id<y>.{py,json}` for `<y> ∈ {0
+  … N-1}`, where `<tag>` is the agent's identifier and `<x>` is
+  the batch index (0-indexed, increments per batch this
+  session). The positional `$1` argument is the *theme tag* for
+  memory.md attribution; it is **not** the agent tag (the agent
+  tag is auto-detected from the model name).
+- Pre-flights all `N` locally, then forks `N` background
+  `python algorithm_scientist/run_submission_aime24.py` processes
+  pinned to the free GPU indices (`CUDA_VISIBLE_DEVICES=${FREE_GPUS[$y]}`)
+  and `wait`s for them all. Re-detects free GPUs immediately
+  before launch in case the set shifted during pre-flight.
+- Honours the concurrency cap: **one** batch at a time on the
+  GPUs it targets; if `free_gpus.sh` returns nothing, hard wait.
+- During the 8+ hr wait, alternates between reading source,
+  designing the next batch (without launching), and analysing
+  children whose `latest.json` has already landed.
 - Reads `summary_submissions/<name>/latest.json` and updates
   memory.md.
 
