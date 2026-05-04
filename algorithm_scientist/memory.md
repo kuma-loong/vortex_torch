@@ -7,47 +7,64 @@ conversation does not.
 
 **Hard constraints** (restate every time you open this file):
 
-- Submissions **always run in batches of 8** via
-  `sbatch algorithm_scientist/run_submission_batch.slurm …`. Never
-  submit a single variant — if you have only one idea, fill the other
-  seven slots with orthogonal knob sweeps.
-- **At most 24 experiments in flight** at once (i.e. ≤ 3 batches
-  queued+running simultaneously). Check `squeue -u $USER -h` before
-  each `sbatch`.
+- Submissions **always run in a batch sized to the free local GPUs**.
+  Detect with `algorithm_scientist/free_gpus.sh` (returns space-
+  separated indices of GPUs with no compute process and
+  memory.used < 1024 MiB); `N = ${#FREE_GPUS[@]}`. Never launch a
+  single variant — if you have only one idea, fill the other `N - 1`
+  slots with orthogonal knob sweeps.
+- **One batch at a time** on the free GPUs. Concurrent batches contend
+  for memory and OOM/thrash. The cadence is: detect free → launch
+  N-variant batch → `wait` → analyse → re-detect → next batch.
+- **At least one off-catalog variant per batch** (`papers/guide.md §16`):
+  paper combinations, knob inversions, untried-knob experiments, or
+  first-principles answers. Pure parameter sweeps and direct paper
+  replications do not count. Pre-register the off-catalog hypothesis
+  in §3 the moment you launch.
+- **File layout.** Submissions live under `submissions/<tag>/`, where
+  `<tag>` is your sanitized model name (e.g. `claude_opus_4_7`).
+  Batched runs use `submissions/<tag>/batch_<x>_id<y>.{py,json}`
+  (`<x>` = batch index, `<y>` = variant slot 0…N-1). Summaries land
+  at `summary_submissions/<tag>/batch_<x>_id<y>/latest.json` (the
+  runner mirrors the source path).
 - **Objective**: maximise AIME24 `throughput` while keeping `mean@16`
   at or above the quality floor set for this session.
 
 ---
 
-## 1. In-flight batches  (≤ 3, equivalent to ≤ 24 experiments)
+## 1. In-flight batches  (at most 1 — every targeted GPU is consumed)
 
-> Append one row when a batch is submitted; remove it once all 8
-> finished rows land in §2. A batch counts against the ceiling from
-> `sbatch` until the last child in the batch lands a summary JSON.
+> Append one row the moment you launch a batch; remove it once all
+> `N` finished rows land in §2. A batch counts as "in-flight" from
+> the `wait` start until the last child writes its `latest.json`.
 
-| batch_id | submitted_at | slurm_job_id | submissions (8) | status |
-|---|---|---|---|---|
-| _none yet_ |  |  |  |  |
+| tag | batch_x | launched_at | logdir | gpus | submissions | off-cat hyp § | status |
+|---|---|---|---|---|---|---|---|
+| _none yet_ |  |  |  |  |  |  |  |
 
 ---
 
 ## 2. Completed batches
 
 > Oldest first. When a batch completes, copy headline metrics from
-> `summary_submissions/<name>/latest.json` and distil 1-3 sentences
-> of takeaway — what moved, what didn't, why.
+> `summary_submissions/<tag>/<stem>/latest.json` for each variant
+> and distil 1-3 sentences of takeaway — what moved, what didn't,
+> why. Always cite the off-catalog variant and what its result said
+> about the §3 hypothesis it pre-registered.
 
 <!--
-### Batch <id> — <one-line label>  (submitted YYYY-MM-DD HH:MM, slurm <JOBID>)
+### <tag>/batch_<x> — <one-line theme>  (launched YYYY-MM-DD HH:MM, free GPUs: 0,3,5,7)
 
-| submission | content_hash | mean@16 | pass@16 | throughput (tok/s) | e2e_time (s) |
-|---|---|---|---|---|---|
-| v1 |  |  |  |  |  |
-| v2 |  |  |  |  |  |
-| …  |  |  |  |  |  |
-| v8 |  |  |  |  |  |
+| variant         | content_hash | mean@16 | pass@16 | throughput (tok/s) | e2e_time (s) | notes |
+|---|---|---|---|---|---|---|
+| batch_<x>_id0   |  |  |  |  |  |  |
+| batch_<x>_id1   |  |  |  |  |  |  |
+| …               |  |  |  |  |  |  |
+| batch_<x>_idN-1 |  |  |  |  |  | ← off-catalog (§3 hyp #?) |
 
-**Hypothesis this batch tested:** …
+**Knob matrix:** id0=…, id1=…, …, idN-1=… (off-catalog: …)
+
+**Off-catalog hypothesis tested:** §3 row #? — verdict: confirmed/refuted/inconclusive.
 
 **What moved:** …
 
@@ -62,11 +79,13 @@ _none yet_
 
 > Keep one row per idea under investigation. Close a row with a
 > verdict when you have enough evidence. A refuted hypothesis is
-> just as valuable as a confirmed one — record it.
+> just as valuable as a confirmed one — record it. Number rows so
+> the §1 "off-cat hyp §" column and §2 "off-catalog hypothesis"
+> notes can cite them.
 
-| hypothesis | evidence for (batch ids) | evidence against | verdict |
-|---|---|---|---|
-| _example: "fp8_e5m2 kv cache keeps mean@16 within 5% of bf16 on AIME24"_ | _e.g. batch 3, 5_ | _e.g. batch 4_ | _open / confirmed / refuted_ |
+| # | hypothesis | source | evidence for (batches) | evidence against | verdict |
+|---|---|---|---|---|---|
+| _ex_ | _"fp8_e5m2 kv cache keeps mean@16 within 5% of bf16 on AIME24"_ | _§16.4 / Double Sparsity §4_ | _e.g. <tag>/batch_3, batch_5_ | _e.g. batch_4_ | _open / confirmed / refuted_ |
 
 ---
 
@@ -89,8 +108,11 @@ _none yet_
 
 ## 6. Open questions / next directions
 
-> The agent's own backlog of ideas it hasn't tested. When a slot
-> opens up (< 24 in flight), pick from the top of this list.
+> The agent's own backlog of ideas it hasn't tested. When the
+> current batch finishes (no in-flight rows in §1), pick from the
+> top of this list. At least one slot in every new batch must be
+> off-catalog — promote items here into pre-registered §3
+> hypotheses on launch.
 
 - _none yet_
 
