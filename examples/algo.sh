@@ -9,10 +9,10 @@ models=(
 Qwen/Qwen3-4B
 )
 trials=(
-8
+16
 )
 topk_val=(
-61
+29
 )
 for algo in "${sparse_algos[@]}"; do
   for model in "${models[@]}"; do
