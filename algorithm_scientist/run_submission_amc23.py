@@ -1,4 +1,4 @@
-"""Run a sparse-attention submission against AIME24 (fixed protocol).
+"""Run a sparse-attention submission against AMC23 (fixed protocol).
 
 Given a submission's engine JSON (e.g. ``submissions/<your_name>.json``),
 this script:
@@ -7,11 +7,11 @@ this script:
      (JSON shape, pow-2 constraints, ``@register(<name>)`` exists,
      flow compiles on a small grid).
   2. Boots an sglang engine with the submission's ``vortex_*`` settings
-     plus the fixed AIME24 protocol constants below.
-  3. Runs :file:`examples/aime24.jsonl` with 16 trials.
+     plus the fixed AMC23 protocol constants below.
+  3. Runs :file:`examples/amc23.jsonl` with 16 trials.
   4. Scores with lighteval's ``MultilingualExtractiveMatchMetric``
      (same setup as ``examples/verify_algo.py``).
-  5. Writes a per-run summary JSON to ``summary_submissions/``.
+  5. Writes a per-run summary JSON to ``summary_amc23_submissions/``.
 
 All benchmark-protocol settings are fixed — the **only** CLI argument
 is the submission config path.
@@ -20,7 +20,7 @@ Usage
 -----
 ::
 
-    python examples/run_submission_aime24.py \\
+    python algorithm_scientist/run_submission_amc23.py \\
         --config submissions/example_block_sparse_attention.json
 """
 
@@ -54,8 +54,8 @@ MODEL_NAME                  = "Qwen/Qwen3-1.7B"
 MAX_INPUT_LENGTH            = 4096
 GENERATION_MAX_NEW_TOKENS   = 16384
 TP_SIZE                     = 1
-DATA_PATH                   = "examples/aime24.jsonl"
-SUMMARY_DIR                 = "summary_submissions"
+DATA_PATH                   = "examples/amc23.jsonl"
+SUMMARY_DIR                 = "summary_amc23_submissions"
 
 # `mem_fraction_static` is the fraction of GPU memory sglang reserves for
 # the KV cache + model weights. It is a SUBMISSION-TUNABLE knob: higher
@@ -240,7 +240,7 @@ def run(config_path: Path) -> Dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Validate a submission and run it on AIME24 with the fixed protocol.",
+        description="Validate a submission and run it on AMC23 with the fixed protocol.",
     )
     parser.add_argument(
         "--config",
@@ -305,7 +305,7 @@ def _summary_subpath(config_path: Path) -> Path:
     (preserving the old single-level layout for ad-hoc paths).
 
     The agent-tagged path (``submissions/<tag>/...``) preserves per-agent
-    isolation in ``summary_submissions/`` so two agents producing the
+    isolation in ``summary_amc23_submissions/`` so two agents producing the
     same ``batch_x_idy`` stem never clobber each other's ``latest.json``.
     """
     parts = config_path.with_suffix("").parts  # drop the .json
@@ -321,7 +321,7 @@ def _write_summary(summary: Dict[str, Any], config_path: Path) -> str:
     """Write the summary into a per-submission subfolder with a content-hashed name.
 
     Layout (mirrors the config's location relative to ``submissions/``):
-        summary_submissions/
+        summary_amc23_submissions/
             <tag>/<config_stem>/                          — agent-tagged batches
                 <timestamp>__<hash12>.json                — full summary + embedded artifacts
                 INDEX.jsonl                               — one row per run (headline metrics)

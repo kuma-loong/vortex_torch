@@ -1,0 +1,14 @@
+{
+  "vortex_module_path":          "submissions/claude_sonnet_4_6/innovate_0_id19.py",
+  "vortex_module_name":          "claude_sonnet_4_6_innovate_0_id19_cls",
+  "vortex_block_size":           16,
+  "vortex_workload_chunk_size":  32,
+  "vortex_topk_val":             48,
+  "vortex_topk_ratio":           0.1,
+  "vortex_block_reserved_bos":   1,
+  "vortex_block_reserved_eos":   2,
+  "vortex_layers_skip":          [0],
+  "vortex_dtype":                "bfloat16",
+  "kv_cache_dtype":              "auto",
+  "mem_fraction_static":         0.85
+}
