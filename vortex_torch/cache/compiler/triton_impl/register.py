@@ -16,6 +16,7 @@ from ...reduce import Reduce
 from ...reduce_interleave import ReduceInterleave
 from ...fill import Fill
 from ...mask import MaskSlice
+from ...reshape import Reshape
 
 from .elementwise import generate_elementwise_impl
 from .elementwise_binary import generate_elementwise_binary_impl
@@ -24,6 +25,7 @@ from .reduce import generate_reduce_impl
 from .reduce_interleave import generate_reduce_interleave_impl
 from .fill import generate_fill_impl
 from .mask import generate_mask_slice_impl
+from .reshape import generate_reshape_impl
 
 IMPL_REGISTRY = {
     # Schedule.W — fused into the per-block cache kernel.
@@ -38,6 +40,7 @@ IMPL_REGISTRY = {
     (Reduce,             Schedule.W): generate_reduce_impl,
     (Fill,               Schedule.W): generate_fill_impl,
     (MaskSlice,          Schedule.W): generate_mask_slice_impl,
+    (Reshape,            Schedule.W): generate_reshape_impl,
 }
 
 

@@ -65,6 +65,7 @@ from .elementwise import Relu, Sigmoid, Silu, Add_Mul, Abs, Log, Exp
 from .save_load import Save, Load
 from .mask import MaskSlice
 from .kron import Kron
+from .reshape import Reshape
 from . import utils_sglang, compiler
 from .context import Context, get_ctx
 __all__ = [
@@ -80,6 +81,7 @@ __all__ = [
     "Save", "Load",
     "MaskSlice",
     "Kron",
+    "Reshape",
     "utils_sglang",
     "Context",
     "get_ctx",

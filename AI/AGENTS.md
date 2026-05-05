@@ -18,9 +18,8 @@ naming convention is:
 
 where `<x>` is the batch index (0-indexed, incrementing across
 batches you launch this session) and `<y>` is the variant slot
-within that batch (`0 … N-1`, where `N` is the count of
-*currently-free* GPUs returned by
-`algorithm_scientist/free_gpus.sh` — not the physical GPU count).
+within that batch (`0 … 3` — every batch is exactly 4 variants;
+see §5c for parallelism rules).
 
 ### Tag — your agent identifier
 
@@ -40,22 +39,34 @@ materials, not work product.
 
 ## Objective
 
-> **Maximise decoding throughput (tokens/sec) while keeping `mean@16`
-> at or above a minimum acceptable floor.**
+> **Strike the best tradeoff between accuracy (`mean@16`) and
+> decoding throughput (tokens/sec) on AIME24.**
 
-`mean@16` is a *quality gate*, not something to maximise. Once the
-flow passes the gate, every extra design choice should be made in the
-direction of **more throughput**: fewer / cheaper cache-side ops,
-fewer intermediate cache fields, tighter `vortex_topk_val` /
-`vortex_topk_ratio` budgets, smarter layer-skip patterns, aggressive
-`kv_cache_dtype` (fp8). If two variants both clear the floor, pick the
-faster one — not the more accurate one.
+There is **no fixed quality floor** and no single number to maximise.
+Both `mean@16` and `throughput` are objectives, and the goal is to
+push the **Pareto frontier** outward — find variants that *trade*
+the two well, not variants that win one axis at any cost on the
+other. A flow that buys +30% throughput for −2% `mean@16` is a
+useful data point; a flow that buys +3% `mean@16` at −40%
+throughput is too. Both belong on the frontier; comparing them is a
+judgement call about where on the frontier you want to live, not a
+hard pass/fail check.
+
+When designing a batch, vary along axes that *change the tradeoff*
+— accuracy-leaning knobs (looser `topk`, fewer `layers_skip`, bf16
+KV) on some variants; throughput-leaning knobs (tighter `topk`,
+more `layers_skip`, fp8 KV, `approxTopK`) on others — and let the
+results map the frontier shape for the current flow family.
 
 Concretely, each benchmark run gives you two headline numbers
 (see §5b):
 
-- `mean@16` — must be `≥ MIN_MEAN_AT_16` (your quality floor).
-- `throughput` — maximise this subject to the floor above.
+- `mean@16` — accuracy. Higher is better.
+- `throughput` — speed (tokens/sec). Higher is better.
+
+Pick winners by where they sit on the `(throughput, mean@16)`
+Pareto frontier across the batch and against memory.md §5
+(patterns that worked).
 
 ---
 
@@ -187,7 +198,7 @@ from vortex_torch.indexer import (
     GeMM, Multiply, Add, Maximum, Minimum, Kron,
     Softmax, Normalize,
     Relu, Sigmoid, Silu, Add_Mul, Abs, Log, Exp,
-    Save, Load, MaskSlice,
+    Save, Load, MaskSlice, Reshape,
     WhereEqual, WhereNotEqual, WhereGreater,
     WhereGreaterEqual, WhereLess, WhereLessEqual,
 )
@@ -199,7 +210,7 @@ from vortex_torch.cache import (
     Multiply as CMultiply, Add as CAdd, Maximum as CMaximum, Minimum as CMinimum,
     Relu as CRelu, Sigmoid as CSigmoid, Silu as CSilu,
     Add_Mul as CAdd_Mul, Abs as CAbs, Log as CLog, Exp as CExp,
-    Fill as CFill, MaskSlice as CMaskSlice,
+    Fill as CFill, MaskSlice as CMaskSlice, Reshape as CReshape,
 )
 
 
@@ -503,51 +514,64 @@ What each field means:
 
 ### What to iterate on
 
-Remember: **throughput is the thing being optimised. `mean@16` is a
-floor, not a ceiling.** Diagnose each run with that asymmetry in
-mind:
+Both `mean@16` and `throughput` are objectives. Diagnose each run by
+asking *where on the (throughput, mean@16) plane* it lands relative
+to the rest of the batch and to the running best in memory.md §5:
 
-- **`mean@16` below the floor** → the quality gate has failed. Fix
-  this first, even at a throughput cost. Tighten the scoring logic in
-  `forward_indexer`, *widen* `vortex_layers_skip` (e.g. `[0, 1]` or
-  interleaved `[0, 4, 8, ...]`), *raise* `vortex_topk_val` /
-  `vortex_topk_ratio`, back off an aggressive `kv_cache_dtype` (fp8
-  → auto). Only once the floor is cleared should you think about
-  speed.
-- **`mean@16` clears the floor, `throughput` merely OK** → this is the
-  normal case and the main optimisation target. Cut cache/indexer
-  work that isn't pulling its weight: drop intermediate cache fields,
-  replace `GeMM` with cheaper reductions where possible, *shrink*
-  `vortex_topk_val`, try fp8 `kv_cache_dtype`, or narrow
-  `vortex_layers_skip` back down.
-- **`mean@16` clears the floor by a lot** → you are probably leaving
-  throughput on the table. Push the sparsity knobs harder
-  (lower `vortex_topk_val` / `vortex_topk_ratio`, shrink
-  `vortex_layers_skip`, try `fp8_e4m3` / `fp8_e5m2` for
-  `kv_cache_dtype`) until `mean@16` approaches the floor.
+- **High `throughput`, low `mean@16`** → too aggressive on sparsity
+  for this flow family. Try the next variant with looser settings
+  to map the accuracy recovery curve: *widen* `vortex_layers_skip`
+  away from the most-aggressive end (e.g. `[0, 1]` instead of
+  `[0, 4, 8, …]`), *raise* `vortex_topk_val` / `vortex_topk_ratio`,
+  back off `kv_cache_dtype` from fp8 to auto. The result tells you
+  the slope of the tradeoff, not whether to "fix" anything.
+- **Low `throughput`, high `mean@16`** → the flow has accuracy
+  headroom you can spend. Try the next variant with tighter
+  sparsity to see how much accuracy you give up per unit of
+  throughput: *shrink* `vortex_topk_val`, try fp8
+  `kv_cache_dtype`, narrow `vortex_layers_skip`, swap `topK` for
+  `approxTopK(tolerate_ratio=0.05–0.15)`.
+- **High on both** → likely Pareto-optimal for this flow family;
+  record in §5 (patterns that worked) and use as the baseline when
+  designing the next batch.
+- **Low on both** → the flow itself has a structural problem
+  (likely the scoring function or a misused op). The decode-time
+  cost has bought no signal. Tighten the indexer-side score logic
+  before sweeping knobs.
 - **`mean@16` nontrivial but `pass@16` much higher** → the flow is
-  inconsistent but not broken. Noise, not a design bug; prioritise
-  throughput work over chasing this.
+  inconsistent but not broken. Noise, not a design bug; treat the
+  current `(throughput, mean@16)` point as roughly fair and move on.
 - **`total_example != 480`** → something is wrong with the run
   itself; investigate before trusting any other number. Usually a
   path error (`--config` pointed at the wrong file) or the engine
   crashed mid-run.
 
-A submission is considered "good" when `mean@16` clears the agreed
-quality floor **and** `throughput` is meaningfully higher than the
-`example_block_sparse_attention` baseline. When in doubt between two
-variants that both clear the floor, pick the one with higher
-`throughput` — that is the entire point of the flow.
+A submission is considered "good" when its `(throughput, mean@16)`
+point sits on or pushes outward the running Pareto frontier in
+memory.md §5 against the `example_block_sparse_attention` baseline.
+When two variants are both Pareto-non-dominated relative to the
+current best, both belong on the frontier — keep them as separate
+data points rather than collapsing to one winner.
 
 ---
 
-## 5c. Batched benchmarking — fill every *free* local GPU per batch
+## 5c. Batched benchmarking — every batch is exactly 4 variants
 
-The workflow **requires every batch to fill every locally-free
-GPU** — one variant per free GPU. The host may share GPUs with
-other users or jobs, so the batch size depends on what's actually
-available *now*, not on `nvidia-smi -L | wc -l`. Detect free GPUs
-at the start of every batch with the helper:
+The workflow **requires every batch to contain exactly 4
+variants**. That fixed width is what guarantees analytical width
+(orthogonal knob sweeps, Pareto-frontier mapping). What changes
+with GPU availability is **parallelism**, not batch size:
+
+- `N >= 4` free GPUs → all 4 variants run in parallel, one per
+  GPU.
+- `0 < N < 4` free GPUs → the 4 variants run in **waves of `N`**
+  on the available GPUs (sequential fallback). With `N = 1` this
+  is fully serial; `N = 2` runs `2 + 2`; `N = 3` runs `3 + 1`.
+- `N == 0` (`free_gpus.sh` returns empty / exits 1) → hard wait;
+  do not launch.
+
+The host may share GPUs with other users or jobs. Detect free
+GPUs at the start of every batch with the helper:
 
 ```bash
 FREE_GPUS=($(algorithm_scientist/free_gpus.sh)) || {
@@ -555,52 +579,66 @@ FREE_GPUS=($(algorithm_scientist/free_gpus.sh)) || {
     exit 1
 }
 N=${#FREE_GPUS[@]}
-echo "free GPUs: ${FREE_GPUS[*]}   (N=$N)"
+BATCH_SIZE=4
+PARALLEL=$N
+[ "$PARALLEL" -gt "$BATCH_SIZE" ] && PARALLEL=$BATCH_SIZE
+echo "free GPUs: ${FREE_GPUS[*]}   (N=$N, parallel=$PARALLEL, batch=$BATCH_SIZE)"
 ```
 
 `free_gpus.sh` excludes any GPU that has a running compute process
 *or* has memory.used ≥ 1024 MiB (override threshold via
 `free_gpus.sh <mib>`). It exits non-zero when nothing is free —
 treat that as a hard "wait" signal, identical to the
-"concurrency cap" rule.
+"concurrency cap" rule. Any `N >= 1` is launchable; with
+`N < 4` you simply pay extra wall-clock time for the additional
+waves.
 
-Single-variant runs are not part of the protocol. If you have only
-one core idea, fill the other `N - 1` slots with orthogonal knob
+Single-variant runs are still not part of the protocol — every
+batch must have 4 variants designed up front. If you only have
+one core idea, fill the other 3 slots with orthogonal knob
 sweeps (different `vortex_topk_val`, different `kv_cache_dtype`,
-different `vortex_layers_skip`, different `vortex_block_size`, etc.).
+different `vortex_layers_skip`, different `vortex_block_size`,
+etc.) — and reserve at least one slot for a genuinely novel
+variant (see "Novelty budget" below).
 
-Launch the `N` variants by forking `N` background `python`
-processes, each pinned to one of the *free* GPU indices via
-`CUDA_VISIBLE_DEVICES`:
+Launch the 4 variants in waves of `PARALLEL = min(N, 4)`, with
+`wait` between waves so a wave's GPUs are free before the next
+wave reuses them:
 
 ```bash
 TAG=claude_opus_4_7                      # ← your agent identifier
 BATCH=$(ls -d submissions/$TAG/batch_*_id0.json 2>/dev/null | wc -l)   # next batch index
 FREE_GPUS=($(algorithm_scientist/free_gpus.sh)) || { echo "no free GPUs"; exit 1; }
 N=${#FREE_GPUS[@]}
+BATCH_SIZE=4
+PARALLEL=$N
+[ "$PARALLEL" -gt "$BATCH_SIZE" ] && PARALLEL=$BATCH_SIZE
 LOGDIR="logs/submission/${TAG}_batch_${BATCH}_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$LOGDIR"
 
-# Variants for this batch live at submissions/<tag>/batch_<x>_id<y>.{py,json},
-# one per free GPU (id 0 … N-1, where N tracks the free count, not the
-# physical GPU count). The y index is the variant slot, NOT the GPU index;
-# CUDA_VISIBLE_DEVICES is set from FREE_GPUS[$y] below.
-for y in $(seq 0 $((N - 1))); do
-    cfg="submissions/${TAG}/batch_${BATCH}_id${y}.json"
-    gpu="${FREE_GPUS[$y]}"
-    stem=$(basename "$cfg" .json)
-    CUDA_VISIBLE_DEVICES=$gpu \
-        python algorithm_scientist/run_submission_aime24.py --config "$cfg" \
-        > "$LOGDIR/gpu${gpu}_${stem}.out" \
-        2> "$LOGDIR/gpu${gpu}_${stem}.err" &
+# Variants for this batch live at submissions/<tag>/batch_<x>_id<y>.{py,json}
+# for y ∈ {0, 1, 2, 3}. The y index is the variant slot, NOT the GPU index;
+# CUDA_VISIBLE_DEVICES is FREE_GPUS[(y - start)] within each wave.
+for start in $(seq 0 $PARALLEL $((BATCH_SIZE - 1))); do
+    end=$((start + PARALLEL))
+    [ "$end" -gt "$BATCH_SIZE" ] && end=$BATCH_SIZE
+    for y in $(seq $start $((end - 1))); do
+        cfg="submissions/${TAG}/batch_${BATCH}_id${y}.json"
+        gpu="${FREE_GPUS[$((y - start))]}"
+        stem=$(basename "$cfg" .json)
+        CUDA_VISIBLE_DEVICES=$gpu \
+            python algorithm_scientist/run_submission_aime24.py --config "$cfg" \
+            > "$LOGDIR/gpu${gpu}_${stem}.out" \
+            2> "$LOGDIR/gpu${gpu}_${stem}.err" &
+    done
+    wait
 done
-wait
 ```
 
 What this does:
 
-1. Forks `N` child processes, one per GPU `0 … N-1`, all running
-   concurrently.
+1. Forks up to `PARALLEL = min(N, 4)` child processes per wave,
+   each pinned to one of the free GPUs.
 2. Each child runs `python algorithm_scientist/run_submission_aime24.py
    --config <cfg>` and writes its summary into
    `summary_submissions/<tag>/<stem>/<timestamp>__<hash>.json` (and
@@ -612,8 +650,10 @@ What this does:
    `batch_x_idy` stem.
 3. Per-child stdout/stderr land in
    `logs/submission/<tag>_batch_<x>_<TS>/gpu<i>_<stem>.{out,err}`.
-4. `wait` blocks until all `N` finish; the next step (analysis)
-   starts only when every child is done.
+4. The outer loop blocks on `wait` between waves; when `N >= 4`
+   that's just one wave. When `N < 4`, additional waves run on
+   the same GPU(s); the analysis step starts only after every
+   wave finishes.
 
 The runner (`run_submission_aime24.py`) automatically records
 `cuda_visible_devices` into each summary JSON, so a quick
@@ -622,33 +662,55 @@ which variant landed on which GPU.
 
 ### Concurrency cap — one batch at a time on the free GPUs
 
-A batch consumes every GPU `free_gpus.sh` returned. **Do not launch
-a second batch while the first is still running**, and **do not try
-to "fill the gaps" by launching extra variants on GPUs another user
-freed mid-batch** — both contend for GPU memory and either OOM or
-thrash. The natural cadence is: detect free GPUs, launch a batch
-sized to that count, `wait`, read the `N` summary JSONs, then
-re-detect (the free set may have changed) and launch the next batch.
+A batch occupies the GPUs `free_gpus.sh` returned for as long as
+its waves are running. **Do not launch a second batch while the
+first is still running** (any wave still alive), and **do not
+try to "fill the gaps" by launching extra variants on GPUs
+another user freed mid-batch** — both contend for GPU memory and
+either OOM or thrash. The natural cadence is: detect free GPUs,
+launch the 4-variant batch, `wait` for all waves, read the 4
+summary JSONs, then re-detect (the free set may have changed)
+and launch the next batch.
 
 If `free_gpus.sh` returns an empty set (exit code 1), do not
 launch — wait, and use the time on the §5d activities.
 
-### Novelty budget — at least one off-catalog variant per batch
+### Novelty budget — at least one *genuinely novel* variant per batch
 
 The `papers/` folder + [papers/guide.md](../papers/guide.md) catalog
-covers what's already published. They are *seeds*, not the menu. Of
-the `N` variants in every batch, **reserve at least one slot for an
-off-catalog flow** — an idea that does not trace cleanly to any
-single paper in `papers/` and that you can defend in one sentence.
-See [papers/guide.md §16](../papers/guide.md) for prompts. Pure
-parameter sweeps (smaller `vortex_topk_val`, more layer skips,
-`approxTopK` in place of `topK`, fp8 KV) do not count as
-off-catalog — they are the orthogonal-knob slots that fill the
-remaining `N - 1` variants. Replicating a paper does not count
-either. Combinations, inversions, novel score functions, and ideas
-derived from the codebase itself do.
+covers what's already published. They are *seeds*, not the menu, and
+**combinations of two paper ideas are still paper-derived thinking**
+— they do not count as novel. The off-catalog slot wants something
+the literature graph in `papers/` does not reach.
 
-Record the off-catalog hypothesis in one sentence in
+Of the 4 variants in every batch, **reserve at least one slot for
+a genuinely novel flow** — an idea that:
+
+- does not trace to any single paper in `papers/`,
+- is not just a combination of two papers (those are
+  catalog-adjacent, see [papers/guide.md §16.1](../papers/guide.md)),
+- is not a parameter sweep, a paper replica, or a mechanical
+  knob-flip,
+- comes from somewhere new: an inversion of a basic assumption
+  (§16.3), an untried-knob experiment derived from staring at the
+  framework's op set (§16.2), a first-principles answer to a
+  question the literature isn't asking (§16.4), or — best of all —
+  a hypothesis you simply haven't seen anywhere.
+
+Combinations from §16.1 are useful as *additional* variants but
+cannot fill the novelty slot on their own. If you propose a
+combination, add a true §16.2/§16.3/§16.4-class idea alongside it.
+Aim for **two genuinely novel variants per batch when you have the
+slots** — one is the floor, not the goal.
+
+What "defending it in one sentence" means: the sentence should
+name the specific framework op or behaviour the idea exploits, not
+"combine X from paper A with Y from paper B". E.g. "use Save/Load
+to track an EMA of attention magnitudes per page so the score
+threshold drifts with sequence length" is novel; "Prism centroid
++ Keyformer accumulator" is a combination.
+
+Record the novelty hypothesis in one sentence in
 `algorithm_scientist/memory.md` §3 the moment the batch is launched,
 so the verdict (after `wait`) lands on a pre-registered prediction.
 
@@ -675,14 +737,16 @@ see which children have finished):
    finishes `wait`. Don't actually launch — concurrent batches
    will OOM the shared GPUs.
 3. **Invent.** Open [papers/guide.md §16](../papers/guide.md) and
-   pick one prompt — a paper combination, a knob no paper has
-   tried, a claim worth inverting, or a first-principles question
-   about the current best flow. Sketch a one-sentence hypothesis
-   and the cache + indexer ops it would need. This is the slot in
-   the next batch reserved for the off-catalog variant (§5c
-   "Novelty budget"). Inventing while a batch runs is free time;
-   inventing while staring at a launched batch's row in §1 is
-   wasted time.
+   pick a §16.2 (untried knob), §16.3 (inversion), or §16.4
+   (first-principles) prompt — *not* a §16.1 combination, those
+   don't count for the novelty slot (see §5c "Novelty budget").
+   Better still: come up with a hypothesis that doesn't fit any
+   §16 sub-bucket — something derived from the framework's op set
+   itself. Sketch a one-sentence hypothesis and the cache +
+   indexer ops it would need. Inventing while a batch runs is
+   free time; inventing while staring at a launched batch's row in
+   §1 is wasted time. Aim for two novel sketches per wait cycle
+   when you can.
 4. **Analyse completed children early.** Each child writes its
    `summary_submissions/<tag>/<stem>/latest.json` as soon as it finishes,
    without waiting for the others. As children land, read those
@@ -735,13 +799,11 @@ every batch completion mutates §1 and §2.
       `python algorithm_scientist/run_submission_aime24.py --config submissions/<tag>/<name>.json`.
       Read the `mean@16` / `pass@16` / `throughput` fields of the saved
       summary JSON.
-- [ ] Confirm `mean@16` clears the quality floor. If not, iterate on
-      accuracy (see §5b) before anything else.
-- [ ] Once the floor is cleared, iterate to **push throughput up** —
-      tighten sparsity, drop unused cache fields, try fp8
-      `kv_cache_dtype`, raise `mem_fraction_static` toward 0.9, swap
-      `topK()` for `approxTopK(tolerate_ratio=…)` — while keeping
-      `mean@16` on the right side of the floor.
+- [ ] Plot the run's `(throughput, mean@16)` point against the
+      running Pareto frontier in `memory.md §5`. If it dominates an
+      existing entry, replace it; if it's dominated, log it as a
+      data point in `§2` and use the diagnostics in `§5b` to pick
+      which axis to push on the next variant.
 - [ ] Done — sglang can now boot your flow by pointing at the JSON.
 
 ---
@@ -764,7 +826,7 @@ every batch completion mutates §1 and §2.
 7. Run `check_engine_config(...)` before declaring done.
 8. Run `algorithm_scientist/run_submission_aime24.py --config <your JSON>` to get
    the `mean@16` / `pass@16` / `throughput` numbers.
-9. **Objective: maximise `throughput` while keeping `mean@16` above
-   the quality floor.** `mean@16` is a gate, not a score to
-   maximise — once it clears the floor, every further change should
-   buy throughput.
+9. **Objective: strike the best tradeoff between `mean@16` and
+   `throughput`.** Both are objectives — push the
+   `(throughput, mean@16)` Pareto frontier outward; there is no
+   fixed quality floor.

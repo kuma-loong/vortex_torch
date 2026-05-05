@@ -59,49 +59,63 @@ Iterate loop (repeat until I say stop):
 4. Design the next batch.
    - Detect the free GPU set:
      `FREE_GPUS=($(algorithm_scientist/free_gpus.sh)) || { echo "no free GPUs — wait"; exit 1; }`
-     `N=${#FREE_GPUS[@]}`  (one variant per *free* GPU; not the
-     physical count — other users may share this host).
+     `N=${#FREE_GPUS[@]}`
+     `BATCH_SIZE=4; PARALLEL=$N; [ "$PARALLEL" -gt "$BATCH_SIZE" ] && PARALLEL=$BATCH_SIZE`
+     (Every batch is exactly 4 variants. With `N >= 4` the 4
+     variants run in parallel, one per free GPU. With `0 < N < 4`
+     they run in **waves of `N`** on the available GPUs
+     — sequential fallback. Only `N == 0` is a hard wait.)
    - State the theme in one short paragraph.
-   - List the knob matrix — one knob varied per variant.
-   - **At least one variant must be off-catalog** (papers/guide.md §16):
-     a paper combination, an inversion, an untried knob, or a
-     first-principles answer. Pure parameter sweeps and direct
-     paper replications do not count.
-   - Pre-register the off-catalog hypothesis as a one-sentence row
+   - List the knob matrix — one knob varied per variant (4 rows).
+   - **At least one variant must be *genuinely novel*** — and aim
+     for two per batch when slots allow. "Genuinely novel"
+     excludes paper replicas AND combinations of two papers
+     (those are catalog-adjacent — papers/guide.md §16.1, don't
+     qualify). Acceptable origins: §16.2 (untried knobs), §16.3
+     (inversions), §16.4 (first-principles), or — best — an idea
+     derived from the framework's op set itself that doesn't fit
+     any §16 sub-bucket. Defend each in one sentence naming the
+     specific framework op or behaviour exploited (not "combine
+     paper A with paper B"). Pure parameter sweeps don't count.
+   - Pre-register each novelty hypothesis as a one-sentence row
      in memory.md §3 the moment you launch.
 
-5. Write the 2*N files at:
+5. Write the 8 files (4 variants × .py + .json) at:
        submissions/<tag>/batch_<x>_id<y>.py
        submissions/<tag>/batch_<x>_id<y>.json
-   for y ∈ {0 .. N-1}, where <x> = number of existing
+   for y ∈ {0, 1, 2, 3}, where <x> = number of existing
    `submissions/<tag>/batch_*_id0.json` files.
    Each .py uses `@register("<tag>_batch_<x>_id<y>_cls")` (must be
    globally unique). Each .json sets:
        "vortex_module_path": "submissions/<tag>/batch_<x>_id<y>.py"
        "vortex_module_name": "<tag>_batch_<x>_id<y>_cls"
 
-6. Pre-flight all N locally (CPU-only):
-       for y in $(seq 0 $((N - 1))); do
+6. Pre-flight all 4 locally (CPU-only):
+       for y in 0 1 2 3; do
          python -c "from vortex_torch.engine.sgl import check_engine_config; check_engine_config('submissions/<tag>/batch_<x>_id${y}.json')"
        done
    Drop or fix any failing variant before launch.
 
 7. Re-detect free GPUs immediately before launch (the set may have
-   shifted during pre-flight). If FREE_GPUS shrank, drop trailing
-   variants from the launch list. Launch via the /batch-benchmark
-   slash command, passing the N names:
-   `batch_<x>_id0 batch_<x>_id1 ... batch_<x>_id<N-1>`. The slash
-   command pins each variant to FREE_GPUS[y], not to GPU y. Add a
-   row to memory.md §1.
+   shifted during pre-flight) and recompute
+   `PARALLEL = min(N, 4)`. The batch size stays at 4 — `N < 4`
+   just means more waves, not fewer variants. Launch via the
+   /batch-benchmark slash command, passing all 4 names:
+   `batch_<x>_id0 batch_<x>_id1 batch_<x>_id2 batch_<x>_id3`. The
+   slash command runs the 4 variants in waves of
+   `PARALLEL = min(N, 4)`, pinning each to FREE_GPUS within its
+   wave. Add a row to memory.md §1.
 
-8. While the batch runs (8+ hours), on each polling cycle do
-   exactly ONE of:
+8. While the batch runs (8+ hours fully parallel; longer with
+   `N < 4`), on each polling cycle do exactly ONE of:
    (a) read the next file in priority order
        (AI/tutorials → AI/developer_guides → papers/ →
         vortex_torch/flow/algorithms.py → vortex_torch/{indexer,cache}/* → csrc/);
        append one bullet to memory.md §7.
-   (b) invent — pick a prompt from papers/guide.md §16 and sketch
-       the off-catalog variant for the next batch.
+   (b) invent — pick a §16.2/§16.3/§16.4 prompt (NOT §16.1
+       combinations, those don't fill the novelty slot) and sketch
+       the genuinely-novel variant(s) for the next batch. Aim for
+       two sketches per wait cycle.
    (c) design the rest of the next batch (do not launch — concurrent
        batches OOM the shared GPUs).
    (d) analyse children that have already produced
@@ -109,12 +123,13 @@ Iterate loop (repeat until I say stop):
        memory.md §2.
    Do not idle; do not poll without doing one of (a)-(d).
 
-9. When wait returns: read all N summaries
-   (summary_submissions/<tag>/batch_<x>_id<y>/latest.json),
-   produce a comparison table (name | content_hash | mean@16 |
-   pass@16 | throughput | e2e_time), append it to memory.md §2,
-   remove the §1 row, and update §3 (hypotheses) / §4 (anti-
-   patterns) / §5 (winners) as the evidence lands.
+9. When wait returns: read all 4 summaries
+   (summary_submissions/<tag>/batch_<x>_id<y>/latest.json for
+   y ∈ {0, 1, 2, 3}), produce a comparison table (name |
+   content_hash | mean@16 | pass@16 | throughput | e2e_time),
+   append it to memory.md §2, remove the §1 row, and update §3
+   (hypotheses) / §4 (anti-patterns) / §5 (winners) as the
+   evidence lands.
 
 10. Loop back to step 4.
 
@@ -147,9 +162,11 @@ After you paste, the agent should reply with something like:
 tag:                  claude_opus_4_7
 bootstrap reads:      done (AGENTS.md + 6 tutorials + papers/guide.md + memory.md)
 in-flight check:      memory.md §1 empty — launching fresh
+free GPUs:            6,7  →  N=2, parallel=2, waves=2 (sequential fallback)
+                      …or…  0,1,3,5,6,7  →  N=6, parallel=4, waves=1 (fully parallel)
 batch 0 theme:        <one-paragraph theme>
-knob matrix:          <table>
-off-catalog variant:  <which id, hypothesis>
+knob matrix:          <table covering all 4 variants>
+novelty variant(s):   <which id(s), hypothesis(es) — at least 1, aim for 2>
 ```
 
 …and then proceed to write the files, pre-flight, and call

@@ -310,6 +310,40 @@ Examples:
 
 ---
 
+## 6c. Same-numel reshape — `Reshape(-1, x2, y2)`
+
+Reinterpret the inner two axes of a `[1, x1, y1]` cache tile as
+`[1, x2, y2]`, where `x2 * y2 == x1 * y1`. The leading per-block
+batch axis is fixed at 1 and must be passed as `-1` (the
+"infer-this-dim" sentinel, mirroring `torch.reshape`):
+
+$$
+\text{Reshape}(X)[0, k, l] = X[0, \lfloor (k \cdot y_2 + l) / y_1 \rfloor,\ (k \cdot y_2 + l) \bmod y_1]
+$$
+
+(Row-major flatten, then row-major unflatten.)
+
+| input shape | constructor | output shape | constraint |
+|---|---|---|---|
+| `[1, x_1, y_1]` | `Reshape(-1, x2, y2)` | `[1, x_2, y_2]` | `x_1 \cdot y_1 == x_2 \cdot y_2` |
+
+Pure layout change — no math, no data motion beyond the existing
+load/store. The constraint is checked at construction-time profile
+and again by `tl.reshape` at compile time.
+
+Use it to:
+
+- **Flatten a multi-feature tile** before feeding it to a downstream
+  `CGeMM` that expects `[1, 1, F]`: e.g. `CReshape(-1, 1, x1*y1)`.
+- **Split a single feature dim into a multi-resolution grid** to
+  pair with `Kron`-style scoring on the indexer side: e.g. a
+  `[1, 1, head_dim]` centroid → `CReshape(-1, g, head_dim/g)` to
+  emit `g` mini-bands per block.
+- **Pack two summaries into one cache field** — write `[1, 2, D]`
+  by stacking centroid + norm, then `CReshape(-1, 1, 2*D)` to flat.
+
+---
+
 ## 6b. Using `cache["v"]` — value-based summaries
 
 Every op that works on `cache["k"]` works identically on `cache["v"]` —
@@ -405,6 +439,7 @@ This gives the indexer a per-token importance vector per block.
 | `Relu/Sigmoid/Silu/... (α, β)(x, output)` | same shape | (see §4) |
 | `Fill(α)(dest)` | writes `dest` | all entries ← `α` |
 | `MaskSlice(start, end, dim, α, β)(x, output)` | same shape | α inside range, β outside |
+| `Reshape(-1, x2, y2)(x, output)` | `[1, x_1, y_1] → [1, x_2, y_2]` (`x_1·y_1 == x_2·y_2`) | row-major same-numel reshape |
 
 (`loc=loc, ctx=ctx` omitted everywhere — thread them through
 verbatim.)

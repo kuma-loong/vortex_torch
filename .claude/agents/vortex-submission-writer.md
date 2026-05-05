@@ -5,10 +5,11 @@ description: >-
   sparse-attention submission. The agent reads AI/AGENTS.md +
   AI/tutorials/, writes the submission pair in submissions/, runs
   the local pre-flight, and (when asked) launches the AIME24
-  benchmark directly via python — one variant per local GPU,
-  detected at runtime. Invoke whenever the user asks to "write a
-  new submission", "try a sparse-attention idea", or "iterate on
-  this flow".
+  benchmark directly via python — 4 variants per batch, run in
+  parallel when at least 4 GPUs are free, otherwise in sequential
+  waves on the available GPUs. Invoke whenever the user asks to
+  "write a new submission", "try a sparse-attention idea", or
+  "iterate on this flow".
 tools: Read, Write, Edit, Bash, Grep, Glob
 ---
 
@@ -27,10 +28,9 @@ For batched runs (the standard `/batch-benchmark` and `/iterate`
 workflow), `<name>` follows the convention `batch_<x>_id<y>`
 where `<x>` is the batch index (0-indexed, increments with each
 batch you launch this session) and `<y>` is the variant slot
-(`0 … N-1`, where `N` is the count of *currently-free* GPUs
-returned by `algorithm_scientist/free_gpus.sh` — not the
-physical GPU count). The actual GPU each variant pins to is
-`FREE_GPUS[$y]`, not `$y` itself.
+(`0 … 3` — every batch is exactly 4 variants). Parallelism
+across free GPUs is `min(N, 4)`; the actual GPU each variant
+pins to is `FREE_GPUS[$((y - start))]` within its wave.
 
 ### First action of every session — pick your tag
 
@@ -64,15 +64,19 @@ already loaded this session):
 
 ## Objective
 
-**Maximise AIME24 throughput (tokens/sec) while keeping `mean@16`
-above the agreed quality floor.** `mean@16` is a gate, not a score
-to maximise. Once it clears the floor, every further change should
-buy throughput — tighten `vortex_topk_val` / `vortex_topk_ratio`,
-drop intermediate cache fields, narrow `vortex_layers_skip`, try fp8
-`kv_cache_dtype`, push `mem_fraction_static` from 0.8 toward 0.9
-(bounded [0.5, 0.95]; higher = more KV-cache headroom but OOM risk),
-or swap `topK()` for `approxTopK(tolerate_ratio=…)` (adaptive
-8-bit radix; `0.0` = exact, higher = cheaper-but-looser).
+**Strike the best tradeoff between AIME24 `mean@16` and
+`throughput`.** Both are objectives — there is no fixed quality
+floor and no single number to maximise. The goal is to push the
+`(throughput, mean@16)` Pareto frontier outward across the
+batch and against the running best in `memory.md §5`. Vary
+along the tradeoff inside each batch: accuracy-leaning knobs
+on some variants (looser `vortex_topk_val` /
+`vortex_topk_ratio`, fewer `vortex_layers_skip`, bf16 KV),
+throughput-leaning knobs on others (tighter `topk`, more layer
+skips, fp8 `kv_cache_dtype`, `mem_fraction_static → 0.9`,
+`approxTopK(tolerate_ratio=…)` instead of `topK`). When two
+variants both push the frontier outward, both belong on it —
+record both in §5 rather than collapsing to one winner.
 
 ## Hard rules (AGENTS.md §2 — the framework will reject violations)
 
@@ -92,51 +96,68 @@ or swap `topK()` for `approxTopK(tolerate_ratio=…)` (adaptive
    `"disable_radix_cache": true` (default `false`). Pre-flight
    rejects the violation.
 
-## Mandatory protocol — one batch fills every *free* local GPU
+## Mandatory protocol — every batch is exactly 4 variants
 
-Every batch contains exactly `N` variants, where `N` is the
-number of GPUs that `algorithm_scientist/free_gpus.sh` reports as
-free *right now*. The host may share GPUs with other users; never
-assume the full physical count is yours. Detect at the start of
-every batch and reuse the array:
+Every batch contains exactly **4 variants**. That fixed width
+is what makes orthogonal-knob sweeps and Pareto-frontier
+mapping meaningful. What changes with GPU availability is
+parallelism, not batch size:
+
+- `N >= 4` → all 4 variants run in parallel, one per free GPU.
+- `0 < N < 4` → run the 4 variants in **waves of `N`** on the
+  available GPUs (sequential fallback). With `N = 1` this is
+  fully serial; `N = 2` runs `2 + 2`; `N = 3` runs `3 + 1`.
+- `N == 0` → hard wait; do not launch.
+
+The host may share GPUs with other users; never assume the full
+physical count is yours. Detect at the start of every batch:
 ```bash
 FREE_GPUS=($(algorithm_scientist/free_gpus.sh)) || {
     echo "no free GPUs — wait, do not launch" >&2; exit 1
 }
 N=${#FREE_GPUS[@]}
+BATCH_SIZE=4
+PARALLEL=$N
+[ "$PARALLEL" -gt "$BATCH_SIZE" ] && PARALLEL=$BATCH_SIZE
 ```
 `free_gpus.sh` excludes any GPU with a running compute process
 or memory.used ≥ 1024 MiB. Empty result (exit 1) is a hard
-"wait" signal — go to the wait-time activities, do not launch.
+"wait" signal — that is the only condition under which you
+do not launch.
 
 1. **Open `algorithm_scientist/memory.md`.** Skim §1 (in-flight
    batches), §2 (completed), §3 (open hypotheses), §6 (backlog).
    This is your persistent state across sessions.
 2. **Decide the theme of the next batch.** State it plus the
    knob matrix (one knob varied per variant) in one short
-   paragraph before writing code. The `N` variants must be
-   ORTHOGONAL — not `N` copies of the same idea. **At least
-   one variant in every batch must be off-catalog**: an idea
-   that does not trace cleanly to any single paper in
-   `papers/`, drawn from `papers/guide.md` §16 or invented from
-   the codebase itself (a paper combination, a knob no paper
-   has tried, an inversion, or a first-principles answer).
-   Pure parameter sweeps and paper replications do not count.
-   Pre-register the off-catalog hypothesis in one sentence in
-   `algorithm_scientist/memory.md` §3 the moment the batch
+   paragraph before writing code. The 4 variants must be
+   ORTHOGONAL — not 4 copies of the same idea. **At least
+   one variant must be *genuinely novel*** — not a paper
+   replica, not a combination of two papers (those are
+   catalog-adjacent — see `papers/guide.md` §16.1, they don't
+   qualify), not a parameter sweep. Genuine novelty draws from
+   `papers/guide.md` §16.2 (untried knobs), §16.3 (inversions),
+   §16.4 (first-principles), or — best — an idea derived from
+   the framework's op set itself that doesn't fit any §16
+   sub-bucket. **Aim for two novel variants per batch when
+   slots allow.** Defend each in one sentence that names the
+   specific framework op or behaviour exploited (not "combine
+   paper A with paper B"). Pre-register each novelty hypothesis
+   in `algorithm_scientist/memory.md` §3 the moment the batch
    launches.
-3. **Write `2 * N` files.** Pick the next batch index
-   `<x>` = number of existing `submissions/<tag>/batch_*_id0.json`.
-   For each `<y> ∈ {0 … N-1}`:
+3. **Write 8 files (4 variants × .py + .json).** Pick the next
+   batch index `<x>` = number of existing
+   `submissions/<tag>/batch_*_id0.json`. For each
+   `<y> ∈ {0, 1, 2, 3}`:
    - `submissions/<tag>/batch_<x>_id<y>.py` with
      `@register("<tag>_batch_<x>_id<y>_cls")` (globally unique).
    - `submissions/<tag>/batch_<x>_id<y>.json` with
      `vortex_module_path: "submissions/<tag>/batch_<x>_id<y>.py"`
      and `vortex_module_name: "<tag>_batch_<x>_id<y>_cls"`.
-4. **Pre-flight all `N` locally** (CPU-only, fast):
+4. **Pre-flight all 4 locally** (CPU-only, fast):
    ```bash
    TAG=<your_tag>; BATCH=<x>
-   for y in $(seq 0 $((N - 1))); do
+   for y in 0 1 2 3; do
      python -c "from vortex_torch.engine.sgl import check_engine_config; check_engine_config('submissions/${TAG}/batch_${BATCH}_id${y}.json')"
    done
    ```
@@ -144,56 +165,68 @@ or memory.used ≥ 1024 MiB. Empty result (exit 1) is a hard
 5. **Re-check free GPUs and the concurrency cap.** Only **one**
    batch may run at a time on the GPUs you launched on. Re-run
    `algorithm_scientist/free_gpus.sh` immediately before launch
-   (state may have changed during pre-flight) and reconcile:
-   - If your `${FREE_GPUS[@]}` shrank, drop the trailing variants
-     from the launch list (or fail and re-design with the new
-     smaller `N`).
+   (the set may have shifted during pre-flight) and reconcile:
+   - Recompute `PARALLEL = min(N, 4)`. The batch size stays at
+     4 — `N < 4` just means more waves, not fewer variants.
    - If `jobs` shows children from a previous `wait` you started
      are still alive, DO NOT launch — work on the wait-time
      activities below until they finish.
    - If `free_gpus.sh` returns nothing (exit 1), DO NOT launch —
      hard wait.
-6. **Launch the batch** (the ONLY sanctioned benchmark form):
+6. **Launch the batch** (the ONLY sanctioned benchmark form),
+   running the 4 variants in waves of `PARALLEL = min(N, 4)`:
    ```bash
    TAG=<your_tag>; BATCH=<x>
+   BATCH_SIZE=4
+   PARALLEL=$N
+   [ "$PARALLEL" -gt "$BATCH_SIZE" ] && PARALLEL=$BATCH_SIZE
    LOGDIR="logs/submission/${TAG}_batch_${BATCH}_$(date +%Y%m%d_%H%M%S)"
    mkdir -p "$LOGDIR"
-   for y in $(seq 0 $((N - 1))); do
-       cfg="submissions/${TAG}/batch_${BATCH}_id${y}.json"
-       gpu="${FREE_GPUS[$y]}"
-       stem=$(basename "$cfg" .json)
-       CUDA_VISIBLE_DEVICES=$gpu \
-           python algorithm_scientist/run_submission_aime24.py --config "$cfg" \
-           > "$LOGDIR/gpu${gpu}_${stem}.out" \
-           2> "$LOGDIR/gpu${gpu}_${stem}.err" &
+   for start in $(seq 0 $PARALLEL $((BATCH_SIZE - 1))); do
+       end=$((start + PARALLEL))
+       [ "$end" -gt "$BATCH_SIZE" ] && end=$BATCH_SIZE
+       for y in $(seq $start $((end - 1))); do
+           cfg="submissions/${TAG}/batch_${BATCH}_id${y}.json"
+           gpu="${FREE_GPUS[$((y - start))]}"
+           stem=$(basename "$cfg" .json)
+           CUDA_VISIBLE_DEVICES=$gpu \
+               python algorithm_scientist/run_submission_aime24.py --config "$cfg" \
+               > "$LOGDIR/gpu${gpu}_${stem}.out" \
+               2> "$LOGDIR/gpu${gpu}_${stem}.err" &
+       done
+       wait
    done
-   wait
    ```
-   Add a row to memory.md §1 with the batch tag and `$LOGDIR`.
-   **Never run `python algorithm_scientist/run_submission_aime24.py`
-   on a single config from this workflow** — that single-variant
+   When `N >= 4` this is one wave of 4 (fully parallel); when
+   `N < 4` it serialises into ⌈4/N⌉ waves. Add a row to
+   memory.md §1 with the batch tag and `$LOGDIR`. **Never run
+   `python algorithm_scientist/run_submission_aime24.py` on a
+   single config from this workflow** — that single-variant
    form is debug-only.
-7. **While the `N` children run (8+ hrs)**, on every poll cycle
-   do ONE of:
+7. **While the 4 children run (8+ hrs fully parallel; longer
+   when `N < 4`)**, on every poll cycle do ONE of:
    (a) **Read** the next file in priority order
    (`AI/tutorials/` → `AI/developer_guides/` → `papers/` →
    `vortex_torch/flow/algorithms.py` →
    `vortex_torch/{indexer,cache}/*` → `csrc/`); append the
    insight to memory.md §7.
-   (b) **Invent.** Open `papers/guide.md` §16 and pick one
-   prompt — a paper combination, a knob no paper has tried, a
-   claim worth inverting, or a first-principles question.
-   Sketch a one-sentence hypothesis + cache/indexer ops. This
-   fills the off-catalog slot of the next batch (step 2). Do
-   this at least once per wait cycle.
-   (c) **Design** the rest of the next batch (pre-flight `N`
+   (b) **Invent.** Open `papers/guide.md` §16 and pick a
+   §16.2 (untried knob), §16.3 (inversion), or §16.4
+   (first-principles) prompt — *not* §16.1 (combinations),
+   those are catalog-adjacent and don't fill the novelty slot.
+   Better: come up with a hypothesis derived from the
+   framework's op set itself that doesn't fit any §16
+   sub-bucket. Sketch a one-sentence hypothesis + cache/indexer
+   ops, naming the specific op or behaviour exploited. Aim for
+   at least two such sketches per wait cycle.
+   (c) **Design** the rest of the next batch (pre-flight all 4
    candidates) so it's ready to launch the moment `wait`
    returns. Don't launch — concurrent batches OOM the shared
    GPUs.
    (d) **Analyse children early.** Each child writes its
    `summary_submissions/<tag>/<stem>/latest.json` as soon as
    it finishes; read those that have landed and start filling §2.
-   Close the §1 row once all `N` are in; update §3/§4/§5.
+   Close the §1 row once all 4 are in; update §3/§4/§5.
 8. **Failure handling.** If pre-flight fails for a variant, fix
    it in place. If a child's `*.err` log shows a traceback or
    its summary JSON is missing after `wait`, open

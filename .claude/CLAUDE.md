@@ -5,21 +5,23 @@ into sglang's decode loop. Users / AI agents write a **sparse-attention
 submission** — two files in `submissions/` — and the framework compiles
 them into Triton kernels at runtime.
 
-## Objective (non-negotiable)
+## Objective
 
-> **Maximise decoding throughput (tokens/sec) on the AIME24 benchmark
-> while keeping `mean@16` at or above a minimum acceptable floor.**
+> **Strike the best tradeoff between accuracy (`mean@16`) and
+> decoding throughput on AIME24.**
 
-`mean@16` is a *quality gate*, not something to maximise. Once a flow
-clears the floor, every subsequent change should trade accuracy-headroom
-for **more throughput**: tighter `vortex_topk_val` / `vortex_topk_ratio`,
-fewer cache-side ops, fewer intermediate cache fields, narrower
-`vortex_layers_skip`, aggressive fp8 `kv_cache_dtype`, raise
-`mem_fraction_static` toward 0.9 (range [0.5, 0.95], default 0.8 —
-higher = more KV-cache headroom = more throughput, but OOM risk),
-swap `topK()` for `approxTopK(tolerate_ratio=…)` (`0.0`=exact,
-higher=cheaper-but-looser; sweet spot 0.05-0.15). When two
-variants both clear the floor, pick the faster one.
+There is **no fixed quality floor** and no single number to maximise.
+Both `mean@16` and `throughput` are objectives — the goal is to push
+the **Pareto frontier** outward. A variant that buys throughput at
+a small `mean@16` cost is useful; a variant that buys accuracy at a
+small throughput cost is useful too. Map the frontier across a
+batch by varying *along* the tradeoff: accuracy-leaning knobs
+(looser `vortex_topk_val`, fewer `vortex_layers_skip`, bf16 KV) on
+some variants, throughput-leaning knobs (tighter `topk`, more layer
+skips, fp8 `kv_cache_dtype`, `approxTopK(tolerate_ratio=…)`,
+`mem_fraction_static → 0.9`) on others. Pick winners by where
+they sit on the `(throughput, mean@16)` plane against the running
+best in `memory.md §5`, not by clearing a fixed bar.
 
 ## Inventing beyond the literature
 
@@ -27,14 +29,17 @@ The `papers/` folder and [papers/guide.md](papers/guide.md) cover
 what's already published — sinks, heavy hitters, channel sparsity,
 low-rank K, LSH sampling, dual-band centroids. Treat them as
 **seeds, not a menu.** A winning flow does not need a citation.
-Every paper in there started by noticing a gap; the framework you
-have (page-level selection, fused per-block kernel, Save/Load,
-`Kron`, `MeanInterleave`) opens combinations and knobs no paper
-here has explored. **Every batch must reserve at least one slot
-for an off-catalog variant** — see `papers/guide.md` §16 for
-prompts (paper combinations, knobs nobody has tried, claims worth
-inverting, first-principles questions). Replicating a paper or
-sweeping a single knob does not count.
+
+**Novelty bar.** Combinations of two paper ideas are still
+paper-derived thinking and **do not** count as novel — they are
+catalog-adjacent (see `papers/guide.md` §16.1). Every batch must
+reserve at least one slot for a *genuinely novel* variant — an
+idea that comes from §16.2 (untried knobs), §16.3 (inversions of
+paper claims), §16.4 (first-principles questions), or — best —
+something derived from the framework's own op set that doesn't
+fit any §16 sub-bucket. Aim for **two novel variants per batch**
+when slots allow. Replicating a paper, combining two papers, or
+sweeping a single knob do not count for the novelty slot.
 
 ## Where the instructions live
 
@@ -86,64 +91,90 @@ modifying the compiler itself, not when writing a submission.
 
 ## Running the benchmark — policy
 
-**The only allowed unit of work is one batch that fills every
-*free* local GPU.** The host may share GPUs with other users; the
-batch size depends on what's actually available *now*, not on the
-physical GPU count. Detect free GPUs at the start of every batch:
+**Every batch is exactly 4 variants.** That fixed width is what
+makes orthogonal-knob sweeps and Pareto-frontier mapping work.
+Parallelism depends on how many GPUs are free *now* — the host
+may share GPUs with other users:
+
+- `N >= 4` free GPUs → run all 4 variants in parallel, one per GPU.
+- `0 < N < 4` free GPUs → run the 4 variants in **waves of N**
+  on the available GPUs (sequential fallback). With `N = 1` this
+  is fully serial; `N = 2` runs `2 + 2`; `N = 3` runs `3 + 1`.
+  The batch still produces 4 results; it just takes longer.
+- `N == 0` (`free_gpus.sh` returns empty / exits 1) → **hard wait**,
+  do not launch.
+
+Detect free GPUs at the start of every batch:
 
 ```bash
 FREE_GPUS=($(algorithm_scientist/free_gpus.sh)) || {
     echo "no free GPUs — wait, do not launch" >&2; exit 1
 }
 N=${#FREE_GPUS[@]}
-echo "free GPUs: ${FREE_GPUS[*]}  (N=$N)"
+BATCH_SIZE=4
+PARALLEL=$N
+[ "$PARALLEL" -gt "$BATCH_SIZE" ] && PARALLEL=$BATCH_SIZE
+echo "free GPUs: ${FREE_GPUS[*]}  (N=$N, parallel=$PARALLEL, batch=$BATCH_SIZE)"
 ```
 
 `free_gpus.sh` excludes GPUs that have a compute process running
 on them or memory.used ≥ 1024 MiB (override via
-`free_gpus.sh <mib>`). Empty result (exit 1) ⇒ hard wait.
+`free_gpus.sh <mib>`). Empty result (exit 1) ⇒ hard wait. Any
+`N >= 1` is launchable; `N < 4` just serialises into multiple
+waves on the available GPUs.
 
 **File layout.** All submissions you write live under
 `submissions/<tag>/`, where `<tag>` is your agent identifier
 (default: a sanitized lowercase form of your model name, e.g.
 `claude_opus_4_7`). Within that dir, batched runs use the
 convention `batch_<x>_id<y>.{py,json}` (`<x>` = batch index,
-`<y>` = per-GPU variant index). Single-variant runs are
+`<y>` = per-variant index in `0…3`). Single-variant runs are
 debug-only. Each batch:
 
-1. **`N` orthogonal variants** —
+1. **4 orthogonal variants** —
    `submissions/<tag>/batch_<x>_id0.{py,json}` …
-   `submissions/<tag>/batch_<x>_id<N-1>.{py,json}` — varying
-   different knobs. `N = ${#FREE_GPUS[@]}`, the number of
-   currently-free GPUs (NOT the physical GPU count).
-2. **Cheap local pre-flight first** for all `N` (CPU, no GPU):
+   `submissions/<tag>/batch_<x>_id3.{py,json}` — varying
+   different knobs. The slot count is fixed at 4 regardless of
+   how many GPUs are free; only the parallelism changes.
+2. **Cheap local pre-flight first** for all 4 (CPU, no GPU):
    ```bash
    TAG=<your_agent_tag>; BATCH=<batch_index>
-   for y in $(seq 0 $((N - 1))); do
+   for y in 0 1 2 3; do
      python -c "from vortex_torch.engine.sgl import check_engine_config; check_engine_config('submissions/${TAG}/batch_${BATCH}_id${y}.json')"
    done
    ```
    Refuse to launch any variant whose pre-flight fails.
-3. **Launch `N` background `python` processes**, one per *free*
-   GPU (pinned via `CUDA_VISIBLE_DEVICES=${FREE_GPUS[$y]}`), and
-   `wait` for them all to finish:
+3. **Launch the 4 variants in waves of `PARALLEL = min(N, 4)`**,
+   each child pinned via `CUDA_VISIBLE_DEVICES`, with `wait`
+   between waves so a wave's GPU is free before the next one
+   reuses it:
    ```bash
    LOGDIR="logs/submission/${TAG}_batch_${BATCH}_$(date +%Y%m%d_%H%M%S)"
    mkdir -p "$LOGDIR"
-   for y in $(seq 0 $((N - 1))); do
-       cfg="submissions/${TAG}/batch_${BATCH}_id${y}.json"
-       gpu="${FREE_GPUS[$y]}"
-       stem=$(basename "$cfg" .json)
-       CUDA_VISIBLE_DEVICES=$gpu \
-           python algorithm_scientist/run_submission_aime24.py --config "$cfg" \
-           > "$LOGDIR/gpu${gpu}_${stem}.out" \
-           2> "$LOGDIR/gpu${gpu}_${stem}.err" &
+   BATCH_SIZE=4
+   PARALLEL=$N
+   [ "$PARALLEL" -gt "$BATCH_SIZE" ] && PARALLEL=$BATCH_SIZE
+   for start in $(seq 0 $PARALLEL $((BATCH_SIZE - 1))); do
+       end=$((start + PARALLEL))
+       [ "$end" -gt "$BATCH_SIZE" ] && end=$BATCH_SIZE
+       for y in $(seq $start $((end - 1))); do
+           cfg="submissions/${TAG}/batch_${BATCH}_id${y}.json"
+           gpu="${FREE_GPUS[$((y - start))]}"
+           stem=$(basename "$cfg" .json)
+           CUDA_VISIBLE_DEVICES=$gpu \
+               python algorithm_scientist/run_submission_aime24.py --config "$cfg" \
+               > "$LOGDIR/gpu${gpu}_${stem}.out" \
+               2> "$LOGDIR/gpu${gpu}_${stem}.err" &
+       done
+       wait
    done
-   wait
    ```
-   The id `<y>` is the variant slot (0…N-1), NOT a GPU index —
-   the actual GPU comes from `FREE_GPUS[$y]`. Each child writes
-   its result into
+   The id `<y>` is the variant slot (0…3), NOT a GPU index —
+   the actual GPU is `FREE_GPUS[$((y - start))]` within each wave.
+   When `N >= 4` there is exactly one wave of 4 (fully parallel,
+   identical to the old behaviour). When `N < 4` the loop runs
+   ⌈4/N⌉ waves; the wall-clock cost scales accordingly. Each
+   child writes its result into
    `summary_submissions/<tag>/<stem>/<timestamp>__<hash>.json`
    and updates `latest.json` on its own. The runner mirrors the
    config's path under `submissions/` into `summary_submissions/`,
@@ -153,10 +184,10 @@ debug-only. Each batch:
    the same `batch_x_idy` stem.
 
 4. **One batch at a time on the free GPUs.** Do not launch a
-   second batch while the first is still running, and do not
-   try to "fill the gaps" by launching extra variants on GPUs
-   another user freed mid-batch — both contend for memory and
-   either OOM or thrash. Use `jobs` (or `ls -lt
+   second batch while the first (any wave) is still running, and
+   do not try to "fill the gaps" by launching extra variants on
+   GPUs another user freed mid-batch — both contend for memory
+   and either OOM or thrash. Use `jobs` (or `ls -lt
    summary_submissions/<tag>/*/latest.json`) to see how many
    children are still alive while you wait.
 
@@ -168,19 +199,22 @@ Idle is not an option. Each polling cycle, do one of:
   `papers/` → `vortex_torch/flow/algorithms.py` →
   `vortex_torch/{indexer,cache}/*` → `csrc/`. After each file,
   append one insight to `algorithm_scientist/memory.md` §7.
-- **Invent.** Open `papers/guide.md` §16 and pick one prompt —
-  a paper combination, a knob no paper has tried, a claim
-  worth inverting, or a first-principles question. Sketch a
-  one-sentence hypothesis + cache/indexer ops. This fills the
-  mandatory off-catalog slot in the next batch.
+- **Invent.** Open `papers/guide.md` §16 and pick a §16.2
+  (untried knob), §16.3 (inversion), or §16.4 (first-principles)
+  prompt — *not* §16.1 combinations, those are catalog-adjacent
+  and don't fill the novelty slot. Better still: come up with
+  a hypothesis derived from the framework's op set itself that
+  doesn't fit any §16 sub-bucket. Sketch a one-sentence
+  hypothesis + cache/indexer ops, naming the specific op or
+  behaviour exploited. Aim for two such sketches per wait cycle.
 - **Design (don't launch) the rest of the next batch.**
-  Pre-flight the `N` candidates so they're ready to fire the
+  Pre-flight the 4 candidates so they're ready to fire the
   moment `wait` returns. Concurrent batches would OOM the
   shared GPUs.
 - **Analyse children early.** As individual `latest.json` files
   appear (children finish at slightly different times), pull
   their `mean@16` / `throughput` and start filling a §2
-  sub-section in memory.md. Close the §1 row when all `N` are
+  sub-section in memory.md. Close the §1 row when all 4 are
   in, then update §3 (hypotheses) / §4 (anti-patterns) / §5
   (winners).
 
@@ -223,9 +257,9 @@ so any later session resumes cleanly from the same prompt.
 
 - `/new-submission <name>` — scaffold a new submission pair.
 - `/preflight <name>`      — run the cheap local pre-flight.
-- `/batch-benchmark <n1> … <nN>` — launch exactly `N` variants in parallel on the *currently-free* GPUs (`N = $(algorithm_scientist/free_gpus.sh | wc -w)`; the only sanctioned benchmark command).
+- `/batch-benchmark <n1> <n2> <n3> <n4>` — launch the 4-variant batch on the currently-free GPUs (parallel when `N >= 4`, otherwise waves of `N`; the only sanctioned benchmark command).
 - `/review <name>`         — audit a submission against AGENTS.md rules.
-- `/iterate <name>`        — kick off a full auto-iteration loop (batches that fill every local GPU, one batch at a time, updates memory.md).
+- `/iterate <name>`        — kick off a full auto-iteration loop (4 variants per batch on the currently-free GPUs, one batch at a time, updates memory.md).
 - `/benchmark <name>`      — *debug only*: run a single variant directly. Do not use in normal workflow.
 
 ## Subagents available

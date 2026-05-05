@@ -40,6 +40,7 @@ from .elementwise_binary import (
 )
 from .fill import Fill
 from .mask import MaskSlice
+from .reshape import Reshape
 from .triton_kernels import set_kv_buffer_launcher, set_kv_buffer_fp8_e4m3_launcher, set_kv_buffer_fp8_e5m2_launcher
 from . import compiler
 
@@ -57,6 +58,7 @@ __all__ = [
     "WhereGreaterEqual", "WhereLess", "WhereLessEqual",
     "Fill",
     "MaskSlice",
+    "Reshape",
     "Context", "ctx", "get_ctx",
     "compiler",
 ]

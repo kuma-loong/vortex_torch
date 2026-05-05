@@ -1,17 +1,25 @@
 ---
-description: Launch one submission per *free* local GPU in parallel (the only sanctioned benchmark form). Pass exactly N submission names, where N is the count returned by algorithm_scientist/free_gpus.sh.
-argument-hint: <name1> <name2> ... <nameN>   (N = number of currently-free GPUs)
+description: Launch the 4-variant batch on the currently-free local GPUs (parallel when N>=4, otherwise sequential waves of N). The only sanctioned benchmark form. Pass exactly 4 submission names.
+argument-hint: <name1> <name2> <name3> <name4>   (always 4 variants; parallelism = min(N_free_gpus, 4))
 ---
 
-Run **one submission per *free* local GPU**, in parallel, against
-the AIME24 benchmark. This is the *only* benchmark command
-sanctioned by the protocol — single-variant runs are debug-only.
+Run the **4-variant batch** against the AIME24 benchmark. **Batch
+size is fixed at 4.** Parallelism depends on free-GPU count `N`:
 
-The user passes **submission names** (not JSON paths); this command
-expands each `<nameI>` into `submissions/<tag>/<nameI>.json`,
+- `N >= 4` → all 4 variants run in parallel, one per GPU.
+- `0 < N < 4` → variants run in **waves of `N`** on the available
+  GPUs (sequential fallback). With `N = 1` this is fully serial;
+  `N = 2` runs `2 + 2`; `N = 3` runs `3 + 1`.
+- `N == 0` → wait, do not launch.
+
+This is the *only* benchmark command sanctioned by the protocol;
+single-variant runs are debug-only.
+
+The user passes **4 submission names** (not JSON paths); this
+command expands each `<nameI>` into `submissions/<tag>/<nameI>.json`,
 where `<tag>` is the session's agent identifier. For the standard
 iterate-loop layout, the names look like
-`batch_<x>_id0 batch_<x>_id1 … batch_<x>_idN-1`.
+`batch_<x>_id0 batch_<x>_id1 batch_<x>_id2 batch_<x>_id3`.
 
 Step 0 — resolve `<tag>`, detect *free* GPUs (not the physical
 count — other users may be sharing this host), then count
@@ -22,16 +30,21 @@ FREE_GPUS=($(algorithm_scientist/free_gpus.sh)) || {
     echo "no free GPUs — wait, do not launch" >&2; exit 1
 }
 N=${#FREE_GPUS[@]}
+BATCH_SIZE=4
+PARALLEL=$N
+[ "$PARALLEL" -gt "$BATCH_SIZE" ] && PARALLEL=$BATCH_SIZE
 NAMES=($ARGUMENTS)
-if [ "${#NAMES[@]}" -ne "$N" ]; then
-    echo "expected $N variants (one per FREE GPU: ${FREE_GPUS[*]}), got ${#NAMES[@]}" >&2
+if [ "${#NAMES[@]}" -ne "$BATCH_SIZE" ]; then
+    echo "expected $BATCH_SIZE variants, got ${#NAMES[@]}" >&2
     exit 1
 fi
+echo "free GPUs: ${FREE_GPUS[*]}  (N=$N, parallel=$PARALLEL, waves=$(( (BATCH_SIZE + PARALLEL - 1) / PARALLEL )))"
 ```
-If the user supplied a different number, refuse and explain:
-"Batches must contain exactly `$N` variants — one per *currently-
-free* GPU (`${FREE_GPUS[*]}`). The number of free GPUs can change
-between batches; re-detect and re-design before re-invoking."
+Refuse cases:
+  - `N == 0` (helper exited non-zero): "No free GPUs. Wait, do
+    not launch."
+  - `${#NAMES[@]} != 4`: "Batches must contain exactly 4
+    variants. Got ${#NAMES[@]} — re-design and re-invoke."
 Do not silently shrink or pad the batch.
 
 Step 1 — concurrency cap. Only **one** batch may run at a time
@@ -54,21 +67,30 @@ done
 Refuse to launch any submission whose preflight failed — fix the
 failing variant first.
 
-Step 3 — fork `N` background `python` processes pinned to the
-*free* GPU indices (NOT 0…N-1) and `wait` for them all:
+Step 3 — launch the 4 variants in waves of `PARALLEL = min(N, 4)`,
+each pinned to a *free* GPU index (NOT 0…N-1), with `wait`
+between waves so a wave's GPUs are free before the next reuses
+them:
 ```bash
 LOGDIR="logs/submission/${TAG}_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$LOGDIR"
-for y in $(seq 0 $((N - 1))); do
-    name="${NAMES[$y]}"
-    gpu="${FREE_GPUS[$y]}"
-    CUDA_VISIBLE_DEVICES=$gpu \
-        python algorithm_scientist/run_submission_aime24.py --config "submissions/${TAG}/${name}.json" \
-        > "$LOGDIR/gpu${gpu}_${name}.out" \
-        2> "$LOGDIR/gpu${gpu}_${name}.err" &
+for start in $(seq 0 $PARALLEL $((BATCH_SIZE - 1))); do
+    end=$((start + PARALLEL))
+    [ "$end" -gt "$BATCH_SIZE" ] && end=$BATCH_SIZE
+    for y in $(seq $start $((end - 1))); do
+        name="${NAMES[$y]}"
+        gpu="${FREE_GPUS[$((y - start))]}"
+        CUDA_VISIBLE_DEVICES=$gpu \
+            python algorithm_scientist/run_submission_aime24.py --config "submissions/${TAG}/${name}.json" \
+            > "$LOGDIR/gpu${gpu}_${name}.out" \
+            2> "$LOGDIR/gpu${gpu}_${name}.err" &
+    done
+    wait
 done
-wait
 ```
+When `N >= 4` this is one wave of 4 (fully parallel — same
+behaviour as the old protocol). When `N < 4` it's
+`ceil(4/N)` sequential waves on the available GPUs.
 Each child writes its result into
 `summary_submissions/<tag>/<name>/<timestamp>__<hash>.json` and
 updates `summary_submissions/<tag>/<name>/latest.json` itself.
@@ -79,23 +101,28 @@ isolation, no collisions across agents that pick the same stem.)
 
 Step 4 — append a row to `algorithm_scientist/memory.md` §1
 *In-flight batches* the moment you launch:
-`| <tag> | <batch_id> | <UTC time> | <LOGDIR> | <name1>,…,<nameN> | RUNNING |`
+`| <tag> | <batch_id> | <UTC time> | <LOGDIR> | <name1>,…,<name4> | RUNNING |`
 
-Step 5 — while waiting (the batch takes **8+ hours**), do NOT
-idle. Spend the time reading tutorials / developer guides /
-source, or designing the next batch (don't launch — concurrent
-batches OOM the shared GPUs), or analysing children that have
-already produced their `latest.json`. See AGENTS.md §5d.
+Step 5 — while waiting (the batch takes **8+ hours** when fully
+parallel, longer with `N < 4`), do NOT idle. Spend the time
+reading tutorials / developer guides / source, or designing the
+next batch (don't launch — concurrent batches OOM the shared
+GPUs), or analysing children that have already produced their
+`latest.json`. See AGENTS.md §5d.
 
-Step 6 — once `wait` returns:
+Step 6 — once the outer `wait` loop returns (all waves done):
 
 - **Success** → for each `<nameI>`, read
   `summary_submissions/<tag>/<nameI>/latest.json`. Produce a comparison
   table with columns: `name | content_hash | mean@16 | pass@16 |
-  throughput | e2e_time`. Recommend the one with the highest
-  `throughput` **that also clears the quality floor**. Append the
-  table + a 1-3 sentence takeaway to `algorithm_scientist/memory.md`
-  §2 *Completed batches*; remove the row you added in step 4 from §1.
+  throughput | e2e_time`. Identify the **Pareto-non-dominated**
+  variants for this batch on the `(throughput, mean@16)` plane —
+  a variant is dominated iff some other variant has *both* equal-
+  or-higher `throughput` *and* equal-or-higher `mean@16`. Append
+  the table + a 1-3 sentence takeaway naming each frontier
+  variant and where it sits relative to the running §5 best, to
+  `algorithm_scientist/memory.md` §2 *Completed batches*; remove
+  the row you added in step 4 from §1.
 - **Failure** → any child whose process exited non-zero (or
   whose `latest.json` is missing / older than `$LOGDIR`'s
   timestamp) wrote its traceback to

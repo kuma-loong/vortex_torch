@@ -1,6 +1,6 @@
 ---
-description: Launch the long-horizon auto-iteration loop (one batch fills every local GPU, one batch at a time, persists state in memory.md).
-argument-hint: <theme-tag> [--min-mean-at-16 <float>] [--max-iterations <int>] [--baseline-throughput <float>]
+description: Launch the long-horizon auto-iteration loop (4 variants per batch, parallel across free GPUs when N>=4 else sequential waves, one batch at a time, persists state in memory.md).
+argument-hint: <theme-tag> [--max-iterations <int>] [--baseline-throughput <float>]
 ---
 
 Kick off a full auto-iteration loop tagged **$1** using
@@ -12,20 +12,24 @@ This drives a dedicated Claude agent that:
   state across sessions (in-flight ledger, completed-batch table,
   hypotheses, anti-patterns, reading log).
 - Detects the *currently-free* GPU set at the start of every
-  batch via `algorithm_scientist/free_gpus.sh` and uses
-  `N = len(FREE_GPUS)` (NOT the physical GPU count — other users
-  may share this host). Writes submission pairs
-  `submissions/<tag>/batch_<x>_id<y>.{py,json}` for `<y> ∈ {0
-  … N-1}`, where `<tag>` is the agent's identifier and `<x>` is
-  the batch index (0-indexed, increments per batch this
-  session). The positional `$1` argument is the *theme tag* for
-  memory.md attribution; it is **not** the agent tag (the agent
-  tag is auto-detected from the model name).
-- Pre-flights all `N` locally, then forks `N` background
-  `python algorithm_scientist/run_submission_aime24.py` processes
-  pinned to the free GPU indices (`CUDA_VISIBLE_DEVICES=${FREE_GPUS[$y]}`)
-  and `wait`s for them all. Re-detects free GPUs immediately
-  before launch in case the set shifted during pre-flight.
+  batch via `algorithm_scientist/free_gpus.sh` (NOT the physical
+  GPU count — other users may share this host). **Every batch is
+  exactly 4 variants**; parallelism is `min(N, 4)`. With `N >= 4`
+  the 4 variants run in parallel (one per GPU); with `0 < N < 4`
+  they run in **waves of `N`** on the available GPUs (sequential
+  fallback). Only `N == 0` triggers a hard wait. Writes submission
+  pairs `submissions/<tag>/batch_<x>_id<y>.{py,json}` for
+  `<y> ∈ {0, 1, 2, 3}`, where `<tag>` is the agent's identifier
+  and `<x>` is the batch index (0-indexed, increments per batch
+  this session). The positional `$1` argument is the *theme tag*
+  for memory.md attribution; it is **not** the agent tag (the
+  agent tag is auto-detected from the model name).
+- Pre-flights all 4 variants locally, then runs them in waves of
+  `min(N, 4)` background `python algorithm_scientist/run_submission_aime24.py`
+  processes pinned to the free GPU indices
+  (`CUDA_VISIBLE_DEVICES=${FREE_GPUS[$((y - start))]}`) with
+  `wait` between waves. Re-detects free GPUs immediately before
+  launch in case the set shifted during pre-flight.
 - Honours the concurrency cap: **one** batch at a time on the
   GPUs it targets; if `free_gpus.sh` returns nothing, hard wait.
 - During the 8+ hr wait, alternates between reading source,
@@ -40,7 +44,7 @@ ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY must be set} \
 ```
 
 (`$ARGUMENTS` forwards every extra flag the user supplies, e.g.
-`--min-mean-at-16 0.62 --baseline-throughput 5500`.)
+`--max-iterations 12 --baseline-throughput 5500`.)
 
 Tail the live log printed to stdout. Every turn, tool call, and
 tool result is also persisted to `logs/auto_agent/$1_*.jsonl`.

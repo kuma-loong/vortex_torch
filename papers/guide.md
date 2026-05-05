@@ -304,8 +304,10 @@ high-RoPE dimensions. Three implications:
 centroid** flow: `CMean` (low-pass, semantic) plus `CMeanInterleave(k=4)`
 (preserves high-frequency / slash) plus `CL2Norm` (preserves
 magnitude). Indexer combines them with `Add`/`Max` before `topK`.
-Predicted to clear quality floor on `niah-multikey` and similar
-position-sensitive tasks where pure-`CMean` flows wobble.
+Predicted to push the `(throughput, mean@16)` Pareto frontier
+outward on `niah-multikey` and similar position-sensitive tasks
+where pure-`CMean` flows wobble — buys accuracy at modest extra
+cache-side cost.
 
 ## 10. SparQ Attention — sparse query, then top-k full keys
 *Ribar, Chelombiev, Hudlass-Galley, Blake, Luschi, Orr. Graphcore. ICLR PML4LRS 2024. arXiv:2312.04985 (referenced as 64_SparQ_…).*
@@ -441,6 +443,7 @@ papers; right column is the cheapest vortex_torch realization.
 | Approximate top-k (MagicPIG, IceFormer) | `approxTopK(tolerate_ratio=0.05–0.15)` instead of `topK` |
 | Cross-page distribution normalization | `Normalize(dim=0)` after the score `GeMM` to undo OOD inflation |
 | Cartesian / multi-head × multi-centroid score grid | `Kron(dim=(1,2))` on a per-head q-summary × per-page multi-centroid field, then `Max(dim=1)` |
+| Same-numel layout adjustment between ops (flatten / split) | `Reshape(-1, x2, y2)` (cache or indexer) — same-numel; pairs with `Kron` to massage grid shapes, with `CMeanInterleave` to flatten mini-centroids before a `CGeMM`, etc. |
 | Running-V residual (SparQ step 3) | not implementable in current framework — engine consumes only the topK indices |
 | ANNS / LSH on CPU (RetrievalAttention, MagicPIG) | not implementable — no CPU offload, single fused kernel |
 
@@ -646,26 +649,35 @@ take the 8 cells that bracket the current best.
 2. Either:
    - Pick a paper from §1–§10 and translate it via §12 (then pull a
      sketch from §14), **or**
-   - Pick a prompt from §16 and invent your own answer.
+   - Pick a §16 prompt — preferring §16.2/§16.3/§16.4 over §16.1 —
+     and invent your own answer.
 3. If the idea lives in §13's "can't do" list, file it as
    framework-level backlog and try again.
-4. Build `N` orthogonal variants. **Required composition:**
-   - **At least 1 off-catalog variant** — an idea you cannot
-     attribute to any single paper here. Could be a combination
-     nobody has explored, a knob nobody has tried, an inversion of
-     a paper's claim, or a flow you derived from first principles.
-     Document the hypothesis in one sentence in `algorithm_scientist/memory.md`
-     §3 alongside the batch row.
-   - The remaining `N - 1` slots should sweep one knob — rank,
-     tolerate_ratio, layers_skip, decay, group size `k`, projection
-     dimension, etc. — to localize the effect.
+4. Build `N` orthogonal variants (`N >= 4`, the framework minimum).
+   **Required composition:**
+   - **At least 1 *genuinely novel* variant** — and aim for 2 when
+     `N >= 6`. "Genuinely novel" means an idea that doesn't trace
+     to any single paper here AND isn't just a combination of two
+     papers (combinations are catalog-adjacent — see §16.1; they
+     are useful as *additional* variants but cannot fill the
+     novelty slot alone). Acceptable origins: §16.2 untried knobs,
+     §16.3 inversions, §16.4 first-principles, or — best — an idea
+     derived from the framework's own op set that doesn't fit any
+     §16 sub-bucket. Defend each in one sentence that names the
+     specific framework op or behaviour exploited (not "combine
+     paper A with paper B"). Document the hypothesis in
+     `algorithm_scientist/memory.md` §3 alongside the batch row.
+   - The remaining `N - 1` (or `N - 2`) slots can sweep one knob —
+     rank, tolerate_ratio, layers_skip, decay, group size `k`,
+     projection dimension, etc. — to localize the effect.
 5. Pre-flight all `N`, launch with `/batch-benchmark`, and record the
    batch in `algorithm_scientist/memory.md` §1.
 
-The shortest path to a *measurable* win, given the current flow
-library, is **§14.1 (Prism dual-band centroid)** — its underlying
-fix is theoretically forced rather than empirically observed. The
-shortest path to a *novel* win is somewhere in §16.
+The shortest path to a *measurable* tradeoff move on the
+`(throughput, mean@16)` plane, given the current flow library, is
+**§14.1 (Prism dual-band centroid)** — its underlying fix is
+theoretically forced rather than empirically observed. The shortest
+path to a *novel* win is somewhere in §16.2/§16.3/§16.4 (not §16.1).
 
 ---
 
@@ -674,12 +686,20 @@ shortest path to a *novel* win is somewhere in §16.
 Every paper in §1–§10 was built on a gap the previous literature
 hadn't named. The framework you're working with — page-level
 selection, fused per-block kernel, Save/Load across decode steps,
-and now (recently added) `Kron` and `MeanInterleave` — opens
-combinations the public literature does not cover. The questions
+and now (recently added) `Kron`, `MeanInterleave`, and `Reshape` —
+opens directions the public literature does not cover. The questions
 below are not rhetorical; each one is a research direction you can
 answer with a batch.
 
-### 16.1 Combinations the literature has not bothered to publish
+> **Note on the novelty bar.** §16.1 (paper combinations) is
+> *catalog-adjacent* — combining two papers is still
+> paper-derived thinking. It does not count as "novel" for the
+> off-catalog slot in `/batch-benchmark`. Reach for §16.2, §16.3,
+> §16.4, or — best — for ideas that don't fit any sub-bucket
+> here, derived from the framework's op set itself. §16.1 entries
+> are fine as additional variants alongside a true novelty.
+
+### 16.1 Combinations the literature has not bothered to publish (catalog-adjacent — does NOT fill the novelty slot)
 
 - **Prism (high-freq pooling) × Heavy-hitter accumulator (Keyformer/H2O).**
   Prism shows that mean-pool centroids miss slash patterns;
@@ -739,18 +759,25 @@ answer with a batch.
   them by default — but what if the score function explicitly
   *down-weights* the sink (knowing the framework will keep it
   anyway), so the rest of the topk budget goes to genuinely
-  informative pages? Does that buy throughput at fixed quality?
+  informative pages? How does that move the
+  `(throughput, mean@16)` point relative to the running best?
 
 ### 16.4 First-principles questions
 
-- What is the **cheapest possible flow** that still clears the
-  quality floor? Strip ops one at a time from the current best;
-  the first thing that breaks is the load-bearing piece.
+- What is the **cheapest possible flow** whose
+  `(throughput, mean@16)` point is still Pareto-non-dominated by
+  the running best? Strip ops one at a time from the current best
+  and watch which removal pulls the point inside the frontier —
+  that's the load-bearing piece.
 - What is the **flow with the smallest cache footprint** that
-  clears the floor? Each cache field costs decode-time bandwidth.
+  stays on the frontier? Each cache field costs decode-time
+  bandwidth, so the question is "how much accuracy did each field
+  buy us, and is the per-field accuracy/throughput slope worth
+  it?"
 - What is the **flow with the fewest indexer ops** (count
-  `__init__` declarations) that clears the floor? Selector
-  simplicity is itself a throughput knob (LServe §8).
+  `__init__` declarations) that stays on the frontier? Selector
+  simplicity is itself a throughput knob (LServe §8) — find the
+  minimum-op flow whose accuracy doesn't crash.
 - What scoring function would make `approxTopK(tolerate_ratio=0.5)`
   match `topK` quality? If you can bound the score in `[0, M]`
   with a known shape, the radix algorithm prunes faster.

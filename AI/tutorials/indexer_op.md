@@ -357,7 +357,9 @@ operators**.
 
 ---
 
-## 6. Layout — `Transpose()`
+## 6. Layout — `Transpose()` and `Reshape(-1, x2, y2)`
+
+### `Transpose()`
 
 Swap the last two axes:
 
@@ -372,6 +374,39 @@ $$
 Useful when you want to apply an op along the other inner axis without
 rewriting the op. Not a pure-metadata "view" — it emits a real
 reshuffle.
+
+### `Reshape(-1, x2, y2)`
+
+Reinterpret the inner two axes of a `[S, x1, y1]` tensor as
+`[S, x2, y2]`, where `x2 * y2 == x1 * y1`. The leading `S` axis is
+preserved and must be passed as `-1` (the "infer-this-dim"
+sentinel, mirroring `torch.reshape`):
+
+$$
+\text{Reshape}(X)[s, k, l] = X[s, \lfloor (k \cdot y_2 + l) / y_1 \rfloor,\ (k \cdot y_2 + l) \bmod y_1]
+$$
+
+| input shape | constructor | output shape | constraint |
+|---|---|---|---|
+| `[S, x_1, y_1]` | `Reshape(-1, x2, y2)` | `[S, x_2, y_2]` | `x_1 \cdot y_1 == x_2 \cdot y_2` |
+
+Pure layout change — no math, no inter-page mixing. Format support:
+`RAGGED → RAGGED`, `BATCHED → BATCHED`. (`PAGED` not yet wired.)
+
+Use it to:
+
+- **Combine with `Kron` to build score grids of an exact shape**.
+  E.g. `Kron(dim=(1,2))` on `[S, H, 1] × [S, 1, C]` gives a grid
+  `[S, H, C]`; `Reshape(-1, 1, H*C)` flattens it for a single
+  `Sum(dim=2)` collapse before `topK`.
+- **Split a single feature dim into multi-resolution sub-bands**:
+  `Reshape(-1, g, D/g)` on a `[S, 1, D]` centroid emits `g`
+  sub-band centroids per page, ready to be folded with
+  `Max(dim=1)` or fed into a per-band `Multiply` against a
+  matching split of `q`.
+- **Flatten a multi-resolution cache field** (`[S, g, D]`) into a
+  single feature vector `[S, 1, g*D]` for a downstream `GeMM`
+  against a learned `[g*D, k]` weight.
 
 ---
 
@@ -541,6 +576,7 @@ is identical.
 | `Normalize(dim)(x)` | same shape | `x / Σ x` |
 | `Conv1d(weight, dim)(x)` | same shape | 1-D conv with user kernel |
 | `Transpose()(x)` | `[S, D_0, D_1] → [S, D_1, D_0]` | swap inner axes |
+| `Reshape(-1, x2, y2)(x)` | `[S, x_1, y_1] → [S, x_2, y_2]` (`x_1·y_1 == x_2·y_2`) | row-major same-numel reshape; pairs naturally with `Kron` for grid-shape adjustments |
 | `MaskSlice(start, end, dim, α, β)(x)` | same shape | α inside range, β outside |
 | `Load()(F)` | `[S, D_0, D_1]` | read cache field |
 | `Save()(x, F)` | writes `F` | persist `x` into cache field |
@@ -565,6 +601,8 @@ is identical.
 | multi-head × multi-centroid score grid | `Kron(dim=(1,2))` on `[S, H, 1]` × `[S, 1, C]` → `[S, H, C]` → `Max(dim=1)` |
 | Cartesian cross-features per page | `Kron(dim=(1,2))` on `[S, 1, A]` × `[S, 1, B]` → `[S, A, B]` → reduce |
 | row-Kron of two centroid sets sharing a feature dim | `Kron(dim=1)` on `[S, x_1, D]` × `[S, y_1, D]` → `[S, x_1·y_1, D]` |
+| flatten multi-band centroid before a GeMM | `Reshape(-1, 1, g*D)` on `[S, g, D]` → `[S, 1, g·D]` → `GeMM(W_proj)` |
+| split feature dim into g sub-bands for multi-resolution scoring | `Reshape(-1, g, D/g)` on `[S, 1, D]` → `[S, g, D/g]` → fold with `Max(dim=1)` |
 
 When in doubt, walk the shapes in your head op by op; every op in this
 doc is a pure, side-effect-free transform of the shapes in the table
