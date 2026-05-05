@@ -718,8 +718,10 @@ so the verdict (after `wait`) lands on a pre-registered prediction.
 
 ## 5d. The "while-you-wait" protocol
 
-A single batch takes **8+ hours** of wall-clock time. Idle is not an
-acceptable answer. While the `N` children are running, do one of the
+A single batch takes **8+ hours** of wall-clock time when fully
+parallel (`N >= 4`), longer when the 4 variants are running in
+waves on fewer GPUs. Idle is not an acceptable answer. While the
+4 children (or wave's children) are running, do one of the
 following on each polling cycle (e.g. `jobs` to see how many are
 still alive, or `ls -lt summary_submissions/<tag>/<stem>/latest.json` to
 see which children have finished):
@@ -731,8 +733,8 @@ see which children have finished):
    After each file, append one bullet to
    [`algorithm_scientist/memory.md`](../algorithm_scientist/memory.md)
    §7 *Reading log* with the single most useful insight.
-2. **Design the next batch.** Sketch the next `N` orthogonal
-   variants (different theme — not `N` more copies of the running
+2. **Design the next batch.** Sketch the next 4 orthogonal
+   variants (different theme — not 4 more copies of the running
    theme) so they're ready to launch the moment the current batch
    finishes `wait`. Don't actually launch — concurrent batches
    will OOM the shared GPUs.
@@ -746,12 +748,13 @@ see which children have finished):
    indexer ops it would need. Inventing while a batch runs is
    free time; inventing while staring at a launched batch's row in
    §1 is wasted time. Aim for two novel sketches per wait cycle
-   when you can.
+   when you can. (For pure ideation without any benchmark, see
+   §5f *Innovation-draft mode*.)
 4. **Analyse completed children early.** Each child writes its
    `summary_submissions/<tag>/<stem>/latest.json` as soon as it finishes,
    without waiting for the others. As children land, read those
    summaries and start filling a §2 sub-section in memory.md
-   (results table + 1-3 sentence takeaway). When all `N` are in,
+   (results table + 1-3 sentence takeaway). When all 4 are in,
    close the §1 row and update §3 (hypotheses) / §4 (anti-patterns)
    / §5 (winners).
 
@@ -777,6 +780,69 @@ context does not. Sections:
 
 **Read at start, update before stop.** Every batch submission and
 every batch completion mutates §1 and §2.
+
+---
+
+## 5f. Innovation-draft mode (no benchmark, no iterate loop)
+
+The default workflow described in §5b-§5e is *iterative*:
+batch → benchmark → analyse → next batch, with `memory.md` as the
+persistent notebook. There is also a complementary one-shot mode
+for **algorithmic exploration only**, exposed as `/innovate <N>
+[theme-hint]`.
+
+`/innovate` produces **N novel submission pairs** in a single
+shot and then returns control to the user. The mode is defined by
+two non-negotiable contracts:
+
+1. **Genuinely novel algorithm.** Every variant must draw from
+   [papers/guide.md](../papers/guide.md) §16.2 (untried knobs),
+   §16.3 (inversions), §16.4 (first-principles), or — best — a
+   hypothesis derived from the framework's op set itself that
+   does not fit any §16 sub-bucket. Paper replicas, §16.1
+   combinations of two papers, and pure parameter sweeps over an
+   existing flow are **disqualified** here (stricter than the
+   iterate-mode novelty budget, which only requires *one* novel
+   slot per batch).
+2. **Compiles.** Every variant must pass `check_engine_config`
+   locally. A novel idea that does not compile is not an output
+   of this mode — fix it or surface the residual error and stop.
+
+The output layout is intentionally separated from the iterate
+tree so the two modes never collide on filenames within a tag:
+
+```
+submissions/<tag>/innovate_<x>_id<y>.py
+submissions/<tag>/innovate_<x>_id<y>.json
+```
+
+for `y ∈ {0 … N-1}`, where `<x>` = number of existing
+`submissions/<tag>/innovate_*_id0.json` files. The `<y>` slot
+range is `0 … N-1` (set by the user's `N`), **not** `0 … 3` —
+batch sizing rules from §5c do not apply to this mode.
+
+What the mode is **not**:
+
+- **Not a benchmark.** No GPU is touched; no
+  `run_submission_aime24.py` invocation; no `latest.json` written.
+- **Not iterative.** One shot, then return. No "wait + analyse +
+  next batch" loop.
+- **Not bound to batch=4.** `N` is whatever the user passes
+  (typically 2-12 depending on the theme's surface area).
+- **Not memory.md-aware.** §5e's notebook is left untouched;
+  there are no §1/§2 ledger mutations and no §3/§4/§5
+  hypothesis/anti-pattern/winner updates.
+
+When the user later wants to evaluate one of these drafts, they
+copy or rename the relevant `innovate_<x>_id<y>.{py,json}` pair
+into a `batch_<x>_id<y>.{py,json}` slot themselves, then run
+`/batch-benchmark` (groups of 4) or `/iterate`. `/innovate` does
+**not** automate that hand-off.
+
+Use `/innovate` when the goal is pure ideation (e.g. "give me 6
+fundamentally different ways to use Save/Load across decode
+steps") and `/iterate` (with §5c) when the goal is to actually
+move the Pareto frontier with measured numbers.
 
 ---
 
