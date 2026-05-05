@@ -137,6 +137,26 @@ CLAUDE_MD = dedent("""\
       across requests with matching prompt prefixes, corrupting
       Save/Load values. `check_engine_config` rejects the violation.
 
+    ## Environment — activate the `vortex_new` conda env first
+
+    Every python invocation in this project (`check_engine_config`,
+    `run_submission_aime24.py`, the pre-flight loops in the slash
+    commands, etc.) expects the **`vortex_new`** conda environment.
+    **Activate it once at session start** before running any of the
+    bash snippets below:
+
+    ```bash
+    source "$(conda info --base)/etc/profile.d/conda.sh"
+    conda activate vortex_new
+    python -c "import sys; print(sys.executable)"   # expect a path under .../envs/vortex_new/
+    ```
+
+    If `conda activate` isn't available in the current shell (e.g. a
+    non-interactive sub-shell that didn't source the conda profile),
+    fall back to `conda run -n vortex_new python ...` for every
+    python call. Either form is acceptable; what matters is that the
+    running interpreter is the one inside `vortex_new`.
+
     ## Running the benchmark — policy
 
     **Every batch is exactly 4 variants.** That fixed width is what
@@ -232,10 +252,10 @@ CLAUDE_MD = dedent("""\
        the same `batch_x_idy` stem.
 
     4. **One batch at a time on the free GPUs.** Do not launch a
-       second batch while the first is still running, and do not
-       try to "fill the gaps" by launching extra variants on GPUs
-       another user freed mid-batch — both contend for memory and
-       either OOM or thrash. Use `jobs` (or `ls -lt
+       second batch while the first (any wave) is still running, and
+       do not try to "fill the gaps" by launching extra variants on
+       GPUs another user freed mid-batch — both contend for memory
+       and either OOM or thrash. Use `jobs` (or `ls -lt
        summary_submissions/<tag>/*/latest.json`) to see how many
        children are still alive while you wait.
 
@@ -369,6 +389,22 @@ SUBMISSION_WRITER = dedent("""\
     `claude_haiku_4_5`, `gpt_5`). If `submissions/<tag>/` does not
     yet exist, create it; otherwise resume into it. Confirm the tag
     with the user only if you cannot determine your model name.
+
+    ### Second action — activate the `vortex_new` conda env
+
+    Every python call in this workflow must run inside the
+    **`vortex_new`** conda env. Activate once at session start:
+
+    ```bash
+    source "$(conda info --base)/etc/profile.d/conda.sh"
+    conda activate vortex_new
+    python -c "import sys; print(sys.executable)"   # must be .../envs/vortex_new/...
+    ```
+
+    If `conda activate` isn't usable in the current shell, prefix
+    each python invocation with `conda run -n vortex_new` instead.
+    A wrong-env python will fail to import the framework's C
+    extension and every pre-flight / benchmark call below will error.
 
     ## Read these before writing code
 

@@ -35,6 +35,26 @@ Example existing flows live at the top level (`submissions/example_*`)
 and are not under any agent tag — those are framework reference
 materials, not work product.
 
+### Environment — activate the `vortex_new` conda env first
+
+Every python invocation in this contract (`check_engine_config`,
+`run_submission_aime24.py`, the pre-flight loops in §5/§5c/§5f,
+the iterate driver, etc.) expects the **`vortex_new`** conda
+environment. Activate it once at session start, before running
+any bash snippet below:
+
+```bash
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate vortex_new
+python -c "import sys; print(sys.executable)"   # expect .../envs/vortex_new/...
+```
+
+If `conda activate` is unavailable in the current shell, fall
+back to `conda run -n vortex_new python ...` per call. Either
+way, the running interpreter must be the one inside `vortex_new`
+— a system / base / wrong-env python will fail to import
+`vortex_torch`'s C extension and the framework's Triton kernels.
+
 ---
 
 ## Objective
