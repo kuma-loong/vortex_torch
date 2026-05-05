@@ -29,10 +29,9 @@ share/python-wheels/
 MANIFEST
 *.json
 
-# Reference submission examples — track them despite the global *.json rule.
-# Single-level glob: only top-level submissions/*.json examples are tracked;
-# agent-tagged batches at submissions/<tag>/*.json stay ignored.
+# Submission JSON files — track them despite the global *.json rule.
 !submissions/*.json
+!submissions/**/*.json
 
 tests/
 *_backup.py
