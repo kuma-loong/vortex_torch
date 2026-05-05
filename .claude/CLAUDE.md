@@ -89,6 +89,26 @@ modifying the compiler itself, not when writing a submission.
   across requests with matching prompt prefixes, corrupting
   Save/Load values. `check_engine_config` rejects the violation.
 
+## Environment — activate the `vortex_new` conda env first
+
+Every python invocation in this project (`check_engine_config`,
+`run_submission_aime24.py`, the pre-flight loops in the slash
+commands, etc.) expects the **`vortex_new`** conda environment.
+**Activate it once at session start** before running any of the
+bash snippets below:
+
+```bash
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate vortex_new
+python -c "import sys; print(sys.executable)"   # expect a path under .../envs/vortex_new/
+```
+
+If `conda activate` isn't available in the current shell (e.g. a
+non-interactive sub-shell that didn't source the conda profile),
+fall back to `conda run -n vortex_new python ...` for every
+python call. Either form is acceptable; what matters is that the
+running interpreter is the one inside `vortex_new`.
+
 ## Running the benchmark — policy
 
 **Every batch is exactly 4 variants.** That fixed width is what
@@ -260,6 +280,7 @@ so any later session resumes cleanly from the same prompt.
 - `/batch-benchmark <n1> <n2> <n3> <n4>` — launch the 4-variant batch on the currently-free GPUs (parallel when `N >= 4`, otherwise waves of `N`; the only sanctioned benchmark command).
 - `/review <name>`         — audit a submission against AGENTS.md rules.
 - `/iterate <name>`        — kick off a full auto-iteration loop (4 variants per batch on the currently-free GPUs, one batch at a time, updates memory.md).
+- `/innovate <N> [theme]`  — *innovation-draft mode*: produce N genuinely-novel submissions in one shot, all required to compile, no benchmark loop, no memory.md mutation. See AGENTS.md §5f.
 - `/benchmark <name>`      — *debug only*: run a single variant directly. Do not use in normal workflow.
 
 ## Subagents available

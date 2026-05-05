@@ -41,6 +41,22 @@ model name (e.g. `claude_opus_4_7`, `claude_sonnet_4_6`,
 yet exist, create it; otherwise resume into it. Confirm the tag
 with the user only if you cannot determine your model name.
 
+### Second action — activate the `vortex_new` conda env
+
+Every python call in this workflow must run inside the
+**`vortex_new`** conda env. Activate once at session start:
+
+```bash
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate vortex_new
+python -c "import sys; print(sys.executable)"   # must be .../envs/vortex_new/...
+```
+
+If `conda activate` isn't usable in the current shell, prefix
+each python invocation with `conda run -n vortex_new` instead.
+A wrong-env python will fail to import the framework's C
+extension and every pre-flight / benchmark call below will error.
+
 ## Read these before writing code
 
 Every time you're invoked for a fresh task, read in this order (unless
