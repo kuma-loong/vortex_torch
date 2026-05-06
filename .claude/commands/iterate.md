@@ -24,15 +24,20 @@ This drives a dedicated Claude agent that:
   this session). The positional `$1` argument is the *theme tag*
   for memory.md attribution; it is **not** the agent tag (the
   agent tag is auto-detected from the model name).
-- Pre-flights all 4 variants locally, then runs them in waves of
-  `min(N, 4)` background `python algorithm_scientist/run_submission_aime24.py`
-  processes pinned to the free GPU indices
+- Pre-flights all 4 variants locally, then runs the RULER pre-filter
+  (`algorithm_scientist/run_ruler.py`) on each variant; any variant
+  scoring below **0.85 accuracy** must be fixed before launch. Then
+  runs the passing variants in waves of `min(N, 4)` background
+  `python algorithm_scientist/run_submission_aime24.py` processes
+  pinned to the free GPU indices
   (`CUDA_VISIBLE_DEVICES=${FREE_GPUS[$((y - start))]}`) with
   `wait` between waves. Re-detects free GPUs immediately before
-  launch in case the set shifted during pre-flight.
+  launch in case the set shifted during pre-flight/RULER.
 - Honours the concurrency cap: **one** batch at a time on the
   GPUs it targets; if `free_gpus.sh` returns nothing, hard wait.
-- During the 8+ hr wait, alternates between reading source,
+- During the 20–60 min wait (kills any child still running after
+  60 min and logs the error in memory.md §4), alternates between
+  reading source,
   designing the next batch (without launching), and analysing
   children whose `latest.json` has already landed.
 - Reads `summary_submissions/<name>/latest.json` and updates
@@ -43,8 +48,21 @@ ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY must be set} \
   python algorithm_scientist/auto_agent.py --submission-name $1 $ARGUMENTS
 ```
 
-(`$ARGUMENTS` forwards every extra flag the user supplies, e.g.
-`--max-iterations 12 --baseline-throughput 5500`.)
+`$ARGUMENTS` forwards every extra flag the user supplies. The most
+important one is **`--max-iterations <N>`** (default: 5), which caps
+the number of 4-variant batches the agent will launch this session.
+The loop enforces the cap automatically — once `N` batches have been
+launched the agent is sent a stop signal and asked for a final summary.
+Set to a large number (e.g. `--max-iterations 99`) for effectively
+unlimited runs. Example:
+
+```bash
+ANTHROPIC_API_KEY=... \
+  python algorithm_scientist/auto_agent.py \
+    --submission-name my_run \
+    --max-iterations 3 \
+    --baseline-throughput 5500
+```
 
 Tail the live log printed to stdout. Every turn, tool call, and
 tool result is also persisted to `logs/auto_agent/$1_*.jsonl`.

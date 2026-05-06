@@ -177,11 +177,27 @@ do not launch.
      python -c "from vortex_torch.engine.sgl import check_engine_config; check_engine_config('submissions/${TAG}/batch_${BATCH}_id${y}.json')"
    done
    ```
-   Drop or fix any failing variant before step 6.
-5. **Re-check free GPUs and the concurrency cap.** Only **one**
+   Drop or fix any failing variant before step 5.
+5. **RULER pre-filter — quick quality gate (≥ 0.85).** Run
+   `algorithm_scientist/run_ruler.py` on each variant sequentially
+   on one free GPU. Any variant scoring below **0.85 accuracy** on
+   `examples/validation.jsonl` has structurally broken attention.
+   Fix it (widen `vortex_topk_val`/`vortex_topk_ratio` or revise
+   the indexer scoring), re-pre-flight, and re-run RULER until all
+   4 pass before launching AIME24:
+   ```bash
+   TAG=<your_tag>; BATCH=<x>
+   for y in 0 1 2 3; do
+     CUDA_VISIBLE_DEVICES=${FREE_GPUS[0]} \
+       python algorithm_scientist/run_ruler.py \
+         --config "submissions/${TAG}/batch_${BATCH}_id${y}.json"
+   done
+   ```
+   Results land in `summary_ruler_submissions/<tag>/<stem>/latest.json`.
+6. **Re-check free GPUs and the concurrency cap.** Only **one**
    batch may run at a time on the GPUs you launched on. Re-run
    `algorithm_scientist/free_gpus.sh` immediately before launch
-   (the set may have shifted during pre-flight) and reconcile:
+   (the set may have shifted during pre-flight/RULER) and reconcile:
    - Recompute `PARALLEL = min(N, 4)`. The batch size stays at
      4 — `N < 4` just means more waves, not fewer variants.
    - If `jobs` shows children from a previous `wait` you started
@@ -189,7 +205,7 @@ do not launch.
      activities below until they finish.
    - If `free_gpus.sh` returns nothing (exit 1), DO NOT launch —
      hard wait.
-6. **Launch the batch** (the ONLY sanctioned benchmark form),
+7. **Launch the batch** (the ONLY sanctioned benchmark form),
    running the 4 variants in waves of `PARALLEL = min(N, 4)`:
    ```bash
    TAG=<your_tag>; BATCH=<x>
@@ -219,8 +235,10 @@ do not launch.
    `python algorithm_scientist/run_submission_aime24.py` on a
    single config from this workflow** — that single-variant
    form is debug-only.
-7. **While the 4 children run (8+ hrs fully parallel; longer
-   when `N < 4`)**, on every poll cycle do ONE of:
+8. **While the 4 children run (20–60 min fully parallel; longer
+   when `N < 4` due to sequential waves)**, on every poll cycle
+   do ONE of (and **kill any child still running after 60 min** —
+   it has stalled; log in memory.md §4 and treat as failed):
    (a) **Read** the next file in priority order
    (`AI/tutorials/` → `AI/developer_guides/` → `papers/` →
    `vortex_torch/flow/algorithms.py` →
@@ -243,9 +261,9 @@ do not launch.
    `summary_submissions/<tag>/<stem>/latest.json` as soon as
    it finishes; read those that have landed and start filling §2.
    Close the §1 row once all 4 are in; update §3/§4/§5.
-8. **Failure handling.** If pre-flight fails for a variant, fix
-   it in place. If a child's `*.err` log shows a traceback or
-   its summary JSON is missing after `wait`, open
+9. **Failure handling.** If pre-flight or RULER filter fails for
+   a variant, fix it in place. If a child's `*.err` log shows a
+   traceback or its summary JSON is missing after `wait`, open
    `$LOGDIR/gpu<i>_<stem>.err` for the failing child, diagnose,
    and incorporate the lesson into memory.md §4 before
    respinning.

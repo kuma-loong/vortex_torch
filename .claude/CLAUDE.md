@@ -164,7 +164,21 @@ debug-only. Each batch:
    done
    ```
    Refuse to launch any variant whose pre-flight fails.
-3. **Launch the 4 variants in waves of `PARALLEL = min(N, 4)`**,
+3. **RULER pre-filter — quick quality gate (≥ 0.85).** Before
+   spending 20–60 minutes on AIME24, run `algorithm_scientist/run_ruler.py`
+   on each variant. Any variant scoring below **0.85 accuracy** on
+   `examples/validation.jsonl` has structurally broken attention —
+   fix it (widen `vortex_topk_val`/`vortex_topk_ratio` or revise the
+   indexer scoring), re-pre-flight, and re-run RULER until all 4 pass.
+   ```bash
+   for y in 0 1 2 3; do
+     CUDA_VISIBLE_DEVICES=${FREE_GPUS[0]} \
+       python algorithm_scientist/run_ruler.py \
+         --config "submissions/${TAG}/batch_${BATCH}_id${y}.json"
+   done
+   ```
+   Results land in `summary_ruler_submissions/<tag>/<stem>/latest.json`.
+4. **Launch the 4 variants in waves of `PARALLEL = min(N, 4)`**,
    each child pinned via `CUDA_VISIBLE_DEVICES`, with `wait`
    between waves so a wave's GPU is free before the next one
    reuses it:
@@ -203,7 +217,7 @@ debug-only. Each batch:
    isolation, no collisions between agents that happen to use
    the same `batch_x_idy` stem.
 
-4. **One batch at a time on the free GPUs.** Do not launch a
+5. **One batch at a time on the free GPUs.** Do not launch a
    second batch while the first (any wave) is still running, and
    do not try to "fill the gaps" by launching extra variants on
    GPUs another user freed mid-batch — both contend for memory
@@ -211,7 +225,7 @@ debug-only. Each batch:
    summary_submissions/<tag>/*/latest.json`) to see how many
    children are still alive while you wait.
 
-## While you wait (8+ hrs per batch)
+## While you wait (20–60 min per batch; kill any child > 60 min)
 
 Idle is not an option. Each polling cycle, do one of:
 

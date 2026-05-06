@@ -67,7 +67,23 @@ done
 Refuse to launch any submission whose preflight failed — fix the
 failing variant first.
 
-Step 3 — launch the 4 variants in waves of `PARALLEL = min(N, 4)`,
+Step 3 — RULER pre-filter (quick quality gate, ≥ 0.85). Run
+`algorithm_scientist/run_ruler.py` on each variant sequentially on
+one free GPU. Any variant scoring below **0.85 accuracy** on
+`examples/validation.jsonl` has structurally broken attention — fix
+it (widen `vortex_topk_val`/`vortex_topk_ratio` or revise the
+indexer), re-pre-flight, and re-run RULER until all 4 pass before
+launching AIME24.
+```bash
+for name in "${NAMES[@]}"; do
+    CUDA_VISIBLE_DEVICES=${FREE_GPUS[0]} \
+        python algorithm_scientist/run_ruler.py --config "submissions/${TAG}/${name}.json"
+done
+```
+Results land in `summary_ruler_submissions/<tag>/<name>/latest.json`.
+Refuse to launch any variant whose RULER accuracy < 0.85.
+
+Step 4 — launch the 4 variants in waves of `PARALLEL = min(N, 4)`,
 each pinned to a *free* GPU index (NOT 0…N-1), with `wait`
 between waves so a wave's GPUs are free before the next reuses
 them:
@@ -99,18 +115,20 @@ updates `summary_submissions/<tag>/<name>/latest.json` itself.
 becomes `summary_submissions/<tag>/batch_<x>_id<y>/...` — per-agent
 isolation, no collisions across agents that pick the same stem.)
 
-Step 4 — append a row to `algorithm_scientist/memory.md` §1
+Step 5 — append a row to `algorithm_scientist/memory.md` §1
 *In-flight batches* the moment you launch:
 `| <tag> | <batch_id> | <UTC time> | <LOGDIR> | <name1>,…,<name4> | RUNNING |`
 
-Step 5 — while waiting (the batch takes **8+ hours** when fully
-parallel, longer with `N < 4`), do NOT idle. Spend the time
+Step 6 — while waiting (the batch takes **20–60 minutes** when fully
+parallel, longer with `N < 4` due to sequential waves; **kill any
+child still running after 60 minutes** — log the error in
+memory.md §4 and treat that variant as failed), do NOT idle. Spend the time
 reading tutorials / developer guides / source, or designing the
 next batch (don't launch — concurrent batches OOM the shared
 GPUs), or analysing children that have already produced their
 `latest.json`. See AGENTS.md §5d.
 
-Step 6 — once the outer `wait` loop returns (all waves done):
+Step 7 — once the outer `wait` loop returns (all waves done):
 
 - **Success** → for each `<nameI>`, read
   `summary_submissions/<tag>/<nameI>/latest.json`. Produce a comparison
@@ -122,7 +140,7 @@ Step 6 — once the outer `wait` loop returns (all waves done):
   the table + a 1-3 sentence takeaway naming each frontier
   variant and where it sits relative to the running §5 best, to
   `algorithm_scientist/memory.md` §2 *Completed batches*; remove
-  the row you added in step 4 from §1.
+  the row you added in step 5 from §1.
 - **Failure** → any child whose process exited non-zero (or
   whose `latest.json` is missing / older than `$LOGDIR`'s
   timestamp) wrote its traceback to
