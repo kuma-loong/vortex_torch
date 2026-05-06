@@ -36,9 +36,14 @@ conversation does not.
   (inversions), §16.4 (first-principles), or — best — ideas
   derived from the framework's op set itself that don't fit any
   §16 sub-bucket. Defend each novelty in one sentence naming the
-  specific framework op or behaviour exploited (not "combine
-  paper A with paper B"). Pre-register each novelty hypothesis in
-  §3 the moment you launch.
+  specific framework op or behaviour exploited. Pre-register each
+  novelty hypothesis in §3 the moment you launch.
+- **Remaining slots use `papers/guide.md` §16.5 techniques.**
+  The 2–3 non-novelty slots per batch should be filled with
+  catalog-adjacent parameter sweeps (`vortex_topk_val`,
+  `approxTopK`, layer-skip patterns, fp8/bf16 KV, etc.) that
+  map the Pareto frontier around the novel variant. These are
+  explicitly encouraged for non-novelty slots.
 - **File layout.** Submissions live under `submissions/<tag>/`,
   where `<tag>` is your sanitized model name (e.g.
   `claude_opus_4_7`). Batched runs use

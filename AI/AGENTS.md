@@ -725,14 +725,9 @@ launch — wait, and use the time on the §5d activities.
 
 ### Novelty budget — at least one *genuinely novel* variant per batch
 
-The `papers/` folder + [papers/guide.md](../papers/guide.md) catalog
-covers what's already published. They are *seeds*, not the menu, and
-**combinations of two paper ideas are still paper-derived thinking**
-— they do not count as novel. The off-catalog slot wants something
-the literature graph in `papers/` does not reach.
-
-Of the 4 variants in every batch, **reserve at least one slot for
-a genuinely novel flow** — an idea that:
+Algorithmic innovation is the primary objective. Of the 4 variants
+in every batch, **reserve at least one slot for a genuinely novel
+flow** — an idea that:
 
 - does not trace to any single paper in `papers/`,
 - is not just a combination of two papers (those are
@@ -745,11 +740,19 @@ a genuinely novel flow** — an idea that:
   question the literature isn't asking (§16.4), or — best of all —
   a hypothesis you simply haven't seen anywhere.
 
-Combinations from §16.1 are useful as *additional* variants but
-cannot fill the novelty slot on their own. If you propose a
-combination, add a true §16.2/§16.3/§16.4-class idea alongside it.
-Aim for **two genuinely novel variants per batch when you have the
-slots** — one is the floor, not the goal.
+Aim for **two genuinely novel variants per batch** — one is the
+floor, not the goal.
+
+**The remaining slots (2–3 per batch) should be filled with
+[papers/guide.md §16.5](../papers/guide.md) techniques** — the
+catalog-adjacent parameter sweeps and orthogonal-knob variants that
+are explicitly *not* novel but are still valuable for mapping the
+Pareto frontier: different `vortex_topk_val` / `vortex_topk_ratio`,
+`approxTopK` vs `topK`, layer-skip patterns, fp8 vs bf16 KV,
+`mem_fraction_static` tuning. These sweeps give the measured curve
+that tells you whether the novel idea in the off-catalog slot is
+actually buying something. Agents are explicitly encouraged to use
+§16.5 techniques for the non-novelty slots.
 
 What "defending it in one sentence" means: the sentence should
 name the specific framework op or behaviour the idea exploits, not

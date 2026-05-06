@@ -78,16 +78,19 @@ CLAUDE_MD = dedent("""\
     low-rank K, LSH sampling, dual-band centroids. Treat them as
     **seeds, not a menu.** A winning flow does not need a citation.
 
-    **Novelty bar.** Combinations of two paper ideas are still
-    paper-derived thinking and **do not** count as novel — they are
-    catalog-adjacent (see `papers/guide.md` §16.1). Every batch must
-    reserve at least one slot for a *genuinely novel* variant — an
-    idea that comes from §16.2 (untried knobs), §16.3 (inversions of
-    paper claims), §16.4 (first-principles questions), or — best —
-    something derived from the framework's own op set that doesn't
-    fit any §16 sub-bucket. Aim for **two novel variants per batch**
-    when slots allow. Replicating a paper, combining two papers, or
-    sweeping a single knob do not count for the novelty slot.
+    **Novelty bar.** Algorithmic innovation is the primary objective.
+    Every batch must reserve **at least one slot** (aim for two) for a
+    *genuinely novel* variant — an idea from §16.2 (untried knobs),
+    §16.3 (inversions), §16.4 (first-principles), or the framework's own
+    op set. Paper replicas and §16.1 combinations are catalog-adjacent
+    and do not fill the novelty slot.
+
+    **The remaining 2–3 slots should use `papers/guide.md` §16.5
+    techniques** — catalog-adjacent parameter sweeps (`vortex_topk_val`,
+    `approxTopK`, layer-skip patterns, fp8/bf16 KV, etc.) that are
+    explicitly encouraged for non-novelty slots. They map the Pareto
+    curve around the novel variant and give the measured context needed
+    to judge whether the novel idea is actually buying something.
 
     ## Where the instructions live
 

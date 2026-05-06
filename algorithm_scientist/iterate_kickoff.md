@@ -75,16 +75,18 @@ Iterate loop (repeat until I say stop):
      — sequential fallback. Only `N == 0` is a hard wait.)
    - State the theme in one short paragraph.
    - List the knob matrix — one knob varied per variant (4 rows).
-   - **At least one variant must be *genuinely novel*** — and aim
-     for two per batch when slots allow. "Genuinely novel"
-     excludes paper replicas AND combinations of two papers
-     (those are catalog-adjacent — papers/guide.md §16.1, don't
-     qualify). Acceptable origins: §16.2 (untried knobs), §16.3
-     (inversions), §16.4 (first-principles), or — best — an idea
-     derived from the framework's op set itself that doesn't fit
-     any §16 sub-bucket. Defend each in one sentence naming the
-     specific framework op or behaviour exploited (not "combine
-     paper A with paper B"). Pure parameter sweeps don't count.
+   - **At least one variant must be *genuinely novel*** — aim for
+     two per batch. Acceptable origins: papers/guide.md §16.2
+     (untried knobs), §16.3 (inversions), §16.4 (first-principles),
+     or an idea from the framework's op set that doesn't fit any
+     §16 sub-bucket. Paper replicas and combinations of two papers
+     (§16.1) are catalog-adjacent and don't qualify. Defend each
+     in one sentence naming the specific op or behaviour exploited.
+   - **Remaining 2–3 slots use papers/guide.md §16.5 techniques**
+     (catalog-adjacent parameter sweeps: different topk_val,
+     approxTopK vs topK, layer-skip patterns, fp8/bf16 KV, etc.).
+     These are explicitly encouraged for non-novelty slots — they
+     map the Pareto curve around the novel variant.
    - Pre-register each novelty hypothesis as a one-sentence row
      in memory.md §3 the moment you launch.
 
