@@ -254,8 +254,9 @@ def _build_system_blocks() -> List[Dict[str, Any]]:
         "You are an expert autonomous algorithm scientist working on "
         "the vortex_torch sparse-attention competition. Your job is "
         "to design, submit, and iterate on `vFlow` submissions over "
-        "very long wall-clock horizons (a single batch of experiments "
-        "can take 8+ hours). You manage your own backlog — do not "
+        "wall-clock horizons (a single batch of experiments takes "
+        "20–60 minutes fully parallel; kill any child still running "
+        "after 60 min — it has stalled). You manage your own backlog — do not "
         "ask the user to plan for you.\n\n"
         "Hard rules — read carefully, these are non-negotiable:\n"
         "  1. **SUBMISSIONS ALWAYS RUN IN BATCHES OF EXACTLY 8.** "
@@ -292,7 +293,7 @@ def _build_system_blocks() -> List[Dict[str, Any]]:
         "     at start and update it before stopping. It is your only "
         "     persistent state across sessions; the conversation is not.\n\n"
         "What to do while Slurm jobs are running (this is MOST of your time):\n"
-        "  Batches take 8+ hours. Idle is forbidden. In each polling "
+        "  Batches take 20–60 minutes (kill any child > 60 min). Idle is forbidden. In each polling "
         "  turn, do one of three things — spread time across all of "
         "  them, don't fixate:\n"
         "  (a) **Deepen understanding.** Priority order:\n"
@@ -426,7 +427,7 @@ def _build_initial_user_prompt(
         f"   ```\n"
         f"   Capture the JOBID. **Add a row to memory.md §1** "
         f"(batch_id, submitted_at, slurm_job_id, submissions, status=PENDING).\n"
-        f"6. **While the batch runs (8+ hrs), don't idle.** "
+        f"6. **While the batch runs (20–60 min; kill any child > 60 min and log in memory.md §4), don't idle.** "
         f"Each polling turn, choose one of (a)/(b)/(c) — spread "
         f"attention across all three over the wait:\n"
         f"   (a) **Read and learn.** One file per turn. Order of "
@@ -543,6 +544,17 @@ def run_agent(
     stop_reason: Optional[str] = None
     log_fp = log_path.open("w", encoding="utf-8")
 
+    # Track batches launched this session by counting batch_*_id0.json files
+    # that appear under submissions/ after the session starts.
+    submissions_dir = REPO_ROOT / "submissions"
+    def _launched_this_session() -> int:
+        return sum(
+            1 for f in submissions_dir.glob("*/batch_*_id0.json")
+            if f.stat().st_mtime >= session_start_mtime
+        )
+    import time as _time
+    session_start_mtime = _time.time()
+
     def _log(obj: Dict[str, Any]) -> None:
         log_fp.write(json.dumps(obj, ensure_ascii=False) + "\n")
         log_fp.flush()
@@ -642,6 +654,65 @@ def run_agent(
             break
 
         messages.append({"role": "user", "content": tool_results})
+
+        # Enforce the max_iterations budget by counting batches launched
+        # this session (new batch_*_id0.json files under submissions/).
+        launched = _launched_this_session()
+        if launched >= max_iterations:
+            stop_msg = (
+                f"BUDGET REACHED: you have launched {launched} batch(es) this "
+                f"session, which equals the --max-iterations limit of "
+                f"{max_iterations}. Do not start another batch. Write your "
+                f"final 2-paragraph summary now — name the best submission, "
+                f"its content_hash, mean@16, throughput, and the key design "
+                f"decisions — then stop."
+            )
+            print(f"\n[auto_agent] max_iterations={max_iterations} reached "
+                  f"({launched} batches launched). Injecting stop signal.")
+            _log({"event": "max_iterations_reached", "launched": launched,
+                  "max_iterations": max_iterations})
+            messages.append({"role": "user", "content": stop_msg})
+            # Allow one final turn for the summary, then exit.
+            turns_before_stop = turns
+            while turns < turns_before_stop + 10:
+                turns += 1
+                for attempt in range(4):
+                    try:
+                        with client.messages.stream(
+                            model=MODEL,
+                            max_tokens=MAX_TOKENS,
+                            system=system_blocks,
+                            tools=TOOLS,
+                            thinking={"type": "adaptive"},
+                            output_config={"effort": "high"},
+                            messages=messages,
+                        ) as stream:
+                            response = stream.get_final_message()
+                        break
+                    except (anthropic.RateLimitError, anthropic.APIError) as e:
+                        wait = 2 ** attempt * 5
+                        time.sleep(wait)
+                print(_pretty_content_blocks(response.content))
+                messages.append({
+                    "role": "assistant",
+                    "content": _blocks_for_messages(response.content),
+                })
+                if response.stop_reason == "end_turn":
+                    break
+                if response.stop_reason == "tool_use":
+                    tr = []
+                    for block in response.content:
+                        if block.type == "tool_use":
+                            result = _dispatch_tool(block.name, block.input or {})
+                            tr.append({"type": "tool_result",
+                                       "tool_use_id": block.id,
+                                       "content": result})
+                    if tr:
+                        messages.append({"role": "user", "content": tr})
+                    else:
+                        break
+            stop_reason = "max_iterations_reached"
+            break
 
     log_fp.close()
 

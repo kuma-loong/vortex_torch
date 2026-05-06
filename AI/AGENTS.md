@@ -459,7 +459,7 @@ python algorithm_scientist/run_submission_aime24.py --config submissions/<tag>/<
 ```
 
 Everything else is hard-coded inside `algorithm_scientist/run_submission_aime24.py`
-(16 trials, `Qwen/Qwen3-4B`, single GPU, 4096-token input cap, 16384
+(16 trials, `Qwen/Qwen3-1.7B`, single GPU, 4096-token input cap, 16384
 max new tokens, `examples/aime24.jsonl`). The only thing you change
 between runs is your flow's JSON.
 
@@ -621,6 +621,34 @@ different `vortex_layers_skip`, different `vortex_block_size`,
 etc.) — and reserve at least one slot for a genuinely novel
 variant (see "Novelty budget" below).
 
+### RULER pre-filter — quick quality gate (≥ 0.85)
+
+Before spending 20–60 minutes on AIME24, run the fast RULER filter on
+each variant using `algorithm_scientist/run_ruler.py`. Any variant
+that scores below **0.85 accuracy** on `examples/validation.jsonl`
+has structurally broken attention — the scoring function is dropping
+so many critical tokens that AIME24 would yield no useful signal.
+Fix or replace it before launching AIME24.
+
+Run sequentially on one free GPU (RULER is fast — short outputs,
+small dataset, finishes in minutes):
+
+```bash
+for y in 0 1 2 3; do
+    cfg="submissions/${TAG}/batch_${BATCH}_id${y}.json"
+    CUDA_VISIBLE_DEVICES=${FREE_GPUS[0]} \
+        python algorithm_scientist/run_ruler.py --config "$cfg"
+done
+```
+
+Read the `accuracy` line from each run's stdout. A variant below
+0.85 needs its `vortex_topk_val` / `vortex_topk_ratio` widened or
+its indexer scoring function revised. Re-pre-flight and re-run RULER
+until all 4 variants clear the bar, then proceed to the AIME24
+launch. Results are also written to
+`summary_ruler_submissions/<tag>/<stem>/latest.json` so you can
+`jq .accuracy` them after the loop.
+
 Launch the 4 variants in waves of `PARALLEL = min(N, 4)`, with
 `wait` between waves so a wave's GPUs are free before the next
 wave reuses them:
@@ -738,13 +766,15 @@ so the verdict (after `wait`) lands on a pre-registered prediction.
 
 ## 5d. The "while-you-wait" protocol
 
-A single batch takes **8+ hours** of wall-clock time when fully
+A single batch takes **20–60 minutes** of wall-clock time when fully
 parallel (`N >= 4`), longer when the 4 variants are running in
-waves on fewer GPUs. Idle is not an acceptable answer. While the
-4 children (or wave's children) are running, do one of the
-following on each polling cycle (e.g. `jobs` to see how many are
-still alive, or `ls -lt summary_submissions/<tag>/<stem>/latest.json` to
-see which children have finished):
+waves on fewer GPUs. **Kill any child still running after 60 minutes**
+— it has likely stalled; log the error in §4 and treat that
+variant as failed. While the 4 children (or wave's children) are
+running, do one of the following on each polling cycle (e.g. `jobs`
+to see how many are still alive, or `ls -lt
+summary_submissions/<tag>/<stem>/latest.json` to see which children
+have finished):
 
 1. **Deepen understanding.** In priority order:
    `AI/tutorials/` → `AI/developer_guides/` →
@@ -881,6 +911,10 @@ move the Pareto frontier with measured numbers.
 - [ ] Save the config to `submissions/<tag>/<name>.json`.
 - [ ] Run `check_engine_config("submissions/<tag>/<name>.json")`. Fix
       errors and re-run until it passes.
+- [ ] Run the RULER pre-filter:
+      `python algorithm_scientist/run_ruler.py --config submissions/<tag>/<name>.json`.
+      Require `accuracy >= 0.85`. If below, widen `vortex_topk_val`/`vortex_topk_ratio`
+      or fix the indexer, re-pre-flight, and re-run until it passes.
 - [ ] Run the benchmark:
       `python algorithm_scientist/run_submission_aime24.py --config submissions/<tag>/<name>.json`.
       Read the `mean@16` / `pass@16` / `throughput` fields of the saved
@@ -910,9 +944,12 @@ move the Pareto frontier with measured numbers.
    `Load`/`Save`, zero-initialise it in `forward_cache` with
    `CFill(0.0)`, AND set `"disable_radix_cache": true` in the JSON.
 7. Run `check_engine_config(...)` before declaring done.
-8. Run `algorithm_scientist/run_submission_aime24.py --config <your JSON>` to get
+8. Run `algorithm_scientist/run_ruler.py --config <your JSON>` and confirm
+   `accuracy >= 0.85`. Below 0.85 means attention is structurally broken —
+   widen knobs or fix the scorer before running AIME24.
+9. Run `algorithm_scientist/run_submission_aime24.py --config <your JSON>` to get
    the `mean@16` / `pass@16` / `throughput` numbers.
-9. **Objective: strike the best tradeoff between `mean@16` and
-   `throughput`.** Both are objectives — push the
-   `(throughput, mean@16)` Pareto frontier outward; there is no
-   fixed quality floor.
+10. **Objective: strike the best tradeoff between `mean@16` and
+    `throughput`.** Both are objectives — push the
+    `(throughput, mean@16)` Pareto frontier outward; there is no
+    fixed quality floor.

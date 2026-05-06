@@ -212,7 +212,21 @@ CLAUDE_MD = dedent("""\
        done
        ```
        Refuse to launch any variant whose pre-flight fails.
-    3. **Launch the 4 variants in waves of `PARALLEL = min(N, 4)`**,
+    3. **RULER pre-filter — quick quality gate (≥ 0.85).** Before
+       spending 20–60 minutes on AIME24, run `algorithm_scientist/run_ruler.py`
+       on each variant. Any variant scoring below **0.85 accuracy** on
+       `examples/validation.jsonl` has structurally broken attention —
+       fix it (widen `vortex_topk_val`/`vortex_topk_ratio` or revise the
+       indexer scoring), re-pre-flight, and re-run RULER until all 4 pass.
+       ```bash
+       for y in 0 1 2 3; do
+         CUDA_VISIBLE_DEVICES=${FREE_GPUS[0]} \\
+           python algorithm_scientist/run_ruler.py \\
+             --config "submissions/${TAG}/batch_${BATCH}_id${y}.json"
+       done
+       ```
+       Results land in `summary_ruler_submissions/<tag>/<stem>/latest.json`.
+    4. **Launch the 4 variants in waves of `PARALLEL = min(N, 4)`**,
        each child pinned via `CUDA_VISIBLE_DEVICES`, with `wait`
        between waves so a wave's GPU is free before the next one
        reuses it:
@@ -251,7 +265,7 @@ CLAUDE_MD = dedent("""\
        isolation, no collisions between agents that happen to use
        the same `batch_x_idy` stem.
 
-    4. **One batch at a time on the free GPUs.** Do not launch a
+    5. **One batch at a time on the free GPUs.** Do not launch a
        second batch while the first (any wave) is still running, and
        do not try to "fill the gaps" by launching extra variants on
        GPUs another user freed mid-batch — both contend for memory
@@ -259,7 +273,7 @@ CLAUDE_MD = dedent("""\
        summary_submissions/<tag>/*/latest.json`) to see how many
        children are still alive while you wait.
 
-    ## While you wait (8+ hrs per batch)
+    ## While you wait (20–60 min per batch; kill any child > 60 min)
 
     Idle is not an option. Each polling cycle, do one of:
 
@@ -526,11 +540,27 @@ SUBMISSION_WRITER = dedent("""\
          python -c "from vortex_torch.engine.sgl import check_engine_config; check_engine_config('submissions/${TAG}/batch_${BATCH}_id${y}.json')"
        done
        ```
-       Drop or fix any failing variant before step 6.
-    5. **Re-check free GPUs and the concurrency cap.** Only **one**
+       Drop or fix any failing variant before step 5.
+    5. **RULER pre-filter — quick quality gate (≥ 0.85).** Run
+       `algorithm_scientist/run_ruler.py` on each variant sequentially
+       on one free GPU. Any variant scoring below **0.85 accuracy** on
+       `examples/validation.jsonl` has structurally broken attention.
+       Fix it (widen `vortex_topk_val`/`vortex_topk_ratio` or revise
+       the indexer scoring), re-pre-flight, and re-run RULER until all
+       4 pass before launching AIME24:
+       ```bash
+       TAG=<your_tag>; BATCH=<x>
+       for y in 0 1 2 3; do
+         CUDA_VISIBLE_DEVICES=${FREE_GPUS[0]} \\
+           python algorithm_scientist/run_ruler.py \\
+             --config "submissions/${TAG}/batch_${BATCH}_id${y}.json"
+       done
+       ```
+       Results land in `summary_ruler_submissions/<tag>/<stem>/latest.json`.
+    6. **Re-check free GPUs and the concurrency cap.** Only **one**
        batch may run at a time on the GPUs you launched on. Re-run
        `algorithm_scientist/free_gpus.sh` immediately before launch
-       (the set may have shifted during pre-flight) and reconcile:
+       (the set may have shifted during pre-flight/RULER) and reconcile:
        - Recompute `PARALLEL = min(N, 4)`. The batch size stays at
          4 — `N < 4` just means more waves, not fewer variants.
        - If `jobs` shows children from a previous `wait` you started
@@ -538,7 +568,7 @@ SUBMISSION_WRITER = dedent("""\
          activities below until they finish.
        - If `free_gpus.sh` returns nothing (exit 1), DO NOT launch —
          hard wait.
-    6. **Launch the batch** (the ONLY sanctioned benchmark form),
+    7. **Launch the batch** (the ONLY sanctioned benchmark form),
        running the 4 variants in waves of `PARALLEL = min(N, 4)`:
        ```bash
        TAG=<your_tag>; BATCH=<x>
@@ -568,8 +598,10 @@ SUBMISSION_WRITER = dedent("""\
        `python algorithm_scientist/run_submission_aime24.py` on a
        single config from this workflow** — that single-variant
        form is debug-only.
-    7. **While the 4 children run (8+ hrs fully parallel; longer
-       when `N < 4`)**, on every poll cycle do ONE of:
+    8. **While the 4 children run (20–60 min fully parallel; longer
+       when `N < 4` due to sequential waves)**, on every poll cycle
+       do ONE of (and **kill any child still running after 60 min** —
+       it has stalled; log in memory.md §4 and treat as failed):
        (a) **Read** the next file in priority order
        (`AI/tutorials/` → `AI/developer_guides/` → `papers/` →
        `vortex_torch/flow/algorithms.py` →
@@ -592,9 +624,9 @@ SUBMISSION_WRITER = dedent("""\
        `summary_submissions/<tag>/<stem>/latest.json` as soon as
        it finishes; read those that have landed and start filling §2.
        Close the §1 row once all 4 are in; update §3/§4/§5.
-    8. **Failure handling.** If pre-flight fails for a variant, fix
-       it in place. If a child's `*.err` log shows a traceback or
-       its summary JSON is missing after `wait`, open
+    9. **Failure handling.** If pre-flight or RULER filter fails for
+       a variant, fix it in place. If a child's `*.err` log shows a
+       traceback or its summary JSON is missing after `wait`, open
        `$LOGDIR/gpu<i>_<stem>.err` for the failing child, diagnose,
        and incorporate the lesson into memory.md §4 before
        respinning.
@@ -902,7 +934,23 @@ CMD_BATCH_BENCHMARK = dedent("""\
     Refuse to launch any submission whose preflight failed — fix the
     failing variant first.
 
-    Step 3 — launch the 4 variants in waves of `PARALLEL = min(N, 4)`,
+    Step 3 — RULER pre-filter (quick quality gate, ≥ 0.85). Run
+    `algorithm_scientist/run_ruler.py` on each variant sequentially on
+    one free GPU. Any variant scoring below **0.85 accuracy** on
+    `examples/validation.jsonl` has structurally broken attention — fix
+    it (widen `vortex_topk_val`/`vortex_topk_ratio` or revise the
+    indexer), re-pre-flight, and re-run RULER until all 4 pass before
+    launching AIME24.
+    ```bash
+    for name in "${NAMES[@]}"; do
+        CUDA_VISIBLE_DEVICES=${FREE_GPUS[0]} \\
+            python algorithm_scientist/run_ruler.py --config "submissions/${TAG}/${name}.json"
+    done
+    ```
+    Results land in `summary_ruler_submissions/<tag>/<name>/latest.json`.
+    Refuse to launch any variant whose RULER accuracy < 0.85.
+
+    Step 4 — launch the 4 variants in waves of `PARALLEL = min(N, 4)`,
     each pinned to a *free* GPU index (NOT 0…N-1), with `wait`
     between waves so a wave's GPUs are free before the next reuses
     them:
@@ -934,18 +982,20 @@ CMD_BATCH_BENCHMARK = dedent("""\
     becomes `summary_submissions/<tag>/batch_<x>_id<y>/...` — per-agent
     isolation, no collisions across agents that pick the same stem.)
 
-    Step 4 — append a row to `algorithm_scientist/memory.md` §1
+    Step 5 — append a row to `algorithm_scientist/memory.md` §1
     *In-flight batches* the moment you launch:
     `| <tag> | <batch_id> | <UTC time> | <LOGDIR> | <name1>,…,<name4> | RUNNING |`
 
-    Step 5 — while waiting (the batch takes **8+ hours** when fully
-    parallel, longer with `N < 4`), do NOT idle. Spend the time
+    Step 6 — while waiting (the batch takes **20–60 minutes** when fully
+    parallel, longer with `N < 4` due to sequential waves; **kill any
+    child still running after 60 minutes** — log the error in
+    memory.md §4 and treat that variant as failed), do NOT idle. Spend the time
     reading tutorials / developer guides / source, or designing the
     next batch (don't launch — concurrent batches OOM the shared
     GPUs), or analysing children that have already produced their
     `latest.json`. See AGENTS.md §5d.
 
-    Step 6 — once the outer `wait` loop returns (all waves done):
+    Step 7 — once the outer `wait` loop returns (all waves done):
 
     - **Success** → for each `<nameI>`, read
       `summary_submissions/<tag>/<nameI>/latest.json`. Produce a comparison
@@ -957,7 +1007,7 @@ CMD_BATCH_BENCHMARK = dedent("""\
       the table + a 1-3 sentence takeaway naming each frontier
       variant and where it sits relative to the running §5 best, to
       `algorithm_scientist/memory.md` §2 *Completed batches*; remove
-      the row you added in step 4 from §1.
+      the row you added in step 5 from §1.
     - **Failure** → any child whose process exited non-zero (or
       whose `latest.json` is missing / older than `$LOGDIR`'s
       timestamp) wrote its traceback to
@@ -1014,15 +1064,20 @@ CMD_ITERATE = dedent("""\
       this session). The positional `$1` argument is the *theme tag*
       for memory.md attribution; it is **not** the agent tag (the
       agent tag is auto-detected from the model name).
-    - Pre-flights all 4 variants locally, then runs them in waves of
-      `min(N, 4)` background `python algorithm_scientist/run_submission_aime24.py`
-      processes pinned to the free GPU indices
+    - Pre-flights all 4 variants locally, then runs the RULER pre-filter
+      (`algorithm_scientist/run_ruler.py`) on each variant; any variant
+      scoring below **0.85 accuracy** must be fixed before launch. Then
+      runs the passing variants in waves of `min(N, 4)` background
+      `python algorithm_scientist/run_submission_aime24.py` processes
+      pinned to the free GPU indices
       (`CUDA_VISIBLE_DEVICES=${FREE_GPUS[$((y - start))]}`) with
       `wait` between waves. Re-detects free GPUs immediately before
-      launch in case the set shifted during pre-flight.
+      launch in case the set shifted during pre-flight/RULER.
     - Honours the concurrency cap: **one** batch at a time on the
       GPUs it targets; if `free_gpus.sh` returns nothing, hard wait.
-    - During the 8+ hr wait, alternates between reading source,
+    - During the 20–60 min wait (kills any child still running after
+      60 min and logs the error in memory.md §4), alternates between
+      reading source,
       designing the next batch (without launching), and analysing
       children whose `latest.json` has already landed.
     - Reads `summary_submissions/<name>/latest.json` and updates
@@ -1033,8 +1088,21 @@ CMD_ITERATE = dedent("""\
       python algorithm_scientist/auto_agent.py --submission-name $1 $ARGUMENTS
     ```
 
-    (`$ARGUMENTS` forwards every extra flag the user supplies, e.g.
-    `--max-iterations 12 --baseline-throughput 5500`.)
+    `$ARGUMENTS` forwards every extra flag the user supplies. The most
+    important one is **`--max-iterations <N>`** (default: 5), which caps
+    the number of 4-variant batches the agent will launch this session.
+    The loop enforces the cap automatically — once `N` batches have been
+    launched the agent is sent a stop signal and asked for a final summary.
+    Set to a large number (e.g. `--max-iterations 99`) for effectively
+    unlimited runs. Example:
+
+    ```bash
+    ANTHROPIC_API_KEY=... \\
+      python algorithm_scientist/auto_agent.py \\
+        --submission-name my_run \\
+        --max-iterations 3 \\
+        --baseline-throughput 5500
+    ```
 
     Tail the live log printed to stdout. Every turn, tool call, and
     tool result is also persisted to `logs/auto_agent/$1_*.jsonl`.

@@ -11,8 +11,10 @@ start the first batch.
 
 1. Open a fresh Claude Code session in this repo (`cd
    /home/zhuominc/new_envs/vortex_new/vortex_torch`, then `claude`).
-2. Paste the entire block below as your first message.
-3. The agent will reply with its chosen tag, then proceed
+2. Set `MAX_ITERATIONS` at the top of the prompt block to the number
+   of batches you want this session (e.g. `3`). Set to `0` for no limit.
+3. Paste the entire block below as your first message.
+4. The agent will reply with its chosen tag, then proceed
    autonomously: design batch → pre-flight → `/batch-benchmark` →
    wait + read/invent/design/analyse → loop.
 
@@ -23,11 +25,17 @@ You don't need to add anything else. The prompt is self-contained.
 ## Prompt — paste this into Claude Code
 
 ```
+# ── USER SETTINGS (edit before pasting) ──────────────────────────
+MAX_ITERATIONS = 3   # stop after this many batches (set to 0 = unlimited)
+# ─────────────────────────────────────────────────────────────────
+
 You are an algorithm scientist iterating on vortex_torch sparse-attention
 submissions. Your goal: maximise AIME24 decoding throughput while
 keeping mean@16 above the quality floor. Operate the full
 long-horizon iterate loop autonomously — do not ask me to confirm
-each step.
+each step. Run at most MAX_ITERATIONS batches this session (0 = no limit);
+count each launched batch and stop autonomously when the budget is
+reached.
 
 Bootstrap (do these in order; each file once):
 
@@ -96,8 +104,19 @@ Iterate loop (repeat until I say stop):
        done
    Drop or fix any failing variant before launch.
 
+6b. RULER pre-filter (≥ 0.85). Run on one free GPU, sequentially:
+       for y in 0 1 2 3; do
+         CUDA_VISIBLE_DEVICES=${FREE_GPUS[0]} \
+           python algorithm_scientist/run_ruler.py \
+             --config "submissions/<tag>/batch_<x>_id${y}.json"
+       done
+   Any variant scoring below 0.85 accuracy on
+   examples/validation.jsonl has structurally broken attention —
+   widen vortex_topk_val/vortex_topk_ratio or fix the indexer,
+   re-pre-flight, and re-run RULER until all 4 pass.
+
 7. Re-detect free GPUs immediately before launch (the set may have
-   shifted during pre-flight) and recompute
+   shifted during pre-flight/RULER) and recompute
    `PARALLEL = min(N, 4)`. The batch size stays at 4 — `N < 4`
    just means more waves, not fewer variants. Launch via the
    /batch-benchmark slash command, passing all 4 names:
@@ -106,8 +125,13 @@ Iterate loop (repeat until I say stop):
    `PARALLEL = min(N, 4)`, pinning each to FREE_GPUS within its
    wave. Add a row to memory.md §1.
 
-8. While the batch runs (8+ hours fully parallel; longer with
-   `N < 4`), on each polling cycle do exactly ONE of:
+8. While the batch runs (20–60 min fully parallel; longer with
+   `N < 4` due to sequential waves), on each polling cycle do
+   exactly ONE of:
+   **Kill any child still running after 60 min** — it has likely
+   stalled. Use `kill %<job>` or `pkill -f run_submission_aime24`
+   then treat that variant as failed and log the error in
+   memory.md §4.
    (a) read the next file in priority order
        (AI/tutorials → AI/developer_guides → papers/ →
         vortex_torch/flow/algorithms.py → vortex_torch/{indexer,cache}/* → csrc/);
@@ -131,7 +155,13 @@ Iterate loop (repeat until I say stop):
    (hypotheses) / §4 (anti-patterns) / §5 (winners) as the
    evidence lands.
 
-10. Loop back to step 4.
+10. Check iteration budget: count the number of batches you have
+    launched this session (each /batch-benchmark call = 1 batch).
+    - If MAX_ITERATIONS > 0 AND batches_launched >= MAX_ITERATIONS:
+      stop. Write a final 2-paragraph summary naming the best
+      submission (name, content_hash, mean@16, throughput, key
+      design decisions) and update memory.md §8 with session notes.
+    - Otherwise: loop back to step 4.
 
 Hard rules (the framework will reject violations):
 - No native torch ops inside create_cache / forward_cache /
