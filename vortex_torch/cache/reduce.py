@@ -2,15 +2,15 @@ import torch
 from ..abs import vOp, vTensor, FORMAT
 from .context import Context
 from ..utils import ReduceType, QuantizationType, Schedule
-from typing import Tuple, Dict, Optional
+from typing import Optional
 
 
 class Reduce(vOp):
     r"""
-    Generic reduction dispatcher over the last two logical axes.
+    Generic reduction op over the last two logical axes.
 
-    This dispatcher covers a family of reductions (mean/max/min/L2-norm/sum,
-    etc.) on rank-3 tensors. The input is treated as
+    Covers a family of reductions (mean/max/min/L2-norm/sum, etc.) on
+    rank-3 tensors
 
     .. math::
 
@@ -40,38 +40,13 @@ class Reduce(vOp):
     The exact reduction operation (mean, max, min, L2-norm, sum, etc.) is
     encoded in :attr:`reduce_type` and interpreted by the implementation.
 
-    Dispatch is based on the pair of tensor formats
-    ``(x_format, o_format)`` and a registry mapping:
-
-    .. code-block:: text
-
-        (x_format, o_format) -> (impl, resolved_output_format)
-
-    Policy
-    ------
-    - If ``output`` is ``None``:
-
-      - :meth:`profile` selects an implementation for
-        ``(x_fmt, FORMAT.RAGGED)`` (i.e. with RAGGED output).
-      - An internal buffer is allocated with logical shape
-        ``[B, exp_N, exp_D]``, where:
-
-        - for ``dim == 1``: ``exp_N = 1``, ``exp_D = D``,
-        - for ``dim == 2``: ``exp_N = N``, ``exp_D = 1``.
-
-    - If ``output`` is provided:
-
-      - :meth:`profile` requires an exact implementation key for
-        ``(x_fmt, o_fmt)``.
-      - The shape of ``output`` must match the expected
-        ``(exp_N, exp_D)`` given :attr:`dim`.
-      - Device consistency is enforced between ``x`` and ``output``.
+    Output format rule: if a caller-provided ``output`` is supplied with
+    ``PAGED`` format, the output is ``PAGED``; in every other case the
+    output is ``RAGGED``. Format compatibility is enforced by the
+    compiler's per-block kernel.
 
     Attributes
     ----------
-    _impl_map : Dict[Tuple[FORMAT, FORMAT], FORMAT]
-        Dispatch table keyed by ``(x_format, o_format)``. Each entry
-        maps to the resolved output format.
     dim : int
         Reduction dimension in the logical 3D tensor. Must be either:
 
@@ -84,13 +59,6 @@ class Reduce(vOp):
     output_buffer : Optional[vTensor]
         Pure-metadata vTensor descriptor for the output (graph node).
     """
-
-    _impl_map: Dict[Tuple[FORMAT, FORMAT], FORMAT] = {
-        (FORMAT.PAGED,  FORMAT.PAGED):  FORMAT.PAGED,
-        (FORMAT.RAGGED, FORMAT.PAGED):  FORMAT.PAGED,
-        (FORMAT.PAGED,  FORMAT.RAGGED): FORMAT.RAGGED,
-        (FORMAT.RAGGED, FORMAT.RAGGED): FORMAT.RAGGED,
-    }
 
     def __init__(self, dim: int = 1):
         super().__init__()
@@ -128,17 +96,8 @@ class Reduce(vOp):
             return QuantizationType.FP8_E4M3
         raise ValueError(f"{prefix}unsupported dtype {x.dtype} for reduction")
 
-    def _infer_output_format_ragged(self, x_fmt: FORMAT) -> FORMAT:
-        """Pick the RAGGED-output dispatch entry for ``x_fmt``."""
-        key = (x_fmt, FORMAT.RAGGED)
-        assert key in self._impl_map, (
-            f"{self._prefix()}no RAGGED-output implementation for x_fmt={x_fmt}. "
-            f"Available keys: {list(self._impl_map.keys())}"
-        )
-        return self._impl_map[key]
-
     # --------------------------------------------------------------------- #
-    # profile: validate, pick impl/format, and return the provided vTensor
+    # profile: validate, pick format, and return the provided vTensor
     # --------------------------------------------------------------------- #
     def profile(
         self, x: vTensor, output: Optional[vTensor], loc: torch.Tensor, ctx: Context
@@ -189,8 +148,7 @@ class Reduce(vOp):
         Raises
         ------
         AssertionError
-            If types, ranks, formats, shapes, or devices are incompatible,
-            or if no implementation is found in :attr:`_impl_map`.
+            If types, ranks, shapes, or devices are incompatible.
         """
         prefix = self._prefix()
 
@@ -199,19 +157,17 @@ class Reduce(vOp):
         assert isinstance(loc, torch.Tensor), f"{prefix}loc must be torch.Tensor, got {type(loc)}"
         assert x.dim() == 3, f"{prefix}x must be 3D, got ndim={x.dim()} shape={tuple(x.shape)}"
 
-        x_fmt = x._format
-
         # Compute expected output (N, D) given reduction dim
         # dim==1 -> reduce rows: keep D, set N=1
         # dim==2 -> reduce cols: keep N, set D=1
         exp_N = 1 if self.dim == 1 else x.shape[1]
         exp_D = 1 if self.dim == 2 else x.shape[2]
 
-        # Case A: output not provided -> pick RAGGED output and build a
-        # pure-metadata vTensor in ``ctx.vortex_dtype`` (the intermediate
-        # dtype used by the cache pipeline, default bf16).
+        # Case A: output not provided -> allocate a RAGGED metadata buffer
+        # in ``ctx.vortex_dtype`` (the intermediate dtype used by the cache
+        # pipeline, default bf16).
         if output is None:
-            self.output_format = self._infer_output_format_ragged(x_fmt)
+            self.output_format = FORMAT.RAGGED
             self.quantization_type = self._resolve_quantization(x)
 
             B = ctx.max_new_tokens_per_batch * ctx.head_num
@@ -229,19 +185,15 @@ class Reduce(vOp):
             ctx.op_to_output_tensor_list.append([self.output_buffer.tensor_id])
             return self.output_buffer
 
-        # Case B: output provided -> validate and pick exact impl by (x_fmt, o_fmt)
+        # Case B: output provided -> output_format follows output._format.
         assert isinstance(output, vTensor), f"{prefix}output must be vTensor, got {type(output)}"
         assert output.dim() == 3, (
             f"{prefix}output must be 3D, got ndim={output.dim()} shape={tuple(output.shape)}"
         )
-
-        o_fmt = output._format
-        key = (x_fmt, o_fmt)
-        assert key in self._impl_map, (
-            f"{prefix}no implementation for (x_fmt={x_fmt}, o_fmt={o_fmt}). "
-            f"Available keys: {list(self._impl_map.keys())}"
+        assert output._format in (FORMAT.PAGED, FORMAT.RAGGED), (
+            f"{prefix}output._format must be PAGED or RAGGED, got {output._format}"
         )
-        self.output_format = self._impl_map[key]
+        self.output_format = output._format
 
         # Shape checks per reduction dim
         if self.dim == 1:

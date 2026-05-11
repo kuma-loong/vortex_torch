@@ -33,20 +33,16 @@ from typing import Any, Dict, Optional, Tuple
 from transformers import AutoTokenizer
 
 import vortex_torch  # noqa: F401  — registers the attention backend
-from vortex_torch.engine.sgl import check_engine_config, get_engine
+from vortex_torch.engine.sgl import MODEL_PATH, check_engine_config, get_engine
 
 
 # ---------------------------------------------------------------------------
 # Fixed benchmark protocol — do not change
 # ---------------------------------------------------------------------------
 
-MODEL_NAME                  = "Qwen/Qwen3-1.7B"
 MAX_NEW_TOKENS              = 64
 DATA_PATH                   = "examples/validation.jsonl"
 SUMMARY_DIR                 = "summary_ruler_submissions"
-
-MEM_FRACTION_STATIC_DEFAULT = 0.8
-MEM_FRACTION_STATIC_RANGE   = (0.5, 0.95)
 
 
 # ---------------------------------------------------------------------------
@@ -60,36 +56,18 @@ def _load_and_validate_config(config_path: Path) -> Dict[str, Any]:
     return config
 
 
-def _resolve_mem_fraction_static(config: Dict[str, Any]) -> float:
-    raw = config.get("mem_fraction_static", MEM_FRACTION_STATIC_DEFAULT)
-    try:
-        val = float(raw)
-    except (TypeError, ValueError) as e:
-        raise ValueError(
-            f"mem_fraction_static must be a number, got {raw!r}"
-        ) from e
-    lo, hi = MEM_FRACTION_STATIC_RANGE
-    if not (lo <= val <= hi):
-        raise ValueError(
-            f"mem_fraction_static={val} is out of allowed range [{lo}, {hi}]. "
-            f"Hint: 0.8-0.9 is typical; higher values often raise throughput "
-            f"but risk CUDA OOM."
-        )
-    return val
-
-
 def _build_engine_kwargs(config: Dict[str, Any]) -> Dict[str, Any]:
-    kwargs = dict(config)
-    kwargs["model_path"]          = MODEL_NAME
-    kwargs["mem_fraction_static"] = _resolve_mem_fraction_static(kwargs)
-    return kwargs
+    """Pass the submission JSON through; :func:`get_engine`'s defaults
+    fill in anything (``model_path``, ``mem_fraction_static``, …) the
+    JSON omits."""
+    return dict(config)
 
 
 def _boot_engine(kwargs: Dict[str, Any]):
-    print(f"[engine] booting — model={kwargs['model_path']}, "
+    print(f"[engine] booting — model={kwargs.get('model_path', '<default>')}, "
           f"module={kwargs.get('vortex_module_name')}, "
           f"kv={kwargs.get('kv_cache_dtype', 'auto')}, "
-          f"mem_fraction_static={kwargs['mem_fraction_static']}")
+          f"mem_fraction_static={kwargs.get('mem_fraction_static', '<default>')}")
     return get_engine(**kwargs)
 
 
@@ -152,8 +130,11 @@ def run(config_path: Path) -> Dict[str, Any]:
     engine_kwargs = _build_engine_kwargs(config)
     llm           = _boot_engine(engine_kwargs)
 
+    # The tokenizer must match the model the engine actually booted with.
+    tokenizer_model = engine_kwargs.get("model_path") or MODEL_PATH
+
     inputs, gold_answers = _load_ruler_data(Path(DATA_PATH))
-    prompts = _build_prompts(inputs, MODEL_NAME)
+    prompts = _build_prompts(inputs, tokenizer_model)
 
     sampling_params = {
         "temperature":    0.6,
@@ -171,9 +152,9 @@ def run(config_path: Path) -> Dict[str, Any]:
         "config_path":         str(config_path),
         "vortex_module_name":  config.get("vortex_module_name"),
         "vortex_module_path":  config.get("vortex_module_path"),
-        "model_name":          MODEL_NAME,
+        "model_path":          tokenizer_model,
         "max_new_tokens":      MAX_NEW_TOKENS,
-        "mem_fraction_static": engine_kwargs["mem_fraction_static"],
+        "mem_fraction_static": engine_kwargs.get("mem_fraction_static"),
         "data_path":           DATA_PATH,
     }
     return summary

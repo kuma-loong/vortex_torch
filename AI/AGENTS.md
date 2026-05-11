@@ -308,7 +308,7 @@ values that suit your flow. The ones that need special care:
 | `vortex_layers_skip` | list of layer ids that bypass sparse attention (run dense). See "Layer-skip patterns" below. |
 | `vortex_dtype` | dtype for **intermediate** tensors. **Recommended: `"bfloat16"`.** Other accepted values: `"float16"`, `"float32"`, `"fp8_e5m2"`, `"fp8_e4m3"` — use only if you have a specific reason; bf16 is the tested default. |
 | `kv_cache_dtype` | dtype for the **K/V cache itself**. Choose from: `"auto"` (resolves to bfloat16), `"fp8_e4m3"`, or `"fp8_e5m2"`. Using fp8 halves cache memory at the cost of numerical precision; bf16 via `"auto"` is the safe default. |
-| `mem_fraction_static` | fraction of GPU memory sglang reserves for KV cache + model weights. Float in `[0.5, 0.95]` (out-of-range values are rejected at engine-boot). **Default 0.8.** Higher values usually raise throughput by enabling larger decode batches, but raise the risk of CUDA OOM mid-run. **Sweet spot 0.8-0.9.** Try `0.85` first; if it runs cleanly, push toward `0.9` / `0.95`. If you OOM, drop back by 0.05. |
+| `mem_fraction_static` | fraction of GPU memory sglang reserves for KV cache + model weights. Float. **Default 0.8** (lives in `get_engine`). Higher values usually raise throughput by enabling larger decode batches, but raise the risk of CUDA OOM mid-run. **Sweet spot 0.8-0.9.** Try `0.85` first; if it runs cleanly, push toward `0.9` / `0.95`. If you OOM, drop back by 0.05. |
 | `disable_radix_cache` | bool. **Default `false`.** **REQUIRED `true` if your `forward_indexer` uses `Save(...)`** (i.e. persistent per-request state via `Save`/`Load`). sglang's prefix-radix cache otherwise reuses KV across requests sharing a prompt prefix — for normal flows that's free throughput, but for `Save`/`Load` flows it shares per-request state across requests and corrupts your Save'd values. Pre-flight rejects the violation. Don't set it for non-`Save` flows: leaving it `false` lets the prefix cache help you. |
 
 ### Budget semantics (`vortex_topk_val`, `vortex_topk_ratio`)
@@ -426,9 +426,10 @@ not.
 ## 5. Before you submit — verify compilation
 
 After writing your flow, **run the pre-flight check**. It validates
-the JSON, loads your module, and runs a small compile sweep. It
-catches most shape/dispatch mistakes before sglang ever touches a
-GPU:
+the JSON, loads your module, downloads (or reads locally) the
+HuggingFace `config.json` for the target model, and runs a compile
+pass at the model's actual `(G, num_kv_heads, head_dim)`. It catches
+most shape/dispatch mistakes before sglang ever touches a GPU:
 
 ```python
 from vortex_torch.engine.sgl import check_engine_config
@@ -444,8 +445,9 @@ failures and what they mean:
 | `must not declare 'k' key` | you put `"k"` in `create_cache` |
 | `must be a positive power of 2` | `vortex_block_size` or `vortex_workload_chunk_size` isn't a power of 2 |
 | `does not contain @register` | `vortex_module_name` doesn't match the string in `@register(...)` |
-| `failed to build vFlow` | typically a shape mismatch or a wrong `_impl_map` key — read the traceback |
+| `failed to build vFlow` | typically a shape mismatch (or, for custom kernels like `Save` / `Load` / `topK` / `Softmax`, a missing `_impl_map` key) — read the traceback |
 | `vortex_module_path ... not found` | file path in the JSON is wrong |
+| `failed to fetch config.json from HuggingFace repo` | the model named by `model_path` isn't reachable; check the repo ID or pre-populate `~/.cache/huggingface/hub` |
 
 ---
 

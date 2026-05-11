@@ -416,8 +416,13 @@ When you sketch a new `vFlow`, walk through these in order:
 
 1. **Indexer inputs**: `q` is BATCHED `[B, H_q, D]`; every cache field
    is PAGED `[S, r, c]` with `(r, c)` declared by `create_cache`.
-2. **Indexer dispatch**: for every op, look up its `_impl_map`. For each
-   input pair, what's the resolved output format?
+2. **Indexer output format**: compiler-generated ops (every op except
+   `Save` / `Load`, `topK` / `approxTopK`, `Softmax` / `Normalize` /
+   `Conv1d`, and `Reduce(dim=0)`) derive their output format inline:
+   `BATCHED` iff every input is `BATCHED`, else `RAGGED`. The custom
+   kernels listed above still use an explicit `_impl_map` /
+   `_supported_formats` table — check the table when you mix
+   formats into one of them.
 3. **Score contract**: the indexer chain *must* terminate in a RAGGED
    `[S, 1, 1]` score handed to `topK(score, o)`. Fold extra `H_q` / `D`
    axes with `Mean` / `Max` / `Sum`.
@@ -428,10 +433,11 @@ When you sketch a new `vFlow`, walk through these in order:
    support `(RAGGED, BATCHED) → RAGGED`).
 5. **Cache inputs**: every cache field is PAGED `[B, r, c]` (the per-block
    view; `B` here is the program's single block). No BATCHED. No `q`.
-6. **Cache dispatch**: cache `_impl_map`s are keyed on triples
-   `(x_fmt, y_fmt, o_fmt)`. Inputs are PAGED; outputs are PAGED (writes
-   into a cache field) or RAGGED (intermediate within the fused
-   per-block kernel).
+6. **Cache output format**: the output is `PAGED` iff the caller
+   passed an `output=cache["..."]` argument with `PAGED` format
+   (writing back into a cache field), otherwise `RAGGED` (an
+   auto-allocated intermediate within the fused per-block kernel).
+   No `_impl_map` dispatch — just the caller's choice.
 7. **Cache restriction**: `Reduce(dim=0)` is forbidden — there's no
    cross-block aggregation in one cache pass.
 8. **Schedule barriers**: every `Schedule.S` op (`topK`, `Softmax`,

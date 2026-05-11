@@ -2,14 +2,13 @@ import torch
 from ..abs import vOp, vTensor, FORMAT
 from .context import Context
 from ..utils import ElementwiseOpType, Schedule
-from typing import Tuple, Dict, Optional
+from typing import Optional
 
 class Elementwise(vOp):
     r"""
-    Unary elementwise operator dispatcher (e.g. ReLU/Sigmoid/SiLU/Abs/Affine).
+    Unary elementwise op (e.g. ReLU/Sigmoid/SiLU/Abs/Affine).
 
-    This class dispatches a family of unary elementwise operations on
-    rank-3 tensors. The input is treated as
+    Operates on rank-3 tensors
 
     .. math::
 
@@ -29,33 +28,16 @@ class Elementwise(vOp):
 
         Y[b, n, d] = f(X[b, n, d]; \alpha, \beta, \text{op_type}),
 
-    where the actual function :math:`f` is selected by :attr:`op_type`,
-    and may make use of scalar parameters :attr:`alpha` and :attr:`beta`
-    (for example, in affine or activation variants).
+    where the actual function :math:`f` is selected by :attr:`op_type`.
 
-    Dispatch is based on the pair of tensor formats
-    ``(x_format, o_format)`` and a registry mapping:
-
-    .. code-block:: text
-
-        (x_format, o_format) -> (impl, resolved_output_format)
-
-    Policy
-    ------
-    - If ``output`` is ``None``, :meth:`profile` selects an implementation
-      with ``o_format == FORMAT.RAGGED``, allocates an internal buffer
-      of logical shape ``[B, N, D]``, and returns a ``vTensor`` view.
-    - If ``output`` is provided, :meth:`profile` requires an exact
-      ``(x_fmt, o_fmt)`` mapping in :attr:`_impl_map` and validates
-      shape/device consistency.
-    - The logical (``N, D``) axes are preserved by design; only the
-      leading ``B`` comes from the runtime context.
+    Output format rule: if a caller-provided ``output`` is supplied with
+    ``PAGED`` format, the output is ``PAGED``; in every other case
+    (``output is None``, or ``output._format == RAGGED``) the output is
+    ``RAGGED``. Format compatibility is enforced by the compiler's
+    per-block kernel.
 
     Attributes
     ----------
-    _impl_map : Dict[Tuple[FORMAT, FORMAT], FORMAT]
-        Dispatch table keyed by ``(x_format, o_format)``. Each entry
-        maps to the resolved output format.
     alpha : float
         Scalar parameter used by certain unary ops.
     beta : float
@@ -68,13 +50,6 @@ class Elementwise(vOp):
         Pure-metadata vTensor descriptor for the output (graph node).
     """
 
-    _impl_map: Dict[Tuple[FORMAT, FORMAT], FORMAT] = {
-        (FORMAT.PAGED,  FORMAT.PAGED):  FORMAT.PAGED,
-        (FORMAT.PAGED,  FORMAT.RAGGED): FORMAT.RAGGED,
-        (FORMAT.RAGGED, FORMAT.PAGED):  FORMAT.PAGED,
-        (FORMAT.RAGGED, FORMAT.RAGGED): FORMAT.RAGGED,
-    }
-
     def __init__(self, alpha: float = 0.0, beta: float = 1.0):
         super().__init__()
         self.alpha = alpha
@@ -86,49 +61,33 @@ class Elementwise(vOp):
         # token-driven kernel — see ``cache.compiler.triton_impl.kernel_gen``.
         self.schedule = Schedule.W
 
-    # ------------------------------ helpers ------------------------------ #
-    def _infer_output_format_ragged(self, x_fmt: FORMAT) -> FORMAT:
-        """Pick the RAGGED-output dispatch entry; used when ``output is None``."""
-        key = (x_fmt, FORMAT.RAGGED)
-        assert key in self._impl_map, (
-            f"{self._prefix()}no RAGGED-output implementation for x_fmt={x_fmt}. "
-            f"Available keys: {list(self._impl_map.keys())}"
-        )
-        return self._impl_map[key]
-
     # --------------------------------------------------------------------- #
-    # profile: validate, select impl/format, and optionally allocate output
+    # profile: validate and optionally allocate output
     # --------------------------------------------------------------------- #
     def profile(
         self, x: vTensor, output: Optional[vTensor], loc: torch.Tensor, ctx: Context
     ) -> vTensor:
         r"""
-        Validate inputs, select implementation and output format, and
-        optionally allocate an internal output buffer.
+        Validate inputs and optionally allocate an internal output buffer.
 
         The input tensor ``x`` is expected to have logical shape
-        ``[B, N, D]``. The auxiliary tensor ``loc`` carries per-position
-        metadata used by the implementation (for example, mapping positions
-        to segments or other runtime indices); its exact shape and semantics
-        are defined by the kernel.
+        ``[B, N, D]``.
 
-        There are two modes:
+        Two modes:
 
         - **No output provided** (``output is None``):
 
-          - Select an implementation for ``(x._format, FORMAT.RAGGED)``.
-          - Allocate an internal buffer with shape
-            ``[B, N, D]``, where
+          - Allocate an internal RAGGED buffer with shape ``[B, N, D]``,
+            where
 
             .. math::
 
-                B = \text{ctx.max_new_tokens_per_batch} \times \text{ctx.head_num},
-
-          - Wrap it as a :class:`vTensor` with the resolved output format.
+                B = \text{ctx.max_new_tokens_per_batch} \times \text{ctx.head_num}.
 
         - **Output provided** (``output is not None``):
 
-          - Require an exact mapping for ``(x._format, output._format)``.
+          - Take the format directly from ``output._format`` (must be
+            ``PAGED`` or ``RAGGED``).
           - Validate that ``output`` has rank 3 and preserves the
             ``(N, D)`` dimensions of ``x``.
           - Validate device consistency between ``x`` and ``output``.
@@ -140,9 +99,9 @@ class Elementwise(vOp):
 
         output : Optional[vTensor]
             Optional preallocated output tensor. If ``None``, an internal
-            buffer is allocated; otherwise, this tensor must have shape
-            ``[B_out, N, D]`` for some ``B_out`` and a format compatible
-            with :attr:`_impl_map`.
+            RAGGED buffer is allocated; otherwise, this tensor must have
+            shape ``[B_out, N, D]`` for some ``B_out`` and a format in
+            ``{PAGED, RAGGED}``.
 
         loc : torch.Tensor
             Auxiliary tensor carrying per-position metadata required by
@@ -163,8 +122,7 @@ class Elementwise(vOp):
         Raises
         ------
         AssertionError
-            If types, ranks, formats, shapes, or devices are incompatible,
-            or if no implementation is found in :attr:`_impl_map`.
+            If types, ranks, shapes, or devices are incompatible.
         """
         prefix = self._prefix()
 
@@ -173,13 +131,11 @@ class Elementwise(vOp):
         assert isinstance(loc, torch.Tensor), f"{prefix}loc must be torch.Tensor, got {type(loc)}"
         assert x.dim() == 3, f"{prefix}x must be 3D, got ndim={x.dim()} shape={tuple(x.shape)}"
 
-        x_fmt = x._format
         N, D = x.shape[1], x.shape[2]
 
-        # Case A: output not provided -> pick RAGGED-output impl, construct
-        # a pure-metadata vTensor, and register it in the cache graph.
+        # Case A: output not provided -> allocate a RAGGED metadata buffer.
         if output is None:
-            self.output_format = self._infer_output_format_ragged(x_fmt)
+            self.output_format = FORMAT.RAGGED
 
             B = ctx.max_new_tokens_per_batch * ctx.head_num
             self.output_buffer = vTensor(
@@ -196,20 +152,17 @@ class Elementwise(vOp):
             ctx.op_to_output_tensor_list.append([self.output_buffer.tensor_id])
             return self.output_buffer
 
-        # Case B: output provided -> validate and select exact impl
+        # Case B: output provided -> output_format follows output._format
+        # (PAGED iff caller supplied a PAGED tensor; otherwise RAGGED).
         assert isinstance(output, vTensor), f"{prefix}output must be vTensor, got {type(output)}"
         assert output.dim() == 3, (
             f"{prefix}output must be 3D, "
             f"got ndim={output.dim()} shape={tuple(output.shape)}"
         )
-
-        o_fmt = output._format
-        key = (x_fmt, o_fmt)
-        assert key in self._impl_map, (
-            f"{prefix}no implementation for (x_fmt={x_fmt}, o_fmt={o_fmt}). "
-            f"Available keys: {list(self._impl_map.keys())}"
+        assert output._format in (FORMAT.PAGED, FORMAT.RAGGED), (
+            f"{prefix}output._format must be PAGED or RAGGED, got {output._format}"
         )
-        self.output_format = self._impl_map[key]
+        self.output_format = output._format
 
         # Shape consistency: unary elementwise keeps (N,D)
         assert output.shape[1] == N and output.shape[2] == D, (

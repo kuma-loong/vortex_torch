@@ -1,17 +1,15 @@
 import torch
-from typing import Dict, Optional
+from typing import Optional
 from .context import Context
 from ..abs import vTensor, FORMAT, vOp
 from ..utils import ReduceType, Schedule
 
 class Reduce(vOp):
     r"""
-    Generic reduction dispatcher for rank-3 logical tensors ``[N, D_0, D_1]``.
+    Generic reduction op for rank-3 logical tensors ``[N, D_0, D_1]``.
 
-    This operator performs a 1D reduction over either the ``D_0`` or ``D_1``
-    axis of a 3D tensor. The leading dimension ``N`` is generic and may
-    represent a batch axis (``B``) or a sequence/page axis (``S``); the
-    reduction is applied independently for each of the ``N`` slices.
+    This operator performs a 1D reduction over the leading ``N`` axis,
+    the ``D_0`` axis, or the ``D_1`` axis of a 3D tensor.
 
     Given an input tensor
 
@@ -22,6 +20,10 @@ class Reduce(vOp):
     the output logical shape depends on the configured reduction dimension
     ``dim``:
 
+    - ``dim == 0`` (reduce over the packed leading axis):
+      collapses ``N`` to one row per ``(batch, kv_head)``; produces a
+      ``BATCHED`` output (custom standalone kernel, requires
+      ``RAGGED`` input).
     - ``dim == 1`` (reduce over :math:`D_0`):
 
       .. math::
@@ -34,22 +36,19 @@ class Reduce(vOp):
 
          \text{out} \in \mathbb{R}^{N \times D_0 \times 1}.
 
+    For ``dim ∈ {1, 2}`` the output is ``BATCHED`` iff the input is
+    ``BATCHED`` (per-row reduction preserves the leading-axis layout);
+    otherwise ``RAGGED``. Format compatibility is enforced by the
+    compiler's per-workload kernel.
+
     The specific reduction operation (e.g. mean, max, min, L2-norm, sum)
     is selected via :attr:`reduce_type`.
 
-    Dispatch is keyed only by the input format ``x._format``.
-
     Attributes
     ----------
-    _impl_map : Dict[FORMAT, FORMAT]
-        Dispatch table keyed by ``x_format``. Each entry maps to the
-        resolved output format.
-
     dim : int
-        Reduction dimension in the logical 3D tensor: must be either
-
-        - ``1`` for reduction over the :math:`D_0` axis, or
-        - ``2`` for reduction over the :math:`D_1` axis.
+        Reduction dimension in the logical 3D tensor: must be ``0``,
+        ``1``, or ``2``.
 
     reduce_type : Optional[ReduceType]
         The type of reduction to perform (e.g. mean, max, min, L2-norm, sum).
@@ -62,15 +61,6 @@ class Reduce(vOp):
         ``[N, out_D0, out_D1]``, where ``out_D0`` and ``out_D1`` depend on
         ``dim`` as described above.
     """
-
-    # Dispatch table for dim in {1, 2} (fused, Schedule.W). dim==0 is a
-    # cross-row reduction (Schedule.S, RAGGED → BATCHED) handled below.
-    _impl_map: Dict[FORMAT, FORMAT] = {
-        FORMAT.RAGGED: FORMAT.RAGGED,
-        FORMAT.BATCHED: FORMAT.BATCHED,
-        # Add more entries if you support other formats:
-        # FORMAT.PAGED: FORMAT.PAGED,
-    }
 
     def __init__(self, dim: int = 1):
         super().__init__()
@@ -134,7 +124,6 @@ class Reduce(vOp):
             f"got ndim={x.dim()} shape={tuple(x.shape)}"
         )
 
-        x_fmt = x._format
         D0, D1 = x.shape[1], x.shape[2]
 
         if self.dim == 0:
@@ -142,17 +131,16 @@ class Reduce(vOp):
             # summary per (batch, kv_head). Input must be RAGGED (per-page or
             # per-token); the compiler allocates a BATCHED buffer with leading
             # dim ``ctx.max_bs * ctx.num_kv_heads`` (see indexer interface).
-            assert x_fmt == FORMAT.RAGGED, (
-                f"{prefix}dim=0 reduce requires RAGGED input, got {x_fmt}"
+            assert x._format == FORMAT.RAGGED, (
+                f"{prefix}dim=0 reduce requires RAGGED input, got {x._format}"
             )
             self.output_format = FORMAT.BATCHED
             out_D0, out_D1 = D0, D1
         else:
-            assert x_fmt in self._impl_map, (
-                f"{prefix}no implementation for x_fmt={x_fmt}. "
-                f"Available keys: {list(self._impl_map.keys())}"
+            # Output is BATCHED iff the input is BATCHED; otherwise RAGGED.
+            self.output_format = (
+                FORMAT.BATCHED if x._format == FORMAT.BATCHED else FORMAT.RAGGED
             )
-            self.output_format = self._impl_map[x_fmt]
             out_D0 = 1 if self.dim == 1 else D0
             out_D1 = 1 if self.dim == 2 else D1
 

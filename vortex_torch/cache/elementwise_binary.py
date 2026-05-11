@@ -2,16 +2,14 @@ import torch
 from ..abs import vOp, vTensor, FORMAT
 from .context import Context
 from ..utils import ElementwiseBinaryOpType, Schedule
-from typing import Tuple, Dict, Optional
+from typing import Optional
 
 
 class Elementwise_Binary(vOp):
     r"""
-    Binary elementwise operator dispatcher
-    (e.g. Maximum / Minimum / AXPBY / Mul).
+    Binary elementwise op (e.g. Maximum / Minimum / AXPBY / Mul).
 
-    This class dispatches a family of binary elementwise operations on
-    rank-3 tensors. The inputs are treated as
+    Operates on rank-3 tensors
 
     .. math::
 
@@ -31,8 +29,8 @@ class Elementwise_Binary(vOp):
     - :math:`D` is broadcastable if ``x.shape[2] == y.shape[2]``,
       or one of them equals ``1``.
 
-    For a given operation type :attr:`op_type`, the dispatcher applies a
-    scalar function
+    For a given operation type :attr:`op_type`, the op applies a scalar
+    function
 
     .. math::
 
@@ -48,44 +46,13 @@ class Elementwise_Binary(vOp):
     where :math:`(n', d')` and :math:`(n'', d'')` are the broadcasted
     indices derived from :math:`(n, d)`.
 
-    Dispatch is based on the triplet of tensor formats
-    ``(x_format, y_format, o_format)`` and a registry mapping:
-
-    .. code-block:: text
-
-        (x_format, y_format, o_format) -> (impl, resolved_output_format)
-
-    Policy
-    ------
-    - If ``output`` is ``None``:
-
-      - :meth:`profile` selects an implementation with
-        ``o_format == FORMAT.RAGGED``, i.e. a key
-        ``(x_fmt, y_fmt, FORMAT.RAGGED)`` in :attr:`_impl_map`.
-      - An internal buffer of shape ``[B, N_out, D_out]`` is allocated,
-        where
-
-        .. math::
-
-            N_{\text{out}} = \max(N_x, N_y), \quad
-            D_{\text{out}} = \max(D_x, D_y),
-
-        and :math:`B` is derived from the runtime context.
-
-    - If ``output`` is provided:
-
-      - :meth:`profile` requires an exact implementation key for
-        ``(x_fmt, y_fmt, o_fmt)``.
-      - The shape of ``output`` must match the broadcasted
-        ``(N_out, D_out)``.
-      - Device consistency is enforced for ``x``, ``y`` and ``output``.
+    Output format rule: if a caller-provided ``output`` is supplied with
+    ``PAGED`` format, the output is ``PAGED``; in every other case the
+    output is ``RAGGED``. Format compatibility is enforced by the
+    compiler's per-block kernel.
 
     Attributes
     ----------
-    _impl_map : Dict[Tuple[FORMAT, FORMAT, FORMAT], FORMAT]
-        Dispatch table keyed by ``(x_format, y_format, o_format)``.
-        Each entry maps to the resolved output format.
-
     alpha : float
         Scalar parameter used by certain binary ops.
     beta : float
@@ -99,17 +66,6 @@ class Elementwise_Binary(vOp):
         Pure-metadata vTensor descriptor for the output (graph node).
     """
 
-    _impl_map: Dict[Tuple[FORMAT, FORMAT, FORMAT], FORMAT] = {
-        (FORMAT.PAGED,  FORMAT.PAGED,  FORMAT.PAGED):  FORMAT.PAGED,
-        (FORMAT.PAGED,  FORMAT.PAGED,  FORMAT.RAGGED): FORMAT.RAGGED,
-        (FORMAT.PAGED,  FORMAT.RAGGED, FORMAT.PAGED):  FORMAT.PAGED,
-        (FORMAT.PAGED,  FORMAT.RAGGED, FORMAT.RAGGED): FORMAT.RAGGED,
-        (FORMAT.RAGGED, FORMAT.PAGED,  FORMAT.PAGED):  FORMAT.PAGED,
-        (FORMAT.RAGGED, FORMAT.PAGED,  FORMAT.RAGGED): FORMAT.RAGGED,
-        (FORMAT.RAGGED, FORMAT.RAGGED, FORMAT.PAGED):  FORMAT.PAGED,
-        (FORMAT.RAGGED, FORMAT.RAGGED, FORMAT.RAGGED): FORMAT.RAGGED,
-    }
-
     def __init__(self, alpha: float = 1.0, beta: float = 1.0):
         super().__init__()
         self.alpha = alpha
@@ -121,50 +77,12 @@ class Elementwise_Binary(vOp):
         # see ``cache.compiler.triton_impl.kernel_gen``.
         self.schedule = Schedule.W
 
-    # ------------------------------ helpers ------------------------------ #
-    def _infer_output_format_ragged(
-        self, x_fmt: FORMAT, y_fmt: FORMAT
-    ) -> FORMAT:
-        r"""
-        Infer an implementation assuming a RAGGED output format.
-
-        This helper is used when :meth:`profile` is called with
-        ``output is None``. It selects an implementation for the key
-        ``(x_fmt, y_fmt, FORMAT.RAGGED)`` in :attr:`_impl_map`.
-
-        Parameters
-        ----------
-        x_fmt : FORMAT
-            Format of the left-hand operand ``x``.
-
-        y_fmt : FORMAT
-            Format of the right-hand operand ``y``.
-
-        Returns
-        -------
-        (Callable, FORMAT)
-            The implementation callable and the resolved output format.
-
-        Raises
-        ------
-        AssertionError
-            If there is no entry for
-            ``(x_fmt, y_fmt, FORMAT.RAGGED)`` in :attr:`_impl_map`.
-        """
-        key = (x_fmt, y_fmt, FORMAT.RAGGED)
-        assert key in self._impl_map, (
-            f"{self._prefix()}no RAGGED-output implementation for "
-            f"(x_fmt={x_fmt}, y_fmt={y_fmt}). Available keys: {list(self._impl_map.keys())}"
-        )
-        return self._impl_map[key]
-
     # ------------------------------------------------------------------ #
     def profile(
         self, x: vTensor, y: vTensor, output: Optional[vTensor], loc: torch.Tensor, ctx: Context
     ) -> vTensor:
         r"""
-        Validate inputs, resolve the implementation and output format,
-        and optionally allocate an internal output buffer.
+        Validate inputs and optionally allocate an internal output buffer.
 
         The input tensors ``x`` and ``y`` are expected to have logical
         shape ``[B, N_x, D_x]`` and ``[B, N_y, D_y]`` respectively,
@@ -174,10 +92,6 @@ class Elementwise_Binary(vOp):
 
             N_{\text{out}} = \max(N_x, N_y), \quad
             D_{\text{out}} = \max(D_x, D_y).
-
-        The auxiliary tensor ``loc`` carries per-position metadata used
-        by the implementation (for example, indices or segment offsets);
-        its shape and semantics are kernel-defined.
 
         Parameters
         ----------
@@ -189,12 +103,11 @@ class Elementwise_Binary(vOp):
 
         output : Optional[vTensor]
             Optional preallocated output tensor. If ``None``, an internal
-            buffer with shape ``[B, N_out, D_out]`` is allocated using
-            ``ctx.max_new_tokens_per_batch * ctx.head_num`` for ``B`` and a
-            RAGGED-output implementation is selected. If not ``None``,
-            this tensor must have rank 3, broadcasted shape
-            ``[B_out, N_out, D_out]`` and a format compatible with
-            :attr:`_impl_map`.
+            RAGGED buffer with shape ``[B, N_out, D_out]`` is allocated
+            using ``ctx.max_new_tokens_per_batch * ctx.head_num`` for
+            ``B``. If not ``None``, this tensor must have rank 3,
+            broadcasted shape ``[B_out, N_out, D_out]`` and format in
+            ``{PAGED, RAGGED}``.
 
         loc : torch.Tensor
             Auxiliary tensor carrying per-position metadata used by the
@@ -207,16 +120,13 @@ class Elementwise_Binary(vOp):
         Returns
         -------
         vTensor
-            A :class:`vTensor` view representing the resolved output:
-            either the provided ``output`` or an internally allocated
-            buffer.
+            A :class:`vTensor` view representing the resolved output.
 
         Raises
         ------
         AssertionError
-            If types, ranks, broadcast conditions, formats, shapes, or
-            devices are incompatible, or if no implementation is found in
-            :attr:`_impl_map`.
+            If types, ranks, broadcast conditions, shapes, or devices are
+            incompatible.
         """
         prefix = self._prefix()
 
@@ -236,13 +146,11 @@ class Elementwise_Binary(vOp):
             x.shape[2] == y.shape[2] or x.shape[2] == 1 or y.shape[2] == 1
         ), f"{prefix}dim-2 not broadcastable: x={x.shape}, y={y.shape}"
 
-        x_fmt, y_fmt = x._format, y._format
         exp_N, exp_D = max(x.shape[1], y.shape[1]), max(x.shape[2], y.shape[2])
 
-        # Case A: output None → pick RAGGED impl, construct a metadata
-        # vTensor, and register it in the cache graph.
+        # Case A: output None → allocate a RAGGED metadata buffer.
         if output is None:
-            self.output_format = self._infer_output_format_ragged(x_fmt, y_fmt)
+            self.output_format = FORMAT.RAGGED
             B = ctx.max_new_tokens_per_batch * ctx.head_num
             self.output_buffer = vTensor(
                 shape=(B, exp_N, exp_D),
@@ -258,19 +166,15 @@ class Elementwise_Binary(vOp):
             ctx.op_to_output_tensor_list.append([self.output_buffer.tensor_id])
             return self.output_buffer
 
-        # Case B: output provided → exact match
+        # Case B: output provided → output_format follows output._format.
         assert isinstance(output, vTensor), f"{prefix}output must be vTensor, got {type(output)}"
         assert output.dim() == 3, (
             f"{prefix}output must be 3D, got ndim={output.dim()} shape={tuple(output.shape)}"
         )
-
-        o_fmt = output._format
-        key = (x_fmt, y_fmt, o_fmt)
-        assert key in self._impl_map, (
-            f"{prefix}no implementation for (x_fmt={x_fmt}, y_fmt={y_fmt}, o_fmt={o_fmt}). "
-            f"Available keys: {list(self._impl_map.keys())}"
+        assert output._format in (FORMAT.PAGED, FORMAT.RAGGED), (
+            f"{prefix}output._format must be PAGED or RAGGED, got {output._format}"
         )
-        self.output_format = self._impl_map[key]
+        self.output_format = output._format
 
         assert output.shape[1] == exp_N and output.shape[2] == exp_D, (
             f"{prefix}output shape mismatch. Expected (*,{exp_N},{exp_D}), got {tuple(output.shape)}"

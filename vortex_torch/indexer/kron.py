@@ -1,5 +1,5 @@
 import torch
-from typing import Tuple, Dict, Optional, Union, Iterable
+from typing import Tuple, Optional, Union, Iterable
 from .context import Context
 from ..abs import vTensor, FORMAT, vOp
 from ..utils import Schedule
@@ -65,16 +65,13 @@ class Kron(vOp):
         \text{out}[s,\, c,\, k \cdot y_2 + l]
         = X[s, c, k] \cdot Y[s, c, l].
 
-    Dispatch is keyed by ``(x._format, y._format)``:
-
-    - Any ``RAGGED`` or ``PAGED`` participant yields a ``RAGGED`` output
-      (one tile per workload position).
-    - ``BATCHED ⊗ BATCHED`` yields a ``BATCHED`` output (one tile per
-      ``(batch, head)``, stored exactly once per workload group via the
-      kernel's first-workload gate).
-    - ``BATCHED`` inputs broadcast along the workload axis (the loaded
-      block has leading dim ``1``) so they can pair with ``PAGED`` or
-      ``RAGGED`` partners.
+    Output format rule: ``BATCHED`` iff both inputs are ``BATCHED``
+    (each tile is one ``(batch, head)`` summary, stored once per
+    workload group via the kernel's first-workload gate); otherwise
+    ``RAGGED`` (per-workload tile). ``BATCHED`` inputs broadcast along
+    the workload axis (leading block dim == 1) so they can pair with
+    non-``BATCHED`` partners. Format compatibility is enforced by the
+    compiler's per-workload kernel.
 
     Parameters
     ----------
@@ -85,8 +82,6 @@ class Kron(vOp):
 
     Attributes
     ----------
-    _impl_map : Dict[Tuple[FORMAT, FORMAT], FORMAT]
-        Dispatch table keyed by ``(x_format, y_format)``.
     dim : Tuple[int, ...]
         Sorted tuple of axes that get the Kronecker expansion.
     output_format : Optional[FORMAT]
@@ -94,21 +89,6 @@ class Kron(vOp):
     output_buffer : Optional[vTensor]
         Pure-metadata vTensor descriptor for the output (graph node).
     """
-
-    # Format policy:
-    #   * Any RAGGED or PAGED participant → RAGGED output (per-workload tile).
-    #   * BATCHED ⊗ BATCHED → BATCHED output (one tile per (batch, head),
-    #     stored once per workload group via the kernel's first-workload gate).
-    #   * BATCHED inputs broadcast along the workload axis (leading block
-    #     dim == 1) so they can pair with PAGED / RAGGED partners.
-    _impl_map: Dict[Tuple[FORMAT, FORMAT], FORMAT] = {
-        (FORMAT.RAGGED,  FORMAT.RAGGED):  FORMAT.RAGGED,
-        (FORMAT.BATCHED, FORMAT.RAGGED):  FORMAT.RAGGED,
-        (FORMAT.RAGGED,  FORMAT.BATCHED): FORMAT.RAGGED,
-        (FORMAT.BATCHED, FORMAT.PAGED):   FORMAT.RAGGED,
-        (FORMAT.PAGED,   FORMAT.BATCHED): FORMAT.RAGGED,
-        (FORMAT.BATCHED, FORMAT.BATCHED): FORMAT.BATCHED,
-    }
 
     def __init__(self, dim: Union[int, Iterable[int]] = (1, 2)):
         super().__init__()
@@ -140,9 +120,8 @@ class Kron(vOp):
     # ---------------- profile ----------------
     def profile(self, x: vTensor, y: vTensor, ctx: Context) -> vTensor:
         r"""
-        Validate inputs, select an implementation by
-        ``(x._format, y._format)``, allocate the output buffer, and
-        return a :class:`vTensor` view with the resolved output format.
+        Validate inputs, allocate the output buffer, and return a
+        :class:`vTensor` view.
 
         For each inner axis ``a`` in ``{1, 2}``:
 
@@ -165,13 +144,12 @@ class Kron(vOp):
         -------
         vTensor
             A :class:`vTensor` view wrapping the internally allocated
-            output buffer with the resolved output format.
+            output buffer.
 
         Raises
         ------
         AssertionError
-            If types are not :class:`vTensor`, if ranks are not 3, if
-            ``(x._format, y._format)`` is not in :attr:`_impl_map`, if a
+            If types are not :class:`vTensor`, if ranks are not 3, if a
             non-Kron axis is not equal/broadcastable, or if ``x`` and
             ``y`` live on different devices.
         """
@@ -184,14 +162,12 @@ class Kron(vOp):
             f"{prefix}expected 3D inputs [S, C, D]; got x.ndim={x.dim()}, y.ndim={y.dim()}"
         )
 
-        # Dispatch by (x_fmt, y_fmt)
-        x_fmt, y_fmt = x._format, y._format
-        key = (x_fmt, y_fmt)
-        assert key in self._impl_map, (
-            f"{prefix}no implementation for (x_fmt={x_fmt}, y_fmt={y_fmt}). "
-            f"Available: {list(self._impl_map.keys())}"
+        # Output is BATCHED iff both inputs are BATCHED; otherwise RAGGED.
+        self.output_format = (
+            FORMAT.BATCHED
+            if (x._format == FORMAT.BATCHED and y._format == FORMAT.BATCHED)
+            else FORMAT.RAGGED
         )
-        self.output_format = self._impl_map[key]
 
         # Device consistency
         assert x.device == y.device, (

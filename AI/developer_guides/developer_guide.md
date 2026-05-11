@@ -323,9 +323,12 @@ self.ctx.execute()                                      # profile is done; lock 
 **Profile phase contracts**:
 
 - Inputs are `vTensor`s (metadata only).
-- `profile()` validates shapes/dtypes, picks an output format from
-  `_impl_map`, allocates a new `vTensor` for its output, and appends
-  to `ctx.tensor_list` / `ctx.op_list` / edges.
+- `profile()` validates shapes/dtypes, resolves the output format
+  (compiler-generated ops infer it inline from the input formats; a
+  small set of custom kernels and conversion ops still consult a
+  per-class dispatch table — see §5.1), allocates a new `vTensor` for
+  its output, and appends to `ctx.tensor_list` / `ctx.op_list` /
+  edges.
 - No real compute happens; no torch ops are called.
 
 **Execute phase contracts**:
@@ -340,58 +343,89 @@ self.ctx.execute()                                      # profile is done; lock 
 
 ---
 
-## 5. Ops and their dispatch tables
+## 5. Ops and how their output format is resolved
 
 Every op class lives in `{indexer,cache}/<family>.py` and has:
 
 - an `__init__` with op-specific parameters (e.g. `dim`, `alpha`,
   `beta`);
-- a class-level `_impl_map` dict keyed by input-format tuple → output
-  format;
-- a `profile(...)` method that validates, resolves `output_format`
-  via `_impl_map`, constructs a `vTensor` for the output, and
+- a `profile(...)` method that validates the inputs, picks
+  `output_format`, constructs a `vTensor` for the output, and
   registers the op into `ctx`.
 
-### 5.1 `_impl_map` shapes
+There are two flavors of format resolution:
 
-| op family | map keying |
-|---|---|
-| indexer unary elementwise | `FORMAT → FORMAT` |
-| indexer binary elementwise | `(FORMAT, FORMAT) → FORMAT` |
-| indexer matmul | `(FORMAT, FORMAT) → FORMAT` |
-| indexer reduce | `FORMAT → FORMAT` |
-| indexer scan (Softmax, Normalize) | `FORMAT → FORMAT` |
-| indexer save / load | `FORMAT → FORMAT` |
-| indexer transpose / mask | `FORMAT → FORMAT` |
-| cache unary elementwise | `(FORMAT, FORMAT) → FORMAT` (x_fmt, o_fmt) |
-| cache binary elementwise | `(FORMAT, FORMAT, FORMAT) → FORMAT` (x_fmt, y_fmt, o_fmt) |
-| cache reduce | `(FORMAT, FORMAT) → FORMAT` |
-| cache matmul | `(FORMAT, FORMAT, FORMAT) → FORMAT` |
-| cache fill | supported-format set (no output resolution — writes the input) |
-| cache mask | `(FORMAT, FORMAT) → FORMAT` |
+- **Compiler-generated ops** — the per-workload kernel handles all
+  format combinations uniformly, so the op only needs to pick the
+  output format and the surrounding kernel takes care of the rest.
+  These ops infer `output_format` inline from a single rule keyed on
+  the input format(s); they no longer carry a per-class `_impl_map`.
+- **Custom kernels & format-conversion ops** — their codegen
+  branches on the tensor formats, so they keep an explicit dispatch
+  table (`_impl_map` keyed on input format, or `_supported_formats`
+  for the no-output variants like `topK` and `Fill`). Mismatches are
+  caught at `profile()` time with an explicit assertion.
 
-Cache maps include `o_fmt` in the key because cache ops can write
-directly into a caller-provided PAGED field or auto-allocate a
-RAGGED intermediate.
+### 5.1 Output-format rules
 
-### 5.2 Output-format resolution
+**Indexer side** (mostly compiler-generated):
 
-The compiler enforces:
+| op family | output format rule | `_impl_map`? |
+|---|---|---|
+| unary elementwise (`Relu`, `Silu`, `Sigmoid`, `Abs`, `Add_Mul`, `Log`, `Exp`) | `BATCHED iff x._format == BATCHED, else RAGGED` | no |
+| binary elementwise (`Add`, `Multiply`, `Maximum`, …, `Where*`) | `BATCHED iff both inputs are BATCHED, else RAGGED` | no |
+| `GeMM` / `GeMV` | `BATCHED iff both inputs are BATCHED, else RAGGED` | no |
+| `Reduce(dim ∈ {1, 2})` | `BATCHED iff x._format == BATCHED, else RAGGED` | no |
+| `Transpose`, `Reshape`, `MaskSlice`, `Kron` | `BATCHED iff input(s) are all BATCHED, else RAGGED` | no |
+| `Reduce(dim == 0)` (custom Schedule.S kernel) | RAGGED → BATCHED | inline asserts `x._format == RAGGED` |
+| `Softmax`, `Normalize`, `Conv1d` (Schedule.S) | preserve input format | `{RAGGED: RAGGED}` |
+| `topK`, `approxTopK` | writes into a caller-provided `o` | `_supported_formats = {RAGGED}` (no output allocated) |
+| `Save` (RAGGED → PAGED) | PAGED | `{RAGGED: PAGED}` |
+| `Load` (PAGED → RAGGED) | RAGGED | `{PAGED: RAGGED}` |
 
-- **Indexer intermediates** must be `RAGGED` or `BATCHED` — not
-  `PAGED`. PAGED outputs only happen when the user explicitly
-  provides a destination (`Save`'s sink).
+Intuition for the BATCHED-iff-input-BATCHED rule: a `BATCHED` tensor
+already has its packed-S axis collapsed to one row per
+`(batch, kv_head)`. Anything an indexer op derives from BATCHED
+inputs stays BATCHED; anything that touches a non-BATCHED partner
+re-expands across the packed axis and becomes RAGGED. PAGED is
+reserved for `Save` outputs (the only producer of PAGED on the
+indexer side).
+
+**Cache side** (compiler-generated except `Fill`):
+
+| op family | output format rule | `_impl_map`? |
+|---|---|---|
+| unary elementwise | `output._format if output is provided else RAGGED` | no |
+| binary elementwise | same | no |
+| `GeMM` | same | no |
+| `Reduce`, `ReduceInterleave` | same | no |
+| `MaskSlice` | same | no |
+| `Reshape` | same | no |
+| `Fill` (pure producer) | overwrites its input; PAGED-only | `_supported_formats = {PAGED}` |
+
+The rule is simpler on the cache side: the caller either provides an
+`output: vTensor` (PAGED to write back into a cache field, RAGGED
+for an intermediate) or omits it (auto-allocates a RAGGED
+intermediate). The op asserts `output._format ∈ {PAGED, RAGGED}` —
+BATCHED has no meaning on the cache side.
+
+### 5.2 Output-format invariants enforced by the compiler
+
+- **Indexer intermediates** are `RAGGED` or `BATCHED` only — never
+  `PAGED`. The only PAGED writer on the indexer side is `Save`, and
+  the destination is always a caller-provided cache field.
 - **BATCHED outputs from `Schedule.W` ops are guarded** at store
   time by `winfo_is_first_workload_per_batch` (see §9.3).
-- **Cache intermediates** can be `RAGGED` (per-trigger-token) or
-  `PAGED` (write-back to a declared field). No BATCHED on the cache
-  side.
+- **Cache intermediates** are `RAGGED` (auto-allocated intermediate)
+  or `PAGED` (write-back to a declared field). No BATCHED on the
+  cache side.
 
 ### 5.3 Schedule assignment
 
 Most ops are `Schedule.W`. `Schedule.S` is currently used by:
 
-- `topK` (drives a C++ extension, distinct from the fused kernel).
+- `topK` / `approxTopK` (drive C++/Triton extensions, distinct from
+  the fused kernel).
 - `Softmax`, `Normalize`, `Conv1d` (scan-style, can't fuse per-workload).
 - `Reduce(dim=0)` — the special case where the *same* op class
   dispatches to different codegen based on schedule. `dim ∈ {1, 2}`
@@ -407,73 +441,45 @@ compute chain. Instead, Save appends its op id to
 `ctx.side_effect_op_ids`; the DAG builder seeds DFS from that set
 separately. See `graph.py:_build_op_dag`.
 
-### 5.5 Concrete `_impl_map` examples
+### 5.5 What `profile()` looks like in practice
 
-Actual dispatch tables, verbatim from the codebase:
+Two representative shapes — a compiler-generated op (no `_impl_map`)
+and a custom kernel that keeps one.
 
-**Indexer `Multiply` / `Add` / `Maximum` / `Where*` (elementwise_binary.py)**:
+**Compiler-generated — `Elementwise_Binary` (indexer)**:
 ```python
-_impl_map = {
-    (FORMAT.RAGGED,  FORMAT.RAGGED):  FORMAT.RAGGED,
-    (FORMAT.BATCHED, FORMAT.PAGED):   FORMAT.RAGGED,
-    (FORMAT.RAGGED,  FORMAT.PAGED):   FORMAT.RAGGED,
-    (FORMAT.BATCHED, FORMAT.RAGGED):  FORMAT.RAGGED,
-    (FORMAT.RAGGED,  FORMAT.BATCHED): FORMAT.RAGGED,
-}
+self.output_format = (
+    FORMAT.BATCHED
+    if (x._format == FORMAT.BATCHED and y._format == FORMAT.BATCHED)
+    else FORMAT.RAGGED
+)
 ```
-The `(BATCHED, PAGED)` entry is `q * cache["..."]` — the most common
-scoring pattern. Mixed `(BATCHED, RAGGED)` / `(RAGGED, BATCHED)` handles
-folding in per-(batch, head) summaries from `Reduce(dim=0)`.
 
-**Indexer `GeMM` (matmul.py)**:
+**Compiler-generated — cache `Elementwise`**:
 ```python
-_impl_map = {
-    (FORMAT.BATCHED, FORMAT.BATCHED): FORMAT.BATCHED,
-    (FORMAT.BATCHED, FORMAT.PAGED):   FORMAT.RAGGED,
-    (FORMAT.BATCHED, FORMAT.RAGGED):  FORMAT.RAGGED,
-    (FORMAT.PAGED,   FORMAT.BATCHED): FORMAT.RAGGED,
-    (FORMAT.PAGED,   FORMAT.PAGED):   FORMAT.RAGGED,
-    (FORMAT.PAGED,   FORMAT.RAGGED):  FORMAT.RAGGED,
-    (FORMAT.RAGGED,  FORMAT.BATCHED): FORMAT.RAGGED,
-    (FORMAT.RAGGED,  FORMAT.PAGED):   FORMAT.RAGGED,
-    (FORMAT.RAGGED,  FORMAT.RAGGED):  FORMAT.RAGGED,
-}
+if output is None:
+    self.output_format = FORMAT.RAGGED         # auto-allocated intermediate
+else:
+    assert output._format in (FORMAT.PAGED, FORMAT.RAGGED)
+    self.output_format = output._format        # honor caller's destination
 ```
-Eight combinations produce RAGGED; `(BATCHED, BATCHED)` produces
-BATCHED (the only path where output stays BATCHED, page-independent).
 
-**Indexer `Reduce` (reduce.py)**:
+**Custom kernel — `Softmax` (indexer)** still uses a dispatch table
+because its standalone codegen reads `t._format`:
 ```python
-_impl_map = {
-    FORMAT.RAGGED:  FORMAT.RAGGED,
-    FORMAT.BATCHED: FORMAT.BATCHED,
-}
+_impl_map: Dict[FORMAT, FORMAT] = {FORMAT.RAGGED: FORMAT.RAGGED}
+...
+assert x_fmt in self._impl_map
+self.output_format = self._impl_map[x_fmt]
 ```
-Simple: preserve the format. `dim=0` is a separate code path (sets
-schedule to S and forces output to BATCHED regardless of input).
 
-**Cache `Reduce` (cache/reduce.py)**:
+**Format-conversion — `Save` (indexer)**:
 ```python
-_impl_map = {
-    (FORMAT.PAGED,  FORMAT.PAGED):  FORMAT.PAGED,
-    (FORMAT.RAGGED, FORMAT.PAGED):  FORMAT.PAGED,
-    (FORMAT.PAGED,  FORMAT.RAGGED): FORMAT.RAGGED,
-    (FORMAT.RAGGED, FORMAT.RAGGED): FORMAT.RAGGED,
-}
-```
-Cache-side dispatch adds `o_fmt` to the key because the caller picks
-the destination (PAGED cache field vs. RAGGED intermediate).
-
-**Cache `MaskSlice` (cache/mask.py)** — shows an intentional design
-choice where `(PAGED, PAGED): PAGED` is allowed so users can write
-directly into a caller-provided cache field:
-```python
-_impl_map = {
-    (FORMAT.PAGED,  FORMAT.PAGED):  FORMAT.PAGED,
-    (FORMAT.PAGED,  FORMAT.RAGGED): FORMAT.RAGGED,
-    (FORMAT.RAGGED, FORMAT.PAGED):  FORMAT.PAGED,
-    (FORMAT.RAGGED, FORMAT.RAGGED): FORMAT.RAGGED,
-}
+_impl_map: Dict[FORMAT, FORMAT] = {FORMAT.RAGGED: FORMAT.PAGED}
+...
+assert x_fmt in self._impl_map
+self.output_format = self._impl_map[x_fmt]
+assert o._format == self.output_format
 ```
 
 ### 5.6 What `profile()` looks like — annotated
@@ -486,18 +492,19 @@ def profile(self, x: vTensor, ctx: Context) -> vTensor:
     assert isinstance(x, vTensor), f"{prefix}x must be vTensor"
     assert x.dim() == 3, f"{prefix}x must be 3D"
 
-    x_fmt = x._format
     D0, D1 = x.shape[1], x.shape[2]
 
     if self.dim == 0:
-        # Cross-row reduction: RAGGED → BATCHED, Schedule.S.
-        assert x_fmt == FORMAT.RAGGED
+        # Cross-row reduction: RAGGED → BATCHED, Schedule.S (custom kernel).
+        assert x._format == FORMAT.RAGGED
         self.output_format = FORMAT.BATCHED
         out_D0, out_D1 = D0, D1
     else:
-        # Per-row reduction: format preserved, keepdim collapses the axis.
-        assert x_fmt in self._impl_map
-        self.output_format = self._impl_map[x_fmt]
+        # Per-row reduction (Schedule.W, compiler-generated):
+        # BATCHED stays BATCHED, everything else becomes RAGGED.
+        self.output_format = (
+            FORMAT.BATCHED if x._format == FORMAT.BATCHED else FORMAT.RAGGED
+        )
         out_D0 = 1 if self.dim == 1 else D0
         out_D1 = 1 if self.dim == 2 else D1
 
@@ -1450,7 +1457,7 @@ CLI: `python -m vortex_torch.flow.verify <flow_name> [--vortex-dtype DT] [...]`.
 
 ### 15.2 `check_engine_config(config_path)`
 
-Pre-flight validation for engine JSONs (`engine/sgl.py`). Eight
+Pre-flight validation for engine JSONs (`engine/sgl.py`). Nine
 checks:
 
 1. JSON file exists and parses.
@@ -1460,7 +1467,20 @@ checks:
 5. `vortex_layers_skip` is empty or a list of ints.
 6. `vortex_module_path` resolves to an existing file.
 7. That file declares `@register("<vortex_module_name>")`.
-8. Compiling across a 9-config `(G, kvh) ∈ {1,2,4}²` grid succeeds.
+8. Compiling succeeds for the actual model's GQA shapes. The
+   resolver reads `config.json` from the JSON's `model_path` (or
+   `engine.sgl.MODEL_PATH` if absent): treats the value as a local
+   directory if it exists, otherwise downloads via
+   `huggingface_hub.hf_hub_download`. It then derives
+   `num_kv_heads = config.num_key_value_heads`,
+   `G = num_attention_heads // num_key_value_heads`, and
+   `head_dim = config.head_dim` (falling back to
+   `hidden_size // num_attention_heads`). The sweep runs at exactly
+   those shapes with `pages_per_workload_values=(16, 32)`.
+9. If the flow uses `Save(...)` in the indexer, the JSON sets
+   `"disable_radix_cache": true` (otherwise sglang's prefix cache
+   would share per-request persistent state across requests with
+   matching prompt prefixes).
 
 Raises `EngineConfigError` with a focused message on first failure.
 
@@ -1475,7 +1495,9 @@ Decide which side (indexer, cache, or both) and which schedule.
 **Indexer-side, Schedule.W** (most common):
 
 1. Create `indexer/<family>.py` with a class that inherits `vOp`,
-   defines `_impl_map`, `__init__`, `profile(...)`.
+   defines `__init__` and `profile(...)`. For a compiler-generated
+   op, pick `output_format` inline using the rules in §5.1
+   (typically `BATCHED iff all inputs are BATCHED, else RAGGED`).
 2. Create `indexer/compiler/triton_impl/<op>.py` exporting
    `generate_<op>_impl(graph, op_id, ctx) -> str`. Return a single
    compute expression like `tensor_{out}_block = <triton expr>`.
@@ -1483,11 +1505,14 @@ Decide which side (indexer, cache, or both) and which schedule.
    `(<OpClass>, Schedule.W): generate_<op>_impl` to
    `triton_impl/register.py:IMPL_REGISTRY`.
 4. Export from `indexer/__init__.py`.
-5. Add a `(RAGGED, ...): RAGGED` entry to `_impl_map` (at minimum).
 
-**Indexer-side, Schedule.S**:
+**Indexer-side, Schedule.S** (custom kernel):
 
-1. Same class skeleton, but set `self.schedule = Schedule.S`.
+1. Same class skeleton, but set `self.schedule = Schedule.S`. Custom
+   kernels usually want an explicit `_impl_map` (or
+   `_supported_formats`) so unsupported input formats fail fast at
+   `profile()` time — the standalone codegen reads `t._format` and
+   would otherwise blow up downstream.
 2. `profile` still allocates a vTensor output (RAGGED or BATCHED).
 3. Codegen function returns the *impl body* (launcher code). Push the
    kernel definition onto `ctx.auxilary_func_def_lines`. Example in
@@ -1495,19 +1520,27 @@ Decide which side (indexer, cache, or both) and which schedule.
 4. Register under `(OpClass, Schedule.S)`.
 
 **Cache-side**: mirror on the cache tree. Cache has no `Schedule.S`
-slot today — all cache ops are `Schedule.W`.
+slot today — all cache ops are `Schedule.W`. Output-format rule is
+"`output._format` if the caller provided one, else `RAGGED`"; assert
+`output._format ∈ {PAGED, RAGGED}`.
 
-### 16.2 Adding a new format combination to an `_impl_map`
+### 16.2 Supporting a new input-format combination
 
-Usually the codegen is already format-agnostic (it references block
-expressions emitted by kernel_gen's per-format load paths). Adding a
-new key to `_impl_map` is sufficient. Verify with
+Compiler-generated ops are already format-agnostic — the
+surrounding kernel emits the right load / store path for every
+combination, so no per-class change is needed. Verify with
 `verify_flow_compilable` on a flow that exercises the new combo.
 
-If the new combo needs a new load or store path, extend kernel_gen's
-`generate_load_tensor_str` / `generate_store_tensor_str`. BATCHED
-inputs and RAGGED outputs are the most commonly missing paths; PAGED
-inputs are fully covered for both indexer and cache.
+For custom kernels (Schedule.S indexer ops, `Save` / `Load`,
+`Fill`), extend the op's `_impl_map` (or `_supported_formats`) and
+match it in the codegen function — these ops branch on `t._format`
+inside their generated kernel.
+
+If a brand-new combination needs a new load or store path, extend
+kernel_gen's `generate_load_tensor_str` /
+`generate_store_tensor_str`. BATCHED inputs and RAGGED outputs are
+the most commonly missing paths; PAGED inputs are fully covered for
+both indexer and cache.
 
 ### 16.3 Adding a new dtype
 
@@ -1749,19 +1782,28 @@ Every line corresponds exactly to one op in the user's
 
 A catalogue of common error modes and how to diagnose each.
 
-### 19.1 `AssertionError: no RAGGED-output implementation for x_fmt=...`
+### 19.1 `AssertionError: no implementation for x_fmt=...` (custom kernels)
 
-**Cause**: Your op's `_impl_map` doesn't have a key for the input
-format you're passing. Either (a) the flow is using a combination
-the table doesn't support, or (b) an earlier op returned an
-unexpected format.
+**Cause**: One of the ops that still uses `_impl_map` /
+`_supported_formats` — `Save`, `Load`, `topK`, `approxTopK`,
+`Softmax`, `Normalize`, `Conv1d`, `Fill`, `Reduce(dim=0)` — got an
+input format it doesn't have a codegen path for. Either (a) the
+flow is using a combination the table doesn't support, or (b) an
+earlier op returned an unexpected format.
 
 **Diagnose**: Add a print in `profile()` before the assertion:
 ```python
-print(f"{prefix}got x_fmt={x_fmt}; map keys: {list(self._impl_map.keys())}")
+print(f"{prefix}got x_fmt={x._format}; map keys: {list(self._impl_map.keys())}")
 ```
-Trace back through `forward_indexer` to find the op whose output
-format is different from what you expected.
+Trace back through `forward_indexer` / `forward_cache` to find the
+op whose output format is different from what you expected — most
+common culprit is a `Reduce(dim=0)` collapsing a RAGGED tensor to
+BATCHED upstream of an op that only handles RAGGED.
+
+Compiler-generated ops no longer raise this error — they derive
+their output format inline from input formats (see §5.1), so a
+"wrong format" surfaces later as a shape or kernel-launch mismatch
+rather than a clean profile-time assertion.
 
 ### 19.2 `RuntimeError: Cycle detected in subgraph DAG`
 
@@ -1869,7 +1911,7 @@ Create `vortex_torch/indexer/clamp.py`:
 
 ```python
 import torch
-from typing import Dict, Optional
+from typing import Optional
 from .context import Context
 from ..abs import vTensor, FORMAT, vOp
 from ..utils import Schedule
@@ -1877,11 +1919,6 @@ from ..utils import Schedule
 
 class Clamp(vOp):
     r"""Elementwise clamp: y = max(lo, min(x, hi)). Shape-preserving."""
-
-    _impl_map: Dict[FORMAT, FORMAT] = {
-        FORMAT.RAGGED: FORMAT.RAGGED,
-        FORMAT.BATCHED: FORMAT.BATCHED,
-    }
 
     def __init__(self, lo: float, hi: float):
         super().__init__()
@@ -1897,11 +1934,10 @@ class Clamp(vOp):
         assert isinstance(x, vTensor), f"{prefix}x must be vTensor"
         assert x.dim() == 3, f"{prefix}x must be 3D"
 
-        x_fmt = x._format
-        assert x_fmt in self._impl_map, (
-            f"{prefix}no implementation for x_fmt={x_fmt}"
+        # Compiler-generated op: BATCHED iff input is BATCHED, else RAGGED.
+        self.output_format = (
+            FORMAT.BATCHED if x._format == FORMAT.BATCHED else FORMAT.RAGGED
         )
-        self.output_format = self._impl_map[x_fmt]
 
         self.output_buffer = vTensor(
             shape=(0, x.shape[1], x.shape[2]),

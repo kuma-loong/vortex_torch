@@ -711,7 +711,8 @@ SUBMISSION_REVIEWER = dedent("""\
         `vortex_topk_val`, `vortex_block_reserved_bos`,
         `vortex_block_reserved_eos` are sensible ints;
         `vortex_dtype` / `kv_cache_dtype` are supported values;
-        `mem_fraction_static` (if present) is a float in [0.5, 0.95];
+        `mem_fraction_static` (if present) is a float (sweet spot
+        0.8-0.9; defaults to 0.8 inside `get_engine`);
         `disable_radix_cache` (if present) is a bool.
 
     ## Output format

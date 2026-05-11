@@ -1,28 +1,28 @@
 import torch
-from typing import Tuple, Dict, Optional
+from typing import Optional
 from .context import Context
 from ..abs import vTensor, FORMAT, vOp
 from ..utils import ElementwiseBinaryOpType, Schedule
 
 class Elementwise_Binary(vOp):
     r"""
-    Binary elementwise dispatcher for rank-3 logical tensors ``[S, C, D]``.
+    Binary elementwise op for rank-3 logical tensors ``[S, C, D]``.
 
-    This operator dispatches to a binary elementwise implementation based on the
-    pair of input formats ``(x._format, y._format)``. The logical output shape:
+    The logical output shape:
 
     - keeps the ``S`` axis from the runtime context (``ctx.max_num_pages``), and
     - follows broadcasting over the ``(C, D)`` axes.
 
-    Scalar parameters ``alpha`` and ``beta`` can be used by certain binary
-    operations (e.g. an ``axpby``-style op).
+    Output format rule: ``BATCHED`` if both inputs are ``BATCHED``,
+    otherwise ``RAGGED``. Format compatibility is enforced by the
+    compiler's per-workload kernel; no explicit format dispatch is
+    needed here.
+
+    Scalar parameters ``alpha`` and ``beta`` can be used by certain
+    binary operations (e.g. an ``axpby``-style op).
 
     Attributes
     ----------
-    _impl_map : Dict[Tuple[FORMAT, FORMAT], FORMAT]
-        Dispatch table keyed by ``(x_format, y_format)``. Each entry maps to
-        the resolved output format.
-
     alpha : float
         Scalar parameter used by some ops. Default is ``1.0``.
 
@@ -39,18 +39,6 @@ class Elementwise_Binary(vOp):
         Preallocated output tensor buffer that stores the binary result.
     """
 
-    # Dispatch table keyed by (x_format, y_format) -> resolved output format.
-    # Mixing BATCHED with RAGGED is allowed (e.g. broadcasting a per-(batch,
-    # head) summary from ``Reduce(dim=0)`` against a per-page RAGGED tensor).
-    _impl_map: Dict[Tuple[FORMAT, FORMAT], FORMAT] = {
-        (FORMAT.RAGGED,  FORMAT.RAGGED):  FORMAT.RAGGED,
-        (FORMAT.BATCHED, FORMAT.PAGED):   FORMAT.RAGGED,
-        (FORMAT.RAGGED,  FORMAT.PAGED):   FORMAT.RAGGED,
-        (FORMAT.BATCHED, FORMAT.RAGGED):  FORMAT.RAGGED,
-        (FORMAT.RAGGED,  FORMAT.BATCHED): FORMAT.RAGGED,
-        # Add more pairs as needed.
-    }
-
     def __init__(self, alpha: float = 1.0, beta: float = 1.0):
         super().__init__()
         self.op_type: Optional[ElementwiseBinaryOpType] = None
@@ -65,19 +53,16 @@ class Elementwise_Binary(vOp):
         Validate inputs, select implementation, allocate the output buffer,
         and return a ``vTensor`` view with the resolved output format.
 
-        The dispatcher:
+        Validates rank-3 shapes and broadcastability on ``(C, D)``.
+        Allocates an output buffer with shape ``[S_ctx, C_out, D_out]`` where
 
-        - checks that ``x`` and ``y`` are rank-3 tensors of shape ``[S, C, D]``
-        - enforces broadcastability on the ``C`` and ``D`` dimensions
-        - selects an implementation using ``(x._format, y._format)``
-        - allocates an output buffer with shape ``[S_ctx, C_out, D_out]`` where
+        .. math::
 
-          .. math::
+           C_{\text{out}} = \max(C_x, C_y), \quad
+           D_{\text{out}} = \max(D_x, D_y),
 
-             C_{\text{out}} = \max(C_x, C_y), \quad
-             D_{\text{out}} = \max(D_x, D_y),
-
-          and ``S_ctx = ctx.max_num_pages``.
+        and ``S_ctx = ctx.max_num_pages``. Output format is ``BATCHED``
+        only when both inputs are ``BATCHED``, otherwise ``RAGGED``.
 
         Parameters
         ----------
@@ -94,15 +79,13 @@ class Elementwise_Binary(vOp):
         Returns
         -------
         vTensor
-            A ``vTensor`` view wrapping the allocated output buffer, using the
-            resolved output format from the dispatch table.
+            A ``vTensor`` view wrapping the allocated output buffer.
 
         Raises
         ------
         AssertionError
             If types are not ``vTensor``, if ranks are not 3, if ``C``/``D``
-            are not broadcastable, if formats are unsupported, or if devices
-            of ``x`` and ``y`` do not match.
+            are not broadcastable, or if devices of ``x`` and ``y`` do not match.
         """
         prefix = self._prefix()
 
@@ -123,14 +106,12 @@ class Elementwise_Binary(vOp):
             f"{prefix}dim-2 not broadcastable: x.shape={tuple(x.shape)}, y.shape={tuple(y.shape)}"
         )
 
-        # Dispatch
-        x_fmt, y_fmt = x._format, y._format
-        key = (x_fmt, y_fmt)
-        assert key in self._impl_map, (
-            f"{prefix}no implementation for (x_fmt={x_fmt}, y_fmt={y_fmt}). "
-            f"Available: {list(self._impl_map.keys())}"
+        # Output preserves BATCHED iff both inputs are BATCHED, else RAGGED.
+        self.output_format = (
+            FORMAT.BATCHED
+            if (x._format == FORMAT.BATCHED and y._format == FORMAT.BATCHED)
+            else FORMAT.RAGGED
         )
-        self.output_format = self._impl_map[key]
 
         # Device consistency
         assert x.device == y.device, (

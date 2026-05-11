@@ -1,5 +1,5 @@
 import torch
-from typing import Dict, Optional
+from typing import Optional
 from .context import Context
 from ..abs import vTensor, FORMAT, vOp
 from ..utils import Schedule
@@ -35,6 +35,10 @@ class Reshape(vOp):
     :meth:`profile` time (and again by ``tl.reshape`` at compile
     time as a numel check).
 
+    Output format rule: ``BATCHED`` iff the input is ``BATCHED``,
+    otherwise ``RAGGED``. Format compatibility is enforced by the
+    compiler's per-workload kernel.
+
     Constructor
     -----------
     ``Reshape(-1, x2, y2)`` — three integers; the leading must be
@@ -42,8 +46,6 @@ class Reshape(vOp):
 
     Attributes
     ----------
-    _impl_map : Dict[FORMAT, FORMAT]
-        Dispatch table keyed by ``x_format``.
     x2, y2 : int
         Target inner-axis sizes.
     output_format : Optional[FORMAT]
@@ -51,18 +53,6 @@ class Reshape(vOp):
     output_buffer : Optional[vTensor]
         Pure-metadata vTensor descriptor for the output (graph node).
     """
-
-    # Single-key dispatch on input format. RAGGED and BATCHED both pass
-    # straight through; ``BATCHED`` blocks have leading dim 1, ``RAGGED``
-    # blocks have leading dim ``ctx.workload_chunk_size`` — the codegen
-    # picks up the right value via ``_block_leading_dim``.
-    _impl_map: Dict[FORMAT, FORMAT] = {
-        FORMAT.RAGGED:  FORMAT.RAGGED,
-        FORMAT.BATCHED: FORMAT.BATCHED,
-        # PAGED currently not wired (the per-workload loader for PAGED
-        # uses an extra ``num_pages_per_workload`` outer dim that would
-        # need separate codegen). Add when needed.
-    }
 
     def __init__(self, batch_dim: int, x2: int, y2: int):
         super().__init__()
@@ -116,12 +106,10 @@ class Reshape(vOp):
             f"target x2*y2 = {self.x2}*{self.y2} = {out_numel}"
         )
 
-        x_fmt = x._format
-        assert x_fmt in self._impl_map, (
-            f"{prefix}no implementation for x_fmt={x_fmt}. "
-            f"Available keys: {list(self._impl_map.keys())}"
+        # Output is BATCHED iff the input is BATCHED; otherwise RAGGED.
+        self.output_format = (
+            FORMAT.BATCHED if x._format == FORMAT.BATCHED else FORMAT.RAGGED
         )
-        self.output_format = self._impl_map[x_fmt]
 
         # Pure-metadata vTensor — leading dim is a placeholder; the
         # runtime knows the actual ``S`` from the pipeline.

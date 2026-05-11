@@ -1,5 +1,5 @@
 import torch
-from typing import Dict, Optional
+from typing import Optional
 from .context import Context
 from ..abs import vTensor, FORMAT, vOp
 from ..utils import Schedule
@@ -56,12 +56,6 @@ class MaskSlice(vOp):
         Value written for positions outside.
     """
 
-    _impl_map: Dict[FORMAT, FORMAT] = {
-        FORMAT.RAGGED: FORMAT.RAGGED,
-        FORMAT.PAGED: FORMAT.RAGGED,
-        FORMAT.BATCHED: FORMAT.BATCHED,
-    }
-
     def __init__(
         self,
         start: int,
@@ -99,12 +93,10 @@ class MaskSlice(vOp):
             f"{prefix}expected 3D input [S, D0, D1], got shape={tuple(x.shape)}"
         )
 
-        x_fmt = x._format
-        assert x_fmt in self._impl_map, (
-            f"{prefix}no implementation for x_fmt={x_fmt}. "
-            f"Available: {list(self._impl_map.keys())}"
+        # Output is BATCHED iff the input is BATCHED; otherwise RAGGED.
+        self.output_format = (
+            FORMAT.BATCHED if x._format == FORMAT.BATCHED else FORMAT.RAGGED
         )
-        self.output_format = self._impl_map[x_fmt]
 
         dim_size = x.shape[self.dim]
         assert 0 <= self.start <= self.end <= dim_size, (

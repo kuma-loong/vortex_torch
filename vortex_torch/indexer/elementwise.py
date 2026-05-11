@@ -1,24 +1,19 @@
 import torch
-from typing import Dict, Callable, Optional
+from typing import Optional
 from .context import Context
 from ..abs import vTensor, FORMAT, vOp
 from ..utils import ElementwiseOpType, Schedule
 
 class Elementwise(vOp):
     """
-    Unary elementwise dispatcher for rank-3 logical tensors ``[S, C, D]``.
+    Unary elementwise op for rank-3 logical tensors ``[S, C, D]``.
 
-    This operator dispatches implementation **only based on the input format**
-    (``x._format``). The output tensor has the same logical shape as the input.
-    Optional scalar parameters ``alpha`` and ``beta`` may be used by certain
-    elementwise operations.
+    Output format rule: ``BATCHED`` iff the input is ``BATCHED`` (its
+    ``S`` axis is already collapsed to 1), otherwise ``RAGGED``. Format
+    compatibility is enforced by the compiler's per-workload kernel.
 
     Attributes
     ----------
-    _impl_map : Dict[FORMAT, FORMAT]
-        Dispatch table keyed by input format. Each entry maps to the
-        resolved output format.
-
     alpha : float
         Scalar parameter used by some ops. Default is ``1.0``.
 
@@ -35,13 +30,6 @@ class Elementwise(vOp):
         Preallocated output tensor buffer.
     """
 
-    # Dispatch table keyed by x_format -> resolved output format.
-    _impl_map: Dict[FORMAT, FORMAT] = {
-        FORMAT.RAGGED: FORMAT.RAGGED,
-        # Add more entries if you support other formats:
-        # FORMAT.PAGED: FORMAT.PAGED,
-    }
-
     def __init__(self, alpha: float = 1.0, beta: float = 1.0):
         super().__init__()
         self.op_type: Optional[ElementwiseOpType] = None
@@ -53,8 +41,9 @@ class Elementwise(vOp):
 
     def profile(self, x: vTensor, ctx: Context) -> vTensor:
         """
-        Validate input, select the implementation based on ``x._format``,
-        allocate the output buffer, and return a ``vTensor`` view.
+        Validate input, allocate the output buffer, and return a
+        ``vTensor`` view. The output is ``BATCHED`` iff the input is
+        ``BATCHED``, otherwise ``RAGGED``.
 
         Parameters
         ----------
@@ -68,13 +57,12 @@ class Elementwise(vOp):
         Returns
         -------
         vTensor
-            A ``vTensor`` view wrapping the allocated output buffer, using the
-            resolved output format.
+            A ``vTensor`` view wrapping the allocated output buffer.
 
         Raises
         ------
         AssertionError
-            If input tensor type, rank, or format is invalid.
+            If input tensor type or rank is invalid.
         """
         prefix = self._prefix()
 
@@ -84,13 +72,11 @@ class Elementwise(vOp):
             f"{prefix}expected 3D input [S, C, D]. Got ndim={x.dim()} shape={tuple(x.shape)}"
         )
 
-        # Dispatch by input format
-        x_fmt = x._format
-        assert x_fmt in self._impl_map, (
-            f"{prefix}no implementation for x_fmt={x_fmt}. "
-            f"Available keys: {list(self._impl_map.keys())}"
+        # Output is BATCHED iff the input is BATCHED (S already collapsed
+        # to 1); otherwise RAGGED.
+        self.output_format = (
+            FORMAT.BATCHED if x._format == FORMAT.BATCHED else FORMAT.RAGGED
         )
-        self.output_format = self._impl_map[x_fmt]
 
         C, D = x.shape[1], x.shape[2]
 

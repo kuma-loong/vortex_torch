@@ -14,11 +14,19 @@ return max(static_kv_budget, dynamic_kv_budget);
 """
 
 
-MODEL_PATH = "/data/zhuoming/hf_models/Qwen3-4B"
+# Default model. Either a local directory containing ``config.json``
+# (treated as the resolved model path) or a HuggingFace repo ID such as
+# ``"Qwen/Qwen3-1.7B"`` (in which case ``config.json`` is fetched via
+# ``hf_hub_download`` and cached under ``~/.cache/huggingface/hub``).
+# Submissions can override via the ``model_path`` key in the engine JSON.
+MODEL_PATH = "Qwen/Qwen3-1.7B"
 
 
 def get_engine(
     *,
+    model_path: str = MODEL_PATH,
+    mem_fraction_static: float = 0.8,
+    vortex_max_seq_lens: int = 20480,
     vortex_block_size: int = 16,
     vortex_topk_val: int = 29,
     vortex_topk_ratio: float | None = None,
@@ -36,11 +44,11 @@ def get_engine(
     policy = DEFAULT_SCHEDULE_POLICY if vortex_schedule_policy is None else vortex_schedule_policy
 
     engine_kwargs = dict(
-        model_path=MODEL_PATH,
+        model_path=model_path,
         page_size=vortex_block_size,
         vortex_block_size=vortex_block_size,
         vortex_topk_val=vortex_topk_val,
-        vortex_max_seq_lens=20480,
+        vortex_max_seq_lens=vortex_max_seq_lens,
         vortex_block_reserved_bos=vortex_block_reserved_bos,
         vortex_block_reserved_eos=vortex_block_reserved_eos,
         vortex_workload_chunk_size=vortex_workload_chunk_size,
@@ -53,7 +61,7 @@ def get_engine(
         enable_vortex_sparsity=True,
         kv_cache_dtype=kv_cache_dtype,
         attention_backend="flashinfer",
-        mem_fraction_static=0.8,
+        mem_fraction_static=mem_fraction_static,
         disable_cuda_graph=False,
         disable_overlap_schedule=True,
         tp_size=1,
@@ -163,9 +171,102 @@ def _check_disable_radix_cache(module_path: Path, config: Dict[str, Any]) -> Non
         )
 
 
-def _check_compilable(module_path: Path, module_name: str) -> None:
+def _read_hf_model_shapes(model_path: str) -> Dict[str, int]:
+    """Resolve ``config.json`` for a model and return the GQA shapes
+    used to drive the compile sweep.
+
+    ``model_path`` is interpreted as a local directory when that
+    directory exists; otherwise it is treated as a HuggingFace repo ID
+    and ``config.json`` is fetched via
+    :func:`huggingface_hub.hf_hub_download` (cached under the standard
+    HF cache so the network is only hit once).
+
+    Returns
+    -------
+    dict
+        ``{"G": int, "num_kv_heads": int, "head_dim": int}`` where
+
+        - ``num_kv_heads`` = ``config.num_key_value_heads``
+        - ``G``            = ``num_attention_heads // num_key_value_heads``
+        - ``head_dim``     = ``config.head_dim`` if present, else
+          ``hidden_size // num_attention_heads``
+
+    Raises
+    ------
+    EngineConfigError
+        If the file can't be located, parsed, or doesn't carry the
+        required fields.
+    """
+    local_dir = Path(model_path).expanduser()
+    if local_dir.is_dir():
+        cfg_path = local_dir / "config.json"
+        if not cfg_path.is_file():
+            raise EngineConfigError(
+                f"local model directory {local_dir} has no config.json"
+            )
+    else:
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError as e:
+            raise EngineConfigError(
+                "huggingface_hub is required to fetch the model config; "
+                "install it with `pip install huggingface_hub`"
+            ) from e
+
+        try:
+            cfg_path = Path(hf_hub_download(repo_id=model_path, filename="config.json"))
+        except Exception as e:
+            raise EngineConfigError(
+                f"failed to fetch config.json from HuggingFace repo "
+                f"{model_path!r}: {e}"
+            ) from e
+
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise EngineConfigError(f"{cfg_path} is not valid JSON: {e}") from e
+    if not isinstance(cfg, dict):
+        raise EngineConfigError(f"{cfg_path} must be a JSON object")
+
+    try:
+        nq = _coerce_int(cfg["num_attention_heads"], "config.num_attention_heads")
+        nkv = _coerce_int(cfg["num_key_value_heads"], "config.num_key_value_heads")
+    except KeyError as e:
+        raise EngineConfigError(
+            f"{cfg_path} missing required field {e.args[0]!r}"
+        ) from e
+    if nkv <= 0 or nq % nkv != 0:
+        raise EngineConfigError(
+            f"{cfg_path}: num_attention_heads={nq} must be a positive "
+            f"multiple of num_key_value_heads={nkv}"
+        )
+
+    if "head_dim" in cfg:
+        D = _coerce_int(cfg["head_dim"], "config.head_dim")
+    else:
+        try:
+            hidden = _coerce_int(cfg["hidden_size"], "config.hidden_size")
+        except KeyError as e:
+            raise EngineConfigError(
+                f"{cfg_path} has no head_dim and missing {e.args[0]!r} "
+                f"(needed to derive head_dim = hidden_size // num_attention_heads)"
+            ) from e
+        if hidden % nq != 0:
+            raise EngineConfigError(
+                f"{cfg_path}: hidden_size={hidden} not divisible by "
+                f"num_attention_heads={nq}"
+            )
+        D = hidden // nq
+
+    return {"G": nq // nkv, "num_kv_heads": nkv, "head_dim": D}
+
+
+def _check_compilable(module_path: Path, module_name: str, model_path: str) -> None:
     """Load the user file, build the registered vFlow, and run a tiny
-    compile sweep. Uses CPU-side metadata only — no CUDA required."""
+    compile sweep using the GQA shapes from ``model_path``'s
+    ``config.json`` (local file when ``model_path`` is a directory,
+    otherwise downloaded via huggingface_hub). Uses CPU-side metadata
+    only — no CUDA required."""
     # Imports are local: avoid pulling vortex_torch.flow at module-import
     # time of vortex_torch.engine, since that drags in the whole compiler
     # surface for callers that only want ``get_engine``.
@@ -186,30 +287,29 @@ def _check_compilable(module_path: Path, module_name: str) -> None:
             f"failed to build vFlow {module_name!r} from {module_path}: {e}"
         ) from e
 
-    # Sweep over a small grid of GQA shapes — enough to catch shape /
-    # dispatch issues that only show up at certain ``(G, num_kv_heads)``
-    # combinations. ``verify_flow_compilable`` only sweeps ``G``
-    # internally, so we wrap kvh in an outer loop.
+    shapes = _read_hf_model_shapes(model_path)
+    G, num_kv_heads, D = shapes["G"], shapes["num_kv_heads"], shapes["head_dim"]
+
     with tempfile.TemporaryDirectory(prefix="vortex_check_") as cache_dir:
-        for kvh in (1, 2, 4):
-            report = verify_flow_compilable(
-                flow,
-                B=2, num_kv_heads=kvh,
-                G_values=(1, 2, 4), D_values=(64,),
-                block_sizes=(16,), page_block_ratios=(1,),
-                pages_per_workload_values=(1,),
-                max_num_pages_per_request=16,
-                max_new_tokens_per_batch=64,
-                cache_dir=cache_dir,
-                verify_indexer=True, verify_cache=True,
+        report = verify_flow_compilable(
+            flow,
+            B=2, num_kv_heads=num_kv_heads,
+            G_values=(G,), D_values=(D,),
+            block_sizes=(16,), page_block_ratios=(1,),
+            pages_per_workload_values=(16, 32),
+            max_num_pages_per_request=64,
+            max_new_tokens_per_batch=64,
+            cache_dir=cache_dir,
+            verify_indexer=True, verify_cache=True,
+        )
+        if not report.ok:
+            first = report.failed[0]
+            raise EngineConfigError(
+                f"vFlow {module_name!r} failed to compile "
+                f"(num_kv_heads={num_kv_heads}, G={G}, D={D}, "
+                f"{first.phase}, cfg {first.cfg.label()}):\n"
+                f"{first.traceback}"
             )
-            if not report.ok:
-                first = report.failed[0]
-                raise EngineConfigError(
-                    f"vFlow {module_name!r} failed to compile "
-                    f"(num_kv_heads={kvh}, {first.phase}, cfg {first.cfg.label()}):\n"
-                    f"{first.traceback}"
-                )
 
 
 def check_engine_config(config_path: Union[str, Path]) -> Dict[str, Any]:
@@ -295,8 +395,15 @@ def check_engine_config(config_path: Union[str, Path]) -> Dict[str, Any]:
         )
     _check_registers_class(module_path, module_name)
 
-    # 8. registered class compiles
-    _check_compilable(module_path, module_name)
+    # 8. registered class compiles. Honor a per-submission ``model_path``
+    # override so the preflight reads the same model that will be used
+    # at runtime.
+    model_path = config.get("model_path", MODEL_PATH)
+    if not isinstance(model_path, str) or not model_path:
+        raise EngineConfigError(
+            f"model_path must be a non-empty string, got {model_path!r}"
+        )
+    _check_compilable(module_path, module_name, model_path)
 
     # 9. Save() in indexer ⇒ disable_radix_cache must be true
     _check_disable_radix_cache(module_path, config)

@@ -1,5 +1,5 @@
 import torch
-from typing import Tuple, Dict, Optional
+from typing import Optional
 from .context import Context
 from ..abs import vOp, vTensor, FORMAT
 from ..utils import QuantizationType, Schedule
@@ -34,6 +34,11 @@ class Reshape(vOp):
     ``(x_1, y_1)`` shape and stores with the output's ``(x_2, y_2)``
     shape.
 
+    Output format rule: if a caller-provided ``output`` is supplied with
+    ``PAGED`` format, the output is ``PAGED``; in every other case the
+    output is ``RAGGED``. Format compatibility is enforced by the
+    compiler's per-block kernel.
+
     Constructor
     -----------
     ``Reshape(-1, x2, y2)`` — three integers; the leading must be
@@ -43,8 +48,6 @@ class Reshape(vOp):
 
     Attributes
     ----------
-    _impl_map : Dict[Tuple[FORMAT, FORMAT], FORMAT]
-        Dispatch table keyed by ``(x_format, o_format)``.
     x2, y2 : int
         Target inner-axis sizes.
     output_format : Optional[FORMAT]
@@ -52,13 +55,6 @@ class Reshape(vOp):
     output_buffer : Optional[vTensor]
         Pure-metadata vTensor descriptor for the output (graph node).
     """
-
-    _impl_map: Dict[Tuple[FORMAT, FORMAT], FORMAT] = {
-        (FORMAT.PAGED,  FORMAT.PAGED):  FORMAT.PAGED,
-        (FORMAT.RAGGED, FORMAT.PAGED):  FORMAT.PAGED,
-        (FORMAT.PAGED,  FORMAT.RAGGED): FORMAT.RAGGED,
-        (FORMAT.RAGGED, FORMAT.RAGGED): FORMAT.RAGGED,
-    }
 
     def __init__(self, batch_dim: int, x2: int, y2: int):
         super().__init__()
@@ -95,14 +91,6 @@ class Reshape(vOp):
             return QuantizationType.FP8_E4M3
         raise ValueError(f"{prefix}unsupported dtype {x.dtype} for reshape")
 
-    def _infer_output_format_ragged(self, x_fmt: FORMAT) -> FORMAT:
-        key = (x_fmt, FORMAT.RAGGED)
-        assert key in self._impl_map, (
-            f"{self._prefix()}no RAGGED-output implementation for x_fmt={x_fmt}. "
-            f"Available keys: {list(self._impl_map.keys())}"
-        )
-        return self._impl_map[key]
-
     # ---------------- profile ----------------
     def profile(
         self, x: vTensor, output: Optional[vTensor], loc: torch.Tensor, ctx: Context
@@ -135,11 +123,9 @@ class Reshape(vOp):
             f"target x2*y2 = {self.x2}*{self.y2} = {out_numel}"
         )
 
-        x_fmt = x._format
-
         # Case A: no preallocated output — allocate a RAGGED metadata buffer.
         if output is None:
-            self.output_format = self._infer_output_format_ragged(x_fmt)
+            self.output_format = FORMAT.RAGGED
             self.quantization_type = self._resolve_quantization(x)
 
             B = ctx.max_new_tokens_per_batch * ctx.head_num
@@ -157,7 +143,7 @@ class Reshape(vOp):
             ctx.op_to_output_tensor_list.append([self.output_buffer.tensor_id])
             return self.output_buffer
 
-        # Case B: caller-provided output — pick exact impl by (x_fmt, o_fmt).
+        # Case B: caller-provided output -> output_format follows output._format.
         assert isinstance(output, vTensor), (
             f"{prefix}output must be vTensor, got {type(output)}"
         )
@@ -168,14 +154,10 @@ class Reshape(vOp):
             f"{prefix}output inner shape must be ({self.x2}, {self.y2}), "
             f"got {tuple(output.shape)}"
         )
-
-        o_fmt = output._format
-        key = (x_fmt, o_fmt)
-        assert key in self._impl_map, (
-            f"{prefix}no implementation for (x_fmt={x_fmt}, o_fmt={o_fmt}). "
-            f"Available keys: {list(self._impl_map.keys())}"
+        assert output._format in (FORMAT.PAGED, FORMAT.RAGGED), (
+            f"{prefix}output._format must be PAGED or RAGGED, got {output._format}"
         )
-        self.output_format = self._impl_map[key]
+        self.output_format = output._format
 
         assert x.device == output.device, (
             f"{prefix}x and output must be on the same device "

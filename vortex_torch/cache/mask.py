@@ -1,5 +1,5 @@
 import torch
-from typing import Dict, Optional, Tuple
+from typing import Optional
 from .context import Context
 from ..abs import vTensor, FORMAT, vOp
 from ..utils import Schedule
@@ -42,13 +42,6 @@ class MaskSlice(vOp):
     beta : float
         Value written for positions outside.
     """
-
-    _impl_map: Dict[Tuple[FORMAT, FORMAT], FORMAT] = {
-        (FORMAT.PAGED,  FORMAT.PAGED):  FORMAT.PAGED,
-        (FORMAT.PAGED,  FORMAT.RAGGED): FORMAT.RAGGED,
-        (FORMAT.RAGGED, FORMAT.PAGED):  FORMAT.PAGED,
-        (FORMAT.RAGGED, FORMAT.RAGGED): FORMAT.RAGGED,
-    }
 
     def __init__(
         self,
@@ -94,7 +87,6 @@ class MaskSlice(vOp):
         )
         assert x.dim() == 3, f"{prefix}x must be 3D, got {tuple(x.shape)}"
 
-        x_fmt = x._format
         B, N, D = x.shape
 
         # Bounds check against the chosen axis.
@@ -104,13 +96,9 @@ class MaskSlice(vOp):
             f"bounds for dim={self.dim} (size={dim_size})"
         )
 
-        # Case A: output not provided -> default to RAGGED output.
+        # Case A: output not provided -> allocate a RAGGED metadata buffer.
         if output is None:
-            key = (x_fmt, FORMAT.RAGGED)
-            assert key in self._impl_map, (
-                f"{prefix}no RAGGED-output implementation for x_fmt={x_fmt}"
-            )
-            self.output_format = self._impl_map[key]
+            self.output_format = FORMAT.RAGGED
 
             eff_B = ctx.max_new_tokens_per_batch * ctx.head_num
             self.output_buffer = vTensor(
@@ -127,21 +115,17 @@ class MaskSlice(vOp):
             ctx.op_to_output_tensor_list.append([self.output_buffer.tensor_id])
             return self.output_buffer
 
-        # Case B: caller-provided output.
+        # Case B: caller-provided output -> output_format follows output._format.
         assert isinstance(output, vTensor), (
             f"{prefix}output must be vTensor, got {type(output)}"
         )
         assert output.dim() == 3, (
             f"{prefix}output must be 3D, got {tuple(output.shape)}"
         )
-
-        o_fmt = output._format
-        key = (x_fmt, o_fmt)
-        assert key in self._impl_map, (
-            f"{prefix}no implementation for (x_fmt={x_fmt}, o_fmt={o_fmt}). "
-            f"Available: {list(self._impl_map.keys())}"
+        assert output._format in (FORMAT.PAGED, FORMAT.RAGGED), (
+            f"{prefix}output._format must be PAGED or RAGGED, got {output._format}"
         )
-        self.output_format = self._impl_map[key]
+        self.output_format = output._format
         # Shape-preserving op; check only the inner dims since the leading
         # axis may differ between B-major and S-major views of the cache.
         assert output.shape[1] == N and output.shape[2] == D, (

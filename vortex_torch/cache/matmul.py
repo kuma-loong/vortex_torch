@@ -2,12 +2,12 @@ import torch
 from .context import Context
 from ..abs import vOp, vTensor, FORMAT
 from ..utils import Schedule
-from typing import Tuple, Dict, Optional
+from typing import Optional
 
 
 class GeMM(vOp):
     r"""
-    General matrix-matrix multiplication dispatcher for page/token-tiled layouts.
+    General matrix-matrix multiplication for page/token-tiled layouts.
 
     This operator computes a batched GEMM of the form
 
@@ -21,8 +21,7 @@ class GeMM(vOp):
     - :math:`Y_b \in \mathbb{R}^{N_y \times K}`, and
     - :math:`O_b \in \mathbb{R}^{N_y \times N_x}`.
 
-    In the logical 3D layout used by this dispatcher, the tensors have
-    shapes
+    In the logical 3D layout, the tensors have shapes
 
     .. math::
 
@@ -34,33 +33,12 @@ class GeMM(vOp):
     derived from the runtime (for example,
     ``max_new_tokens_per_batch * head_num`` in an attention-style kernel).
 
-    Dispatch is based on the triplet of tensor formats
-    ``(x_format, y_format, o_format)`` and a registry mapping:
+    Output format rule: if a caller-provided ``output`` is supplied with
+    ``PAGED`` format, the output is ``PAGED``; in every other case the
+    output is ``RAGGED``. Format compatibility is enforced by the
+    compiler's per-block kernel.
 
-    .. code-block:: text
-
-        (x_format, y_format, o_format) -> (impl, resolved_output_format)
-
-    Policy
-    ------
-    - If ``output`` is ``None``:
-
-      - :meth:`profile` selects an implementation with
-        ``o_format == FORMAT.RAGGED``, i.e. a key
-        ``(x_fmt, y_fmt, FORMAT.RAGGED)`` in :attr:`_impl_map`.
-      - An internal buffer is allocated with logical shape
-        ``[B, N_y, N_x]`` on the same device and with the same dtype as
-        ``x``.
-
-    - If ``output`` is provided:
-
-      - :meth:`profile` requires an exact implementation key for
-        ``(x_fmt, y_fmt, o_fmt)``.
-      - The shape of ``output`` must be rank-3 with last two dimensions
-        ``(N_y, N_x)``.
-      - Device consistency is enforced across ``x``, ``y`` and ``output``.
-
-    Additionally, the shared inner dimension :math:`K` must match:
+    The shared inner dimension :math:`K` must match:
 
     .. math::
 
@@ -68,21 +46,11 @@ class GeMM(vOp):
 
     Attributes
     ----------
-    _impl_map : Dict[Tuple[FORMAT, FORMAT, FORMAT], FORMAT]
-        Dispatch table keyed by ``(x_format, y_format, o_format)``.
-        Each entry maps to the resolved output format.
     output_format : Optional[FORMAT]
         The output tensor format as determined in :meth:`profile`.
     output_buffer : Optional[vTensor]
         Pure-metadata vTensor descriptor for the output (graph node).
     """
-
-    _impl_map: Dict[Tuple[FORMAT, FORMAT, FORMAT], FORMAT] = {
-        (FORMAT.PAGED,  FORMAT.PAGED,  FORMAT.PAGED):  FORMAT.PAGED,
-        (FORMAT.PAGED,  FORMAT.PAGED,  FORMAT.RAGGED): FORMAT.RAGGED,
-        (FORMAT.RAGGED, FORMAT.RAGGED, FORMAT.PAGED):  FORMAT.PAGED,
-        (FORMAT.RAGGED, FORMAT.RAGGED, FORMAT.RAGGED): FORMAT.RAGGED,
-    }
 
     def __init__(self):
         super().__init__()
@@ -92,27 +60,14 @@ class GeMM(vOp):
         # ``cache.compiler.triton_impl.kernel_gen``.
         self.schedule = Schedule.W
 
-    def _infer_output_format_ragged(
-        self, x_fmt: FORMAT, y_fmt: FORMAT
-    ) -> FORMAT:
-        """Pick the RAGGED-output dispatch entry for ``(x_fmt, y_fmt)``."""
-        key = (x_fmt, y_fmt, FORMAT.RAGGED)
-        assert key in self._impl_map, (
-            f"{self._prefix()}no RAGGED-output implementation for "
-            f"(x_fmt={x_fmt}, y_fmt={y_fmt}). "
-            f"Available keys: {list(self._impl_map.keys())}"
-        )
-        return self._impl_map[key]
-
     # --------------------------------------------------------------------- #
-    # profile: validate, select impl/format, and optionally allocate output
+    # profile: validate and optionally allocate output
     # --------------------------------------------------------------------- #
     def profile(
         self, x: vTensor, y: vTensor, output: Optional[vTensor], loc: torch.Tensor, ctx: Context
     ) -> vTensor:
         r"""
-        Validate inputs, resolve the GEMM implementation and output format,
-        and optionally allocate an internal output buffer.
+        Validate inputs and optionally allocate an internal output buffer.
 
         The logical shapes are:
 
@@ -126,10 +81,6 @@ class GeMM(vOp):
 
             x.\text{shape}[2] = y.\text{shape}[2].
 
-        The auxiliary tensor ``loc`` carries per-position or per-tile
-        metadata used by the implementation (for example, page indices or
-        tiling information); its shape and semantics are kernel-defined.
-
         Parameters
         ----------
         x : vTensor
@@ -142,12 +93,11 @@ class GeMM(vOp):
 
         output : Optional[vTensor]
             Optional preallocated output tensor. If ``None``, an internal
-            buffer with shape ``[B, N_y, N_x]`` is allocated using
+            RAGGED buffer with shape ``[B, N_y, N_x]`` is allocated using
             ``ctx.max_new_tokens_per_batch * ctx.head_num`` for the
-            leading dimension and a RAGGED-output implementation is
-            selected. If not ``None``, this tensor must have rank 3
-            and last two dimensions ``(N_y, N_x)``, with a format
-            compatible with :attr:`_impl_map`.
+            leading dimension. If not ``None``, this tensor must have
+            rank 3, last two dimensions ``(N_y, N_x)``, and format in
+            ``{PAGED, RAGGED}``.
 
         loc : torch.Tensor
             Auxiliary tensor carrying metadata required by the GEMM
@@ -160,16 +110,13 @@ class GeMM(vOp):
         Returns
         -------
         vTensor
-            A :class:`vTensor` view representing the resolved output:
-            either the provided ``output`` or an internally allocated
-            buffer.
+            A :class:`vTensor` view representing the resolved output.
 
         Raises
         ------
         AssertionError
-            If types, ranks, inner-dimension match, formats, shapes, or
-            devices are incompatible, or if no implementation is found
-            in :attr:`_impl_map`.
+            If types, ranks, inner-dimension match, shapes, or devices
+            are incompatible.
         """
         prefix = self._prefix()
 
@@ -187,12 +134,10 @@ class GeMM(vOp):
 
         # Output logical shape: [B, Ny, Nx]
         Ny, Nx = y.shape[1], x.shape[1]
-        x_fmt, y_fmt = x._format, y._format
 
-        # Case A: output not provided -> pick RAGGED impl and build a
-        # pure-metadata vTensor, then register it in the cache graph.
+        # Case A: output not provided -> allocate a RAGGED metadata buffer.
         if output is None:
-            self.output_format = self._infer_output_format_ragged(x_fmt, y_fmt)
+            self.output_format = FORMAT.RAGGED
 
             B = ctx.max_new_tokens_per_batch * ctx.head_num
             self.output_buffer = vTensor(
@@ -209,19 +154,15 @@ class GeMM(vOp):
             ctx.op_to_output_tensor_list.append([self.output_buffer.tensor_id])
             return self.output_buffer
 
-        # Case B: output provided -> validate and select exact impl
+        # Case B: output provided -> output_format follows output._format.
         assert isinstance(output, vTensor), f"{prefix}output must be vTensor, got {type(output)}"
         assert output.dim() == 3, (
             f"{prefix}output must be 3D, got ndim={output.dim()} shape={tuple(output.shape)}"
         )
-
-        o_fmt = output._format
-        key = (x_fmt, y_fmt, o_fmt)
-        assert key in self._impl_map, (
-            f"{prefix}no implementation for (x_fmt={x_fmt}, y_fmt={y_fmt}, o_fmt={o_fmt}). "
-            f"Available keys: {list(self._impl_map.keys())}"
+        assert output._format in (FORMAT.PAGED, FORMAT.RAGGED), (
+            f"{prefix}output._format must be PAGED or RAGGED, got {output._format}"
         )
-        self.output_format = self._impl_map[key]
+        self.output_format = output._format
 
         # Shape consistency: GEMM yields [*, Ny, Nx]
         assert output.shape[1] == Ny and output.shape[2] == Nx, (

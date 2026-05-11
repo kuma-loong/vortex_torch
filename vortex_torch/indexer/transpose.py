@@ -1,12 +1,12 @@
 import torch
-from typing import Dict, Optional
+from typing import Optional
 from .context import Context
 from ..abs import vTensor, FORMAT, vOp
 from ..utils import Schedule
 
 class Transpose(vOp):
     r"""
-    Transpose dispatcher for rank-3 logical tensors.
+    Transpose op for rank-3 logical tensors.
 
     This operator transposes the last two dimensions of a rank-3 tensor
     while keeping the leading axis unchanged. The input is treated as
@@ -31,26 +31,18 @@ class Transpose(vOp):
     a packed axis (e.g. :math:`S_{\text{pack}} = \sum_b S_b`); the transpose
     is applied independently for each slice along that axis.
 
-    Dispatch is keyed only by the input tensor format ``x._format``.
+    Output format rule: ``BATCHED`` iff the input is ``BATCHED``,
+    otherwise ``RAGGED``. Format compatibility is enforced by the
+    compiler's per-workload kernel.
 
     Attributes
     ----------
-    _impl_map : Dict[FORMAT, FORMAT]
-        Dispatch table keyed by ``x_format``. Each entry maps to the
-        resolved output format.
     output_format : Optional[FORMAT]
         The output tensor format as determined in :meth:`profile`.
     output_buffer : Optional[torch.Tensor]
         Preallocated output tensor buffer with logical shape
         ``[S, D_1, D_0]``.
     """
-
-    # Dispatch table keyed by x_format -> resolved output format.
-    _impl_map: Dict[FORMAT, FORMAT] = {
-        FORMAT.RAGGED: FORMAT.RAGGED,
-        # Add more entries if you support other formats:
-        # FORMAT.PAGED: FORMAT.PAGED,
-    }
 
     def __init__(self):
         super().__init__()
@@ -61,8 +53,8 @@ class Transpose(vOp):
     # ---------------- profile ----------------
     def profile(self, x: vTensor, ctx: Context) -> vTensor:
         r"""
-        Validate the input, select an implementation, allocate the output
-        buffer, and return a :class:`vTensor` view with the resolved format.
+        Validate the input, allocate the output buffer, and return a
+        :class:`vTensor` view.
 
         The input tensor is expected to have logical shape
         ``[S_in, D_0, D_1]``. The output buffer is allocated with shape
@@ -88,13 +80,12 @@ class Transpose(vOp):
         -------
         vTensor
             A ``vTensor`` view wrapping the internally allocated output
-            buffer with the resolved output format.
+            buffer.
 
         Raises
         ------
         AssertionError
-            If ``x`` is not a :class:`vTensor`, if its rank is not 3, or if
-            no implementation is registered for ``x._format``.
+            If ``x`` is not a :class:`vTensor` or its rank is not 3.
         """
         prefix = self._prefix()
 
@@ -105,13 +96,10 @@ class Transpose(vOp):
             f"got ndim={x.dim()} shape={tuple(x.shape)}"
         )
 
-        # Dispatch by input format
-        x_fmt = x._format
-        assert x_fmt in self._impl_map, (
-            f"{prefix}no implementation for x_fmt={x_fmt}. "
-            f"Available keys: {list(self._impl_map.keys())}"
+        # Output is BATCHED iff the input is BATCHED; otherwise RAGGED.
+        self.output_format = (
+            FORMAT.BATCHED if x._format == FORMAT.BATCHED else FORMAT.RAGGED
         )
-        self.output_format = self._impl_map[x_fmt]
 
         # Allocate output buffer: [S, D1, D0]
         # S is derived from runtime context (number of pages/tokens in the pipeline)

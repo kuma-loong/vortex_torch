@@ -50,21 +50,11 @@ from lighteval.models.model_output import ModelResponse
 # ---------------------------------------------------------------------------
 
 TRIALS                      = 16
-MODEL_NAME                  = "Qwen/Qwen3-1.7B"
 MAX_INPUT_LENGTH            = 4096
 GENERATION_MAX_NEW_TOKENS   = 16384
 TP_SIZE                     = 1
 DATA_PATH                   = "examples/amc23.jsonl"
 SUMMARY_DIR                 = "summary_amc23_submissions"
-
-# `mem_fraction_static` is the fraction of GPU memory sglang reserves for
-# the KV cache + model weights. It is a SUBMISSION-TUNABLE knob: higher
-# values usually raise throughput (more KV-cache headroom → larger
-# decode batches) but raise the risk of CUDA OOM mid-run. Submissions
-# may set `mem_fraction_static` in their JSON; if absent we fall back
-# to the default below. Out-of-range values are rejected at engine-boot.
-MEM_FRACTION_STATIC_DEFAULT = 0.8
-MEM_FRACTION_STATIC_RANGE   = (0.5, 0.95)
 
 
 # ---------------------------------------------------------------------------
@@ -79,36 +69,14 @@ def _load_and_validate_config(config_path: Path) -> Dict[str, Any]:
     return config
 
 
-def _resolve_mem_fraction_static(config: Dict[str, Any]) -> float:
-    """Pull `mem_fraction_static` from the submission JSON (defaulting if
-    absent), coerce to float, and validate the range.
-
-    Hint to submitters: 0.8-0.9 is the usual sweet spot — higher values
-    typically raise throughput (more KV-cache headroom) but risk CUDA
-    OOM mid-decode.
-    """
-    raw = config.get("mem_fraction_static", MEM_FRACTION_STATIC_DEFAULT)
-    try:
-        val = float(raw)
-    except (TypeError, ValueError) as e:
-        raise ValueError(
-            f"mem_fraction_static must be a number, got {raw!r}"
-        ) from e
-    lo, hi = MEM_FRACTION_STATIC_RANGE
-    if not (lo <= val <= hi):
-        raise ValueError(
-            f"mem_fraction_static={val} is out of allowed range [{lo}, {hi}]. "
-            f"Hint: 0.8-0.9 is typical; higher values often raise throughput "
-            f"but risk CUDA OOM."
-        )
-    return val
-
-
 def _build_engine_kwargs(config: Dict[str, Any]) -> Dict[str, Any]:
-    """Merge the submission JSON with the fixed protocol settings."""
+    """Merge the submission JSON with the fixed protocol settings.
+
+    Everything else (``model_path``, ``mem_fraction_static``, etc.) is
+    either taken from the submission JSON or filled in by
+    :func:`get_engine`'s defaults.
+    """
     kwargs = dict(config)
-    kwargs["model_path"]           = MODEL_NAME
-    kwargs["mem_fraction_static"]  = _resolve_mem_fraction_static(kwargs)
     kwargs["tp_size"]              = TP_SIZE
     kwargs["vortex_max_seq_lens"]  = MAX_INPUT_LENGTH + GENERATION_MAX_NEW_TOKENS
     kwargs["context_length"]       = max(
@@ -119,10 +87,10 @@ def _build_engine_kwargs(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _boot_engine(kwargs: Dict[str, Any]):
-    print(f"[engine] booting — model={kwargs['model_path']}, "
+    print(f"[engine] booting — model={kwargs.get('model_path', '<default>')}, "
           f"module={kwargs.get('vortex_module_name')}, "
           f"kv={kwargs.get('kv_cache_dtype', 'auto')}, "
-          f"mem_fraction_static={kwargs['mem_fraction_static']}")
+          f"mem_fraction_static={kwargs.get('mem_fraction_static', '<default>')}")
     return get_engine(**kwargs)
 
 
@@ -223,11 +191,11 @@ def run(config_path: Path) -> Dict[str, Any]:
         "config_path":                str(config_path),
         "vortex_module_name":         config.get("vortex_module_name"),
         "vortex_module_path":         config.get("vortex_module_path"),
-        "model_name":                 MODEL_NAME,
+        "model_path":                 engine_kwargs.get("model_path"),
         "trials":                     TRIALS,
         "max_input_length":           MAX_INPUT_LENGTH,
         "generation_max_new_tokens":  GENERATION_MAX_NEW_TOKENS,
-        "mem_fraction_static":        engine_kwargs["mem_fraction_static"],
+        "mem_fraction_static":        engine_kwargs.get("mem_fraction_static"),
         "tp_size":                    TP_SIZE,
         "data_path":                  DATA_PATH,
     }

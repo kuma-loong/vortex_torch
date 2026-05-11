@@ -1,5 +1,5 @@
 import torch
-from typing import Tuple, Dict, Optional
+from typing import Optional
 from .context import Context
 from ..abs import vTensor, FORMAT, vOp
 from ..utils import Schedule
@@ -58,39 +58,19 @@ class GeMV(vOp):
         \in \mathbb{R}^{S_{\text{pack}} \times 1 \times 1}.
 
     In the runtime, :math:`S_{\text{pack}}` is given by
-    ``ctx.max_num_pages`` and the dispatch is keyed by the pair of input
-    formats ``(x_format, y_format)``.
+    ``ctx.max_num_pages``. Output format rule: ``BATCHED`` iff both
+    inputs are ``BATCHED`` (both have their ``S`` axis already collapsed
+    to 1), otherwise ``RAGGED``. Format compatibility is enforced by
+    the compiler's per-workload kernel.
 
     Attributes
     ----------
-    _impl_map : Dict[Tuple[FORMAT, FORMAT], FORMAT]
-        Dispatch table keyed by ``(x_format, y_format)``. Each entry maps
-        to the resolved output format.
-
     output_format : Optional[FORMAT]
         The output tensor format as determined in :meth:`profile`.
 
     output_buffer : Optional[torch.Tensor]
         Preallocated output tensor buffer of shape ``[S_pack, 1, 1]``.
     """
-
-    # Dispatch table keyed by (x_format, y_format) -> resolved output format.
-    # All per-(batch, head)/per-S combinations produce a RAGGED result (one
-    # row per S-slice). (BATCHED, BATCHED) is the special case: both inputs
-    # are page-independent so the result is also page-independent —
-    # produces a BATCHED tensor. The Schedule.W kernel writes the same value
-    # from every workload that shares ``(batch, head)``; redundant but safe.
-    _impl_map: Dict[Tuple[FORMAT, FORMAT], FORMAT] = {
-        (FORMAT.BATCHED, FORMAT.BATCHED): FORMAT.BATCHED,
-        (FORMAT.BATCHED, FORMAT.PAGED):   FORMAT.RAGGED,
-        (FORMAT.BATCHED, FORMAT.RAGGED):  FORMAT.RAGGED,
-        (FORMAT.PAGED,   FORMAT.BATCHED): FORMAT.RAGGED,
-        (FORMAT.PAGED,   FORMAT.PAGED):   FORMAT.RAGGED,
-        (FORMAT.PAGED,   FORMAT.RAGGED):  FORMAT.RAGGED,
-        (FORMAT.RAGGED,  FORMAT.BATCHED): FORMAT.RAGGED,
-        (FORMAT.RAGGED,  FORMAT.PAGED):   FORMAT.RAGGED,
-        (FORMAT.RAGGED,  FORMAT.RAGGED):  FORMAT.RAGGED,
-    }
 
     def __init__(self):
         super().__init__()
@@ -100,8 +80,8 @@ class GeMV(vOp):
     # ---------------- profile ----------------
     def profile(self, x: vTensor, y: vTensor, ctx: Context) -> vTensor:
         r"""
-        Validate inputs, select an implementation, allocate the output buffer,
-        and return an :func:`as_vtensor` view with the resolved format.
+        Validate inputs, allocate the output buffer, and return a
+        :class:`vTensor` view.
 
         The method enforces the logical shapes
 
@@ -128,14 +108,12 @@ class GeMV(vOp):
             f"{prefix}last dimension mismatch: x.shape[2]={x.shape[2]} vs y.shape[2]={y.shape[2]}"
         )
 
-        # Dispatch
-        x_fmt, y_fmt = x._format, y._format
-        key = (x_fmt, y_fmt)
-        assert key in self._impl_map, (
-            f"{prefix}no implementation for (x_fmt={x_fmt}, y_fmt={y_fmt}). "
-            f"Available: {list(self._impl_map.keys())}"
+        # Output is BATCHED iff both inputs are BATCHED; otherwise RAGGED.
+        self.output_format = (
+            FORMAT.BATCHED
+            if (x._format == FORMAT.BATCHED and y._format == FORMAT.BATCHED)
+            else FORMAT.RAGGED
         )
-        self.output_format = self._impl_map[key]
         # Pure-metadata vTensor — no torch.empty allocation needed.
         self.output_buffer = vTensor(
             shape=(0, 1, 1),
@@ -192,37 +170,19 @@ class GeMM(vOp):
 
     - The output tensor ``O`` has logical shape ``[S, N_y, N_x]``.
 
-    At runtime, the logical ``S`` is taken from ``ctx.max_num_pages``, and
-    dispatch is keyed by the pair of tensor formats ``(x_format, y_format)``.
+    At runtime, the logical ``S`` is taken from ``ctx.max_num_pages``.
+    Output format rule: ``BATCHED`` iff both inputs are ``BATCHED``,
+    otherwise ``RAGGED``. Format compatibility is enforced by the
+    compiler's per-workload kernel.
 
     Attributes
     ----------
-    _impl_map : Dict[Tuple[FORMAT, FORMAT], FORMAT]
-        Dispatch table keyed by ``(x_format, y_format)``. Each entry maps to
-        the resolved output format.
-
     output_format : Optional[FORMAT]
         The output tensor format as determined in :meth:`profile`.
 
     output_buffer : Optional[torch.Tensor]
         Preallocated output tensor buffer of shape ``[S, N_y, N_x]``.
     """
-
-    # Dispatch table keyed by (x_format, y_format) -> resolved output format.
-    # See :class:`GeMV` for the rationale; (BATCHED, BATCHED) keeps both
-    # inputs page-independent and produces a BATCHED result, written by the
-    # Schedule.W kernel via the BATCHED store path.
-    _impl_map: Dict[Tuple[FORMAT, FORMAT], FORMAT] = {
-        (FORMAT.BATCHED, FORMAT.BATCHED): FORMAT.BATCHED,
-        (FORMAT.BATCHED, FORMAT.PAGED):   FORMAT.RAGGED,
-        (FORMAT.BATCHED, FORMAT.RAGGED):  FORMAT.RAGGED,
-        (FORMAT.PAGED,   FORMAT.BATCHED): FORMAT.RAGGED,
-        (FORMAT.PAGED,   FORMAT.PAGED):   FORMAT.RAGGED,
-        (FORMAT.PAGED,   FORMAT.RAGGED):  FORMAT.RAGGED,
-        (FORMAT.RAGGED,  FORMAT.BATCHED): FORMAT.RAGGED,
-        (FORMAT.RAGGED,  FORMAT.PAGED):   FORMAT.RAGGED,
-        (FORMAT.RAGGED,  FORMAT.RAGGED):  FORMAT.RAGGED,
-    }
 
     def __init__(self):
         super().__init__()
@@ -233,8 +193,8 @@ class GeMM(vOp):
     # ---------------- profile ----------------
     def profile(self, x: vTensor, y: vTensor, ctx: Context) -> vTensor:
         r"""
-        Validate inputs, select implementation, allocate the output buffer,
-        and return an :func:`as_vtensor` view with the resolved format.
+        Validate inputs, allocate the output buffer, and return a
+        :class:`vTensor` view.
 
         The method enforces that both inputs are rank-3 tensors and that the
         inner dimension :math:`K` matches:
@@ -254,8 +214,7 @@ class GeMM(vOp):
         ----------
         x : vTensor
             Right-hand operand (transposed in the mathematical view), with
-            shape ``[B_or_S, N_x, K]`` and a format participating in the
-            ``(x_format, y_format)`` dispatch.
+            shape ``[B_or_S, N_x, K]``.
 
         y : vTensor
             Left-hand operand with shape ``[S, N_y, K]``.
@@ -267,15 +226,13 @@ class GeMM(vOp):
         Returns
         -------
         vTensor
-            A ``vTensor`` view wrapping the allocated output buffer with the
-            resolved output format.
+            A ``vTensor`` view wrapping the allocated output buffer.
 
         Raises
         ------
         AssertionError
-            If types are not ``vTensor``, ranks are not 3, the inner
-            dimensions :math:`K` do not match, or there is no implementation
-            for the pair ``(x._format, y._format)``.
+            If types are not ``vTensor``, ranks are not 3, or the inner
+            dimensions :math:`K` do not match.
         """
         prefix = self._prefix()
 
@@ -292,14 +249,12 @@ class GeMM(vOp):
             f"{prefix}last dimension mismatch: x.shape[2]={x.shape[2]} vs y.shape[2]={y.shape[2]}"
         )
 
-        # Dispatch
-        x_fmt, y_fmt = x._format, y._format
-        key = (x_fmt, y_fmt)
-        assert key in self._impl_map, (
-            f"{prefix}no implementation for (x_fmt={x_fmt}, y_fmt={y_fmt}). "
-            f"Available: {list(self._impl_map.keys())}"
+        # Output is BATCHED iff both inputs are BATCHED; otherwise RAGGED.
+        self.output_format = (
+            FORMAT.BATCHED
+            if (x._format == FORMAT.BATCHED and y._format == FORMAT.BATCHED)
+            else FORMAT.RAGGED
         )
-        self.output_format = self._impl_map[key]
 
         # Output logical sizes: Ny x Nx
         Ny, Nx = y.shape[1], x.shape[1]
