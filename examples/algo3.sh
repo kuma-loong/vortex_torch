@@ -2,6 +2,7 @@
 export CUDA_VISIBLE_DEVICES=5
 set -e
 sparse_algos=(
+full_attention
 block_sparse_attention
 )
 
@@ -29,7 +30,7 @@ for algo in "${sparse_algos[@]}"; do
             --vortex-module-name "${algo}" \
             --model-name  "${model}" \
             --mem 0.85 \
-            --data-path examples/aime24.jsonl \
+            --data-path examples/aime26.jsonl \
             --generation-max-new-tokens 16384 \
             --max-input-length 4096 \
             --tp-size 1 \
