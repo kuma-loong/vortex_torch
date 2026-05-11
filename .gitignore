@@ -6,6 +6,7 @@ debug/
 debug*
 # C extensions
 *.so
+*.whl
 *compiled_func.py
 flashinfer_test.py
 # Distribution / packaging
@@ -253,6 +254,7 @@ Cargo.lock
 .claude/settings.local.json
 *.jsonl
 !examples/lcbv5.jsonl
+!examples/aime26.jsonl
 RLG
 .codex
 .claude/.nfs*
