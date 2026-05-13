@@ -16,11 +16,26 @@ def _check_topk_io(graph: Graph, op_id: int) -> tuple[int, int]:
 
 
 def generate_topk_impl(graph: Graph, op_id: int, ctx: Context) -> str:
-    ctx.compilation_header_lines.append("from vortex_torch_C import topk_output, topk_output_v2")  # Import the custom C++ extension for topk
+    # Pick the best-known top-k kernel at runtime via the dispatcher in
+    # ``vortex_torch/kernels/topk/dispatcher.py``. We don't know which
+    # specialised kernel will be selected at codegen time (it depends on
+    # ``ctx.max_topk_val``, available only per call), so emit a tiny
+    # per-module memo so the hot path collapses to a dict lookup.
+    # ``max_topk_val=None`` falls through to the CUB-sort baseline,
+    # matching the previous ``topk_output`` behavior.
+    ctx.compilation_header_lines.extend([
+        "from vortex_torch.kernels.topk.dispatcher import dispatch as _vortex_topk_dispatch",
+        "_vortex_topk_kernel_cache = {}",
+        "def _vortex_topk_kernel_for(max_topk):",
+        "    fn = _vortex_topk_kernel_cache.get(max_topk)",
+        "    if fn is None:",
+        "        fn = _vortex_topk_kernel_cache[max_topk] = _vortex_topk_dispatch(max_topk)",
+        "    return fn",
+    ])
     input_tensor_id, output_tensor_id = _check_topk_io(graph, op_id)
 
     impl_lines = [
-        f"topk_output(",
+        f"_vortex_topk_kernel_for(getattr(ctx, 'max_topk_val', None))(",
         f"{INDENT * 2}tensor_{input_tensor_id},",
         f"{INDENT * 2}ctx.dense_kv_indptr,",
         f"{INDENT * 2}ctx.sparse_kv_indptr,",

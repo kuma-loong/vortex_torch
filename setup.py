@@ -103,7 +103,7 @@ if any(cap >= (9, 0) for cap in _cuda_caps):
 
 setup(
     name="vortex_torch",
-    version="0.3.0",
+    version="0.4.0",
     packages=find_packages(),
     python_requires=">=3.10",
     install_requires=[

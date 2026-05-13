@@ -24,7 +24,7 @@ Activate the conda environment:
 ```bash
 CONDA_BASE=$(conda info --base 2>/dev/null || echo /root/anaconda3)
 source "$CONDA_BASE/etc/profile.d/conda.sh"
-conda activate vortex_new
+conda activate vortex_v04
 python -c "import sys; print(sys.executable)"
 ```
 

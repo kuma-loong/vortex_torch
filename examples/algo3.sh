@@ -2,7 +2,6 @@
 export CUDA_VISIBLE_DEVICES=5
 set -e
 sparse_algos=(
-full_attention
 block_sparse_attention
 )
 
@@ -10,7 +9,7 @@ models=(
 Qwen/Qwen3-4B
 )
 trials=(
-16
+8
 )
 topk_val=(
 61
@@ -24,17 +23,17 @@ for algo in "${sparse_algos[@]}"; do
             --trials ${trial} \
             --topk-val ${k_val} \
             --page-size 16 \
-            --workload-chunk-size 64 \
+            --workload-chunk-size 32 \
             --block-size 16 \
-            --topk-ratio 0.0625 \
+            --topk-ratio 0.00 \
             --vortex-module-name "${algo}" \
             --model-name  "${model}" \
             --mem 0.85 \
-            --data-path examples/aime26.jsonl \
+            --data-path examples/aime24.jsonl \
             --generation-max-new-tokens 16384 \
             --max-input-length 4096 \
             --tp-size 1 \
-            --summary-dir summary-Qwen3-4B
+            --summary-dir summary-Qwen3-4B-Fast
       done
     done
   done

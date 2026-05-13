@@ -1,9 +1,36 @@
+"""Latency + recall comparison: best JIT top-k kernel vs CUB baseline.
+
+- Baseline (v1): ``vortex_torch/kernels/topk/configs/sort_default.json``
+  (CUB ``BlockRadixSort``, fp32 keys).
+- Best (v2):     ``vortex_torch/kernels/topk/k_256/configs/claude_opus_4_7/batch_24_id1.json``
+  (regcache-unrolled 8-bit radix + ``x*|x|`` transform, T=512, smem=8KB).
+  Geomean ~1.48x over baseline at R@253 >= 0.9952 — see
+  ``vortex_torch/kernels/topk/k_256/reports/claude_opus_4_7/batch_24_id1.md``.
+
+Both kernels share the entry-point signature
+
+    topk(x, dense_kv_indptr, sparse_kv_indptr, dense_kv_indices,
+         sparse_kv_indices, eff_batch_size, reserved_bos, reserved_eos,
+         max_num_pages)
+"""
+
+from pathlib import Path
+
 import torch
 import triton
-from vortex_torch_C import approx_topk_output, topk_output
 from tqdm import tqdm
+
+import vortex_torch.kernels.topk as _vt_topk
+from vortex_torch.kernels.topk.dispatcher import load_submission
+
+
+_TOPK_ROOT = Path(_vt_topk.__file__).resolve().parent
+BASELINE_CONFIG = _TOPK_ROOT / "configs" / "sort_default.json"
+BEST_CONFIG = _TOPK_ROOT / "k_256" / "configs" / "claude_opus_4_7" / "batch_24_id1.json"
+
+
 SEQ_LENS = [1024, 1536, 2048, 4096]
-BATCH_SIZES = [16, 32, 64, 128, 256, 512]
+BATCH_SIZES = [16, 32, 64, 128]
 
 K = 253
 EVAL_KS = [5, 10, 16, 32, 64, 96, 125, 157, 189, 253]
@@ -49,44 +76,19 @@ def make_inputs(batch_size, seq_len, k, reserve_bos, reserve_eos, device="cuda")
     )
 
 
-def run_v1(
+def run_kernel(
+    module,
     scores,
     dense_kv_indptr,
-    dense_kv_indices,
     sparse_kv_indptr,
+    dense_kv_indices,
     sparse_kv_indices,
     batch_size,
-    k,
     reserve_bos,
     reserve_eos,
     seq_len,
 ):
-    topk_output(
-        scores,
-        dense_kv_indptr,
-        dense_kv_indices,
-        sparse_kv_indptr,
-        sparse_kv_indices,
-        batch_size,
-        reserve_bos,
-        reserve_eos,
-        seq_len,
-    )
-
-
-def run_v2(
-    scores,
-    dense_kv_indptr,
-    dense_kv_indices,
-    sparse_kv_indptr,
-    sparse_kv_indices,
-    batch_size,
-    k,
-    reserve_bos,
-    reserve_eos,
-    seq_len,
-):
-    approx_topk_output(
+    module.topk(
         scores,
         dense_kv_indptr,
         sparse_kv_indptr,
@@ -96,7 +98,6 @@ def run_v2(
         reserve_bos,
         reserve_eos,
         seq_len,
-        0.1  # tolerate_ratio
     )
 
 
@@ -107,24 +108,22 @@ def compute_recall_at_ks(ref_indices, pred_indices, batch_size, k, eval_ks):
 
     recall@r = fraction of ref top-r recovered in pred top-k
     """
-    ref = ref_indices.view(batch_size, k).to(torch.int64)   # [B, K]
-    pred = pred_indices.view(batch_size, k).to(torch.int64) # [B, K]
+    ref = ref_indices.view(batch_size, k).to(torch.int64)
+    pred = pred_indices.view(batch_size, k).to(torch.int64)
 
     recalls = {}
 
     for r in eval_ks:
-        ref_r = ref[:, :r]  # only reference top-r
-        # compare ref top-r against ALL pred K entries
-        match = (ref_r.unsqueeze(2) == pred.unsqueeze(1))   # [B, r, K]
-        hit = match.any(dim=2)                              # [B, r]
-        recall = hit.float().sum(dim=1) / r                 # [B]
+        ref_r = ref[:, :r]
+        match = (ref_r.unsqueeze(2) == pred.unsqueeze(1))
+        hit = match.any(dim=2)
+        recall = hit.float().sum(dim=1) / r
         recalls[r] = recall.mean().item()
 
     return recalls
 
 
 def bench_latency(fn):
-    # warmup
     for _ in range(10):
         fn()
     torch.cuda.synchronize()
@@ -138,7 +137,7 @@ def bench_latency(fn):
     return ms
 
 
-def eval_one(batch_size, seq_len, k, reserve_bos, reserve_eos):
+def eval_one(baseline_mod, best_mod, batch_size, seq_len, k, reserve_bos, reserve_eos):
     (
         scores,
         dense_kv_indptr,
@@ -156,34 +155,33 @@ def eval_one(batch_size, seq_len, k, reserve_bos, reserve_eos):
     )
 
     def fn_v1():
-        run_v1(
+        run_kernel(
+            baseline_mod,
             scores,
             dense_kv_indptr,
             sparse_kv_indptr,
             dense_kv_indices,
             sparse_kv_indices_v1,
             batch_size,
-            k,
             reserve_bos,
             reserve_eos,
             seq_len,
         )
 
     def fn_v2():
-        run_v2(
+        run_kernel(
+            best_mod,
             scores,
             dense_kv_indptr,
-            dense_kv_indices,
             sparse_kv_indptr,
+            dense_kv_indices,
             sparse_kv_indices_v2,
             batch_size,
-            k,
             reserve_bos,
             reserve_eos,
             seq_len,
         )
 
-    # 先各跑一次，拿输出
     fn_v1()
     fn_v2()
     torch.cuda.synchronize()
@@ -195,7 +193,6 @@ def eval_one(batch_size, seq_len, k, reserve_bos, reserve_eos):
         eval_ks=EVAL_KS,
     )
 
-    # latency
     ms_v1 = bench_latency(fn_v1)
     ms_v2 = bench_latency(fn_v2)
 
@@ -204,6 +201,12 @@ def eval_one(batch_size, seq_len, k, reserve_bos, reserve_eos):
 
 def main():
     torch.cuda.init()
+
+    print(f"Baseline (v1): {BASELINE_CONFIG}")
+    print(f"Best     (v2): {BEST_CONFIG}")
+    print("Compiling kernels (JIT, cached)...")
+    baseline_mod = load_submission(str(BASELINE_CONFIG))
+    best_mod = load_submission(str(BEST_CONFIG))
 
     results = {}
 
@@ -228,6 +231,8 @@ def main():
             for seed in tqdm(range(NUM_RUNS)):
                 torch.cuda.manual_seed(seed)
                 ms_v1, ms_v2, recalls = eval_one(
+                    baseline_mod,
+                    best_mod,
                     batch_size=bs,
                     seq_len=seq_len,
                     k=K,

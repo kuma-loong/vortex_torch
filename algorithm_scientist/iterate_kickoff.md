@@ -10,7 +10,7 @@ start the first batch.
 ## How to use
 
 1. Open a fresh Claude Code session in this repo (`cd
-   /home/zhuominc/new_envs/vortex_new/vortex_torch`, then `claude`).
+   /home/zhuominc/vortex_v04/vortex_torch`, then `claude`).
 2. Set `MAX_ITERATIONS` at the top of the prompt block to the number
    of batches you want this session (e.g. `3`). Set to `0` for no limit.
 3. Paste the entire block below as your first message.

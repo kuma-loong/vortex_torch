@@ -22,7 +22,7 @@ class Context(ContextBase):
         # hardware / paging
         "num_sms", "page_size", "max_num_pages", "max_num_pages_per_request", "block_size", "max_num_blocks", "max_num_blocks_per_request", "num_blocks_per_page", "num_pages_per_workload",
         # misc
-        "topk_val", "topk_ratio", "block_reserved_bos", "block_reserved_eos",
+        "topk_val", "topk_ratio", "block_reserved_bos", "block_reserved_eos", "max_topk_val",
         
         # auxilary memory in graph
         "_aux_total_bytes",
@@ -80,6 +80,7 @@ class Context(ContextBase):
     topk_ratio: float                #: Top-K ratio used in pruning or selection.
     block_reserved_bos: int           #: Reserved page count for BOS (begin-of-sequence).
     block_reserved_eos: int           #: Reserved page count for EOS (end-of-sequence).
+    max_topk_val: Union[int, None]   #: Optional maximum Top-K value to dispatch topk kernel variants.
 
     # --- auxiliary ---
     _aux_total_bytes: int            #: Accumulated auxiliary memory in bytes.
@@ -164,6 +165,7 @@ class Context(ContextBase):
         self.max_num_blocks_per_request = self.max_num_pages_per_request * self.num_blocks_per_page
         self.num_pages_per_workload = self.workload_chunk_size // self.num_blocks_per_page
         self.topk_val = sa.vortex_topk_val
+        self.max_topk_val = sa.vortex_max_topk_val
         self.topk_ratio = sa.vortex_topk_ratio
         self.vortex_dtype = resolve_dtype(
             getattr(sa, "vortex_dtype", "bfloat16"), default=torch.bfloat16

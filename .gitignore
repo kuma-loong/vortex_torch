@@ -254,6 +254,7 @@ Cargo.lock
 .claude/settings.local.json
 *.jsonl
 !examples/lcbv5.jsonl
+!examples/aime25.jsonl
 !examples/aime26.jsonl
 RLG
 .codex
@@ -261,3 +262,4 @@ RLG
 *.slurm
 RLG/
 scripts/
+vortex_torch/kernels/centroid_score

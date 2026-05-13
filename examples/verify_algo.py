@@ -37,6 +37,7 @@ kv_cache_dtype: str = "auto"
                     vortex_block_size=block_size,
                     page_size=page_size,
                     vortex_topk_val=topk_val,
+                    vortex_max_topk_val=96,
                     tp_size=tp_size,
                     kv_cache_dtype=kv_cache_dtype,
                     disable_overlap_schedule=True,
