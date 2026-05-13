@@ -1,0 +1,9 @@
+{
+    "file": "../../sources/claude_opus_4_7/batch_12_id1.cu",
+    "substitutions": {
+        "__THREADS_PER_BLOCK__": 512,
+        "__VORTEX_MAX_TOPK__": 256,
+        "__SMEM_BYTES__": 16384
+    },
+    "extra_cuda_cflags": []
+}

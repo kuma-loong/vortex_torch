@@ -1,0 +1,9 @@
+{
+    "file": "../../radix_topk.cu",
+    "substitutions": {
+        "__THREADS_PER_BLOCK__": 1024,
+        "__VORTEX_MAX_TOPK__": 256,
+        "__SMEM_BYTES__": 49152
+    },
+    "extra_cuda_cflags": []
+}

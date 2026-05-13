@@ -1,0 +1,10 @@
+{
+    "file": "../../sources/claude_opus_4_7/batch_0_base_winner.cu",
+    "substitutions": {
+        "__THREADS_PER_BLOCK__": 512,
+        "__VORTEX_MAX_TOPK__": 96,
+        "__SMEM_BYTES__": 8192,
+        "__TRANSFORM_TYPE__": 1
+    },
+    "extra_cuda_cflags": []
+}
