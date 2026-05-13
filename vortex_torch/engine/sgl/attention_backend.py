@@ -36,7 +36,6 @@ from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 from sglang.srt.utils import is_flashinfer_available
-from sglang.srt.mem_cache.vtx_graph_memory_pool import VTXGraphCachePool
 from sglang.srt.layers.attention.flashinfer_backend import should_use_tensor_core
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -560,7 +559,6 @@ class VortexFlashInferBackend(AttentionBackend):
         save_kv_cache=True,
     ):
         
-        assert isinstance(forward_batch.token_to_kv_pool, VTXGraphCachePool)
         assert not layer.is_cross_attention
         cache_loc = forward_batch.out_cache_loc
         
@@ -641,7 +639,6 @@ class VortexFlashInferBackend(AttentionBackend):
         """
 
         # Sanity checks and setup
-        assert isinstance(forward_batch.token_to_kv_pool, VTXGraphCachePool)
         assert not layer.is_cross_attention
         cache_loc = forward_batch.out_cache_loc
 
