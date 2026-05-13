@@ -122,6 +122,11 @@ def generate_initialization_str(sub_graph: Graph, ctx: Context) -> str:
             lines.append(f"tensor_{tid}_dim1_ptr = tl.arange(0, {t.shape[1]})")
             lines.append(f"tensor_{tid}_dim2_ptr = tl.arange(0, {t.shape[2]})")
 
+    # Multi-page PAGED scratch index pointers (workload spans >1 page).
+    # ``page_idx_i32_ptr`` enumerates pages within a workload;
+    # ``block_i32_ptr`` enumerates blocks within a page; ``tensor_X_flat_ptr``
+    # is the flattened per-page element index (one page = num_blocks_per_page
+    # blocks of shape[1] x shape[2] elements).
     if ctx.num_pages_per_workload > 1:
         lines.append(f"page_idx_i32_ptr = tl.arange(0, {ctx.num_pages_per_workload})")
         lines.append(f"block_i32_ptr = tl.arange(0, {ctx.num_blocks_per_page})")
@@ -182,6 +187,8 @@ def _load_paged_single_page(tid: int, t, ctx: Context) -> List[str]:
 
 
 def _load_paged_multi_page(tid: int, t, ctx: Context) -> List[str]:
+    # ``page_valid`` masks the per-page lanes (length num_pages_per_workload);
+    # distinct from ``valid`` which masks the per-block workload lanes.
     reshape = (
         f"tl.reshape(tl.load(tensor_{tid}_block_ptr, mask=page_valid[:, None], "
         f'other=0.0, cache_modifier=".cv"), '
@@ -246,6 +253,9 @@ def generate_load_tensor_str(sub_graph: Graph, ctx: Context) -> str:
     if ctx.num_pages_per_workload == 1:
         page_idx_line = "page_idx_i32 = tl.load(indices + ragged_idx_i32).to(tl.int32)"
     else:
+        # ``page_idx_i32_ptr`` enumerates pages within a workload; multiplying
+        # by ``num_blocks_per_page`` yields the block-granular stride into
+        # ``indices`` (which is keyed at block-of-page granularity).
         page_idx_line = (
             f"page_indices_i32 = tl.load(indices + ragged_idx_i32 + "
             f"page_idx_i32_ptr * {ctx.num_blocks_per_page}, mask=page_valid, "
@@ -287,6 +297,9 @@ def _store_paged_single_page(tid: int, t, ctx: Context) -> List[str]:
 
 
 def _store_paged_multi_page(tid: int, t, ctx: Context) -> List[str]:
+    # When ``page_size > block_size`` the destination layout has separate
+    # page-of-workload and block-of-page axes; the pointer expression and
+    # reshape both keep all four (page, block, dim1, dim2).
     ptr_expr = (
         f"tensor_{tid}_block_ptr = tensor_{tid}_ptr "
         f"+ page_indices_i32[:,None,None,None] * {t.shape[1] * t.shape[2]} "
@@ -371,6 +384,9 @@ def generate_store_tensor_str(sub_graph: Graph, ctx: Context) -> str:
     paged_str = "\n".join(paged) if paged else ""
 
     if ragged:
+        # When ``num_pages_per_workload == 1`` the preamble doesn't define
+        # ``_len`` / ``valid`` (the multi-page preamble does); RAGGED stores
+        # need both, so emit them here in the single-page case.
         ragged_str = (
             "\n".join([
                 "_len = tl.load(winfo_y_lens + i)",

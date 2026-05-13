@@ -443,6 +443,17 @@ class Conv1d(vOp):
             f"must match input inner dims {tuple(x.shape[1:])}"
         )
 
+        # ``__init__`` materializes ``self.weight`` on whatever device the
+        # user passed (defaulting to CPU when none was given), but the
+        # generated Triton kernel dereferences ``weight`` from the GPU.
+        # Migrate here — ``profile`` is the first call where the
+        # inference device is known. ``.to`` is a no-op if already on the
+        # right device, so it's safe to call on every re-profile.
+        if self.weight.device != x.device:
+            self.weight = self.weight.to(device=x.device)
+        if not self.weight.is_contiguous():
+            self.weight = self.weight.contiguous()
+
         x_fmt = x._format
         assert x_fmt in self._impl_map, (
             f"{prefix}no implementation for x_fmt={x_fmt}. "
