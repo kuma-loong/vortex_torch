@@ -1,0 +1,24 @@
+"""Vortex attention backends for sglang.
+
+Each backend lives in its own sibling module here (``flashinfer.py``,
+future ``triton.py``, ``flash_attention.py``, …) and exposes one
+``AttentionBackend`` subclass. The package re-exports their public
+names so existing call sites such as::
+
+    from vortex_torch.engine.sgl.attention_backend import VortexFlashInferBackend
+
+continue to work unchanged after the split.
+
+Adding a new backend:
+  1. Drop ``my_backend.py`` next to this file. Subclass
+     ``sglang.srt.layers.attention.base_attn_backend.AttentionBackend``;
+     implement ``init_forward_metadata``, ``forward_extend``,
+     ``forward_decode`` etc.
+  2. Re-export the class below — keep the registry deterministic so
+     ``model_runner.py`` can pick it by name.
+"""
+from vortex_torch.engine.sgl.attention_backend.flashinfer import (
+    VortexFlashInferBackend,
+)
+
+__all__ = ["VortexFlashInferBackend"]

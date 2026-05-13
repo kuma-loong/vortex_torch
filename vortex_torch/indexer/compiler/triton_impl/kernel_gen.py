@@ -1,20 +1,47 @@
+"""Triton kernel generator for fused indexer subgraphs.
+
+A subgraph is one of:
+  - ``Schedule.W`` (workload-scheduled): emit a ``@triton.jit`` kernel +
+    a Python wrapper that launches it across ``num_sms * 4`` programs.
+    The kernel iterates planner-scheduled workloads ``[start, end)``,
+    each covering ``workload_chunk_size`` ragged slots / pages.
+  - non-W: a single op whose impl function is inlined directly into a
+    plain Python wrapper. The op's ``get_impl_func`` does all codegen.
+
+The W path is the bulk of this file. Generated kernels load inputs by
+``FORMAT`` (BATCHED / PAGED / RAGGED), run a chain of op impl strings,
+then store outputs by ``FORMAT``. The store body is also gated for
+BATCHED outputs that may be written by multiple workloads sharing the
+same ``(batch, head)`` slot.
+
+Public API: :func:`generate_triton_impl`. The other ``generate_*`` /
+helper symbols below are kept exported for in-tree debugging and tests.
+"""
+from __future__ import annotations
+
+from typing import Iterable, List, Tuple
+
 from ..graph import Graph
-from typing import Dict, List, Tuple, Callable
 from ...context import Context
 from ....abs import FORMAT
 from ....utils import Schedule, INDENT
 from .register import get_impl_func
-from .dtype_cast import is_fp8 as _is_fp8, load_cast_expr as _load_cast_expr, store_cast_expr as _store_cast_expr
-import os
-import torch
+from .dtype_cast import (
+    is_fp8 as _is_fp8,
+    load_cast_expr as _load_cast_expr,
+    store_cast_expr as _store_cast_expr,
+)
 
+
+# --------------------------------------------------------------------------- #
+# Small utilities
+# --------------------------------------------------------------------------- #
 
 def _has_batched_output(sub_graph) -> bool:
     """True iff the subgraph stores any BATCHED tensor.
 
-    Used to conditionally include ``winfo_is_first_workload_per_batch`` in
-    the kernel signature/launcher and to decide whether the store body
-    needs the per-workload "first" gate at all.
+    Drives ``winfo_is_first_workload_per_batch`` in the kernel signature /
+    launcher and the per-workload "first" gate in the store body.
     """
     return any(
         sub_graph.tensor_list[tid]._format == FORMAT.BATCHED
@@ -23,303 +50,419 @@ def _has_batched_output(sub_graph) -> bool:
 
 
 def indent_block(text: str, level: int = 1) -> str:
-    """
-    Indent a multi-line text block by the given indentation level.
-    """
+    """Indent every non-blank line in ``text`` by ``level`` ``INDENT`` units."""
     prefix = INDENT * level
-    lines = text.splitlines()
-    return "\n".join(prefix + line if line.strip() else line for line in lines)
+    return "\n".join(
+        prefix + line if line.strip() else line for line in text.splitlines()
+    )
 
 
-def generate_initialization_str(sub_graph: Graph, ctx:Context) -> str:
+def _join_sections(sections: Iterable[str], fallback: str) -> str:
+    """Join non-empty ``sections`` with ``\\n\\n``; return ``fallback`` if all empty."""
+    non_empty = [s for s in sections if s]
+    return "\n\n".join(non_empty) if non_empty else fallback
+
+
+def _iter_kernel_tensors(sub_graph) -> Iterable[Tuple[int, str]]:
+    """Yield ``(tensor_id, role)`` for each kernel argument tensor.
+
+    A tensor that's both an input (``Load``) and an output (``Save``)
+    appears exactly once, with ``role='output'``. Otherwise role is
+    ``'input'`` (input-only) or ``'output'`` (output-only).
     """
-    Generate the initialization code string for a given sub-graph.
-    This may include declarations of intermediate variables and pre-computations.
-    """
-    lines = []
+    output_set = set(sub_graph.output_tensor_ids)
+    for tid in sub_graph.input_tensor_ids:
+        if tid in output_set:
+            continue
+        yield tid, "input"
+    for tid in sub_graph.output_tensor_ids:
+        yield tid, "output"
 
-    for local_tensor_id in sub_graph.input_tensor_ids:
-        t = sub_graph.tensor_list[local_tensor_id]
+
+def _emit_block_ptr(tensor_id: int, t, offset_var: str, block_dim0_expr) -> str:
+    """Emit one ``tl.make_block_ptr(...)`` assignment.
+
+    Used by BATCHED/RAGGED/PAGED loads and the PAGED-single-page store.
+    The strides + shape come from ``t.shape``; only the offset and
+    block-shape leading dim differ across callers.
+    """
+    return "\n".join([
+        f"tensor_{tensor_id}_block_ptr = tl.make_block_ptr(",
+        f"{INDENT}base=tensor_{tensor_id}_ptr,",
+        f"{INDENT}shape=(tensor_{tensor_id}_dim0 * {t.shape[1]}, {t.shape[2]}),",
+        f"{INDENT}strides=({t.shape[2]}, 1),",
+        f"{INDENT}offsets=({offset_var}, 0),",
+        f"{INDENT}block_shape=({block_dim0_expr}, {t.shape[2]}),",
+        f"{INDENT}order=(1, 0),",
+        f")",
+    ])
+
+
+# --------------------------------------------------------------------------- #
+# Initialization
+# --------------------------------------------------------------------------- #
+
+def generate_initialization_str(sub_graph: Graph, ctx: Context) -> str:
+    """Pre-kernel-loop declarations: zero-init BATCHED input slots and
+    pre-build ``tl.arange`` index pointers for ragged / paged outputs."""
+    lines: List[str] = []
+
+    for tid in sub_graph.input_tensor_ids:
+        t = sub_graph.tensor_list[tid]
         if t._format == FORMAT.BATCHED:
-            lines.append(f"# Declare variables for tensor_{local_tensor_id}")
+            lines.append(f"# Declare variables for tensor_{tid}")
             lines.append(
-                f"tensor_{local_tensor_id}_block = tl.zeros((1, {t.shape[1]}, {t.shape[2]}), dtype=tl.float32)"
+                f"tensor_{tid}_block = tl.zeros((1, {t.shape[1]}, {t.shape[2]}), "
+                f"dtype=tl.float32)"
             )
 
-    
-    for local_tensor_id in sub_graph.output_tensor_ids:
-        t = sub_graph.tensor_list[local_tensor_id]
+    for tid in sub_graph.output_tensor_ids:
+        t = sub_graph.tensor_list[tid]
         if t._format in (FORMAT.RAGGED, FORMAT.BATCHED):
-            lines.append(f"tensor_{local_tensor_id}_dim1_ptr = tl.arange(0, {t.shape[1]})")
-            lines.append(f"tensor_{local_tensor_id}_dim2_ptr = tl.arange(0, {t.shape[2]})")
+            lines.append(f"tensor_{tid}_dim1_ptr = tl.arange(0, {t.shape[1]})")
+            lines.append(f"tensor_{tid}_dim2_ptr = tl.arange(0, {t.shape[2]})")
 
     if ctx.num_pages_per_workload > 1:
         lines.append(f"page_idx_i32_ptr = tl.arange(0, {ctx.num_pages_per_workload})")
         lines.append(f"block_i32_ptr = tl.arange(0, {ctx.num_blocks_per_page})")
-        for local_tensor_id in sub_graph.input_tensor_ids:
-            t = sub_graph.tensor_list[local_tensor_id]
-            if t._format == FORMAT.PAGED:     
-                lines.append(f"tensor_{local_tensor_id}_flat_ptr = tl.arange(0, {ctx.num_blocks_per_page * t.shape[1] * t.shape[2]})")
-        for local_tensor_id in sub_graph.output_tensor_ids:
-            t = sub_graph.tensor_list[local_tensor_id]
-            if t._format == FORMAT.PAGED:     
-                lines.append(f"tensor_{local_tensor_id}_dim1_ptr = tl.arange(0, {t.shape[1]})")
-                lines.append(f"tensor_{local_tensor_id}_dim2_ptr = tl.arange(0, {t.shape[2]})")
-                
+        for tid in sub_graph.input_tensor_ids:
+            t = sub_graph.tensor_list[tid]
+            if t._format == FORMAT.PAGED:
+                lines.append(
+                    f"tensor_{tid}_flat_ptr = tl.arange(0, "
+                    f"{ctx.num_blocks_per_page * t.shape[1] * t.shape[2]})"
+                )
+        for tid in sub_graph.output_tensor_ids:
+            t = sub_graph.tensor_list[tid]
+            if t._format == FORMAT.PAGED:
+                lines.append(f"tensor_{tid}_dim1_ptr = tl.arange(0, {t.shape[1]})")
+                lines.append(f"tensor_{tid}_dim2_ptr = tl.arange(0, {t.shape[2]})")
+
     return "\n".join(lines) if lines else "# No initialization required"
 
 
-def generate_load_tensor_str(sub_graph: Graph, ctx: Context) -> str:
-    """
-    Generate the tensor loading code string for a given sub-graph.
-    """
-    batched_lines = []
-    paged_lines = []
-    ragged_lines = []
-    for local_tensor_id in sub_graph.input_tensor_ids:
-        t = sub_graph.tensor_list[local_tensor_id]
-        if t._format == FORMAT.BATCHED:
-            batched_lines.append(
-                f"tensor_{local_tensor_id}_ptr_row_start = new_batch_idx_i32 * {t.shape[1]}"
-            )
-            batched_lines.append(
-                "\n".join([
-                    f"tensor_{local_tensor_id}_block_ptr = tl.make_block_ptr(",
-                    f"{INDENT}base=tensor_{local_tensor_id}_ptr,",
-                    f"{INDENT}shape=(tensor_{local_tensor_id}_dim0 * {t.shape[1]}, {t.shape[2]}),",
-                    f"{INDENT}strides=({t.shape[2]}, 1),",
-                    f"{INDENT}offsets=(tensor_{local_tensor_id}_ptr_row_start, 0),",
-                    f"{INDENT}block_shape=({t.shape[1]}, {t.shape[2]}),",
-                    f"{INDENT}order=(1, 0),",
-                    f")",
-                ])
-            )
-            batched_reshape = f"tl.reshape(tl.load(tensor_{local_tensor_id}_block_ptr, boundary_check=(0, 1), padding_option=\"zero\", cache_modifier=\".ca\"), (1, {t.shape[1]}, {t.shape[2]}))"
-            batched_lines.append(f"tensor_{local_tensor_id}_block = {_load_cast_expr(batched_reshape, t)}")
-        elif t._format == FORMAT.PAGED:
+# --------------------------------------------------------------------------- #
+# Load (per FORMAT)
+# --------------------------------------------------------------------------- #
 
-            if ctx.num_pages_per_workload == 1:
-                paged_lines.append(
-                    f"tensor_{local_tensor_id}_ptr_row_start = page_idx_i32 * {t.shape[1]}"
-                )
-                paged_lines.append(
-                    "\n".join([
-                        f"tensor_{local_tensor_id}_block_ptr = tl.make_block_ptr(",
-                        f"{INDENT}base=tensor_{local_tensor_id}_ptr,",
-                        f"{INDENT}shape=(tensor_{local_tensor_id}_dim0 * {t.shape[1]}, {t.shape[2]}),",
-                        f"{INDENT}strides=({t.shape[2]}, 1),",
-                        f"{INDENT}offsets=(tensor_{local_tensor_id}_ptr_row_start, 0),",
-                        f"{INDENT}block_shape=({t.shape[1] * ctx.workload_chunk_size}, {t.shape[2]}),",
-                        f"{INDENT}order=(1, 0),",
-                        f")",
-                    ])
-                )
-                paged_reshape = f"tl.reshape(tl.load(tensor_{local_tensor_id}_block_ptr, boundary_check=(0, 1), padding_option=\"zero\", cache_modifier=\".cv\"), ({ctx.workload_chunk_size}, {t.shape[1]}, {t.shape[2]}))"
-                paged_lines.append(f"tensor_{local_tensor_id}_block = {_load_cast_expr(paged_reshape, t)}")
-            else:
-                paged_lines.append(f"_tensor_{local_tensor_id}_block_ptr = page_indices_i32[:,None] * {t.shape[1] * t.shape[2]} + tensor_{local_tensor_id}_flat_ptr[None,:]")
-                paged_lines.append(f"tensor_{local_tensor_id}_block_ptr = tensor_{local_tensor_id}_ptr + _tensor_{local_tensor_id}_block_ptr")
-                paged_reshape = f"tl.reshape(tl.load(tensor_{local_tensor_id}_block_ptr, mask=page_valid[:, None], other=0.0, cache_modifier=\".cv\"), ({ctx.workload_chunk_size}, {t.shape[1]}, {t.shape[2]}))"
-                paged_lines.append(f"tensor_{local_tensor_id}_block = {_load_cast_expr(paged_reshape, t)}")
-            
-        elif t._format == FORMAT.RAGGED:
-            ragged_lines.append(
-                f"tensor_{local_tensor_id}_ptr_row_start = ragged_idx_i32 * {t.shape[1]}"
-            )
-            ragged_lines.append(
-                "\n".join([
-                    f"tensor_{local_tensor_id}_block_ptr = tl.make_block_ptr(",
-                    f"{INDENT}base=tensor_{local_tensor_id}_ptr,",
-                    f"{INDENT}shape=(tensor_{local_tensor_id}_dim0 * {t.shape[1]}, {t.shape[2]}),",
-                    f"{INDENT}strides=({t.shape[2]}, 1),",
-                    f"{INDENT}offsets=(tensor_{local_tensor_id}_ptr_row_start, 0),",
-                    f"{INDENT}block_shape=({t.shape[1] * ctx.workload_chunk_size}, {t.shape[2]}),",
-                    f"{INDENT}order=(1, 0),",
-                    f")",
-                ])
-            )
-            ragged_reshape = f"tl.reshape(tl.load(tensor_{local_tensor_id}_block_ptr, boundary_check=(0, 1), padding_option=\"zero\",), ({ctx.workload_chunk_size}, {t.shape[1]}, {t.shape[2]}))"
-            ragged_lines.append(f"tensor_{local_tensor_id}_block = {_load_cast_expr(ragged_reshape, t)}")
-
-    if batched_lines:
-        batched_lines = [
-            "new_batch_idx_i32 = tl.load(winfo_x_indices + i).to(tl.int32)",
-            indent_block("\n".join(batched_lines), 0),
-        ]
-        batched_lines = "\n".join(batched_lines)
-
-    paged_lines = "\n".join(paged_lines) if paged_lines else "# No paged tensor loading required"
-    ragged_lines = "\n".join(ragged_lines) if ragged_lines else "# No ragged tensor loading required"
-    addressing_lines = [
-        "ragged_idx_i32 = tl.load(winfo_y_offsets + i).to(tl.int32)", 
-        "page_idx_i32 = tl.load(indices + ragged_idx_i32).to(tl.int32)" if ctx.num_pages_per_workload == 1 else f"page_indices_i32 = tl.load(indices + ragged_idx_i32 + page_idx_i32_ptr * {ctx.num_blocks_per_page}, mask=page_valid, other=0).to(tl.int32)",
+def _load_batched(tid: int, t) -> List[str]:
+    block_ptr = _emit_block_ptr(
+        tid, t,
+        offset_var=f"tensor_{tid}_ptr_row_start",
+        block_dim0_expr=t.shape[1],
+    )
+    reshape = (
+        f"tl.reshape(tl.load(tensor_{tid}_block_ptr, boundary_check=(0, 1), "
+        f'padding_option="zero", cache_modifier=".ca"), '
+        f"(1, {t.shape[1]}, {t.shape[2]}))"
+    )
+    return [
+        f"tensor_{tid}_ptr_row_start = new_batch_idx_i32 * {t.shape[1]}",
+        block_ptr,
+        f"tensor_{tid}_block = {_load_cast_expr(reshape, t)}",
     ]
-    addressing_lines = "\n".join(addressing_lines)
 
-    return "\n\n".join(filter(None, [batched_lines, addressing_lines, paged_lines, ragged_lines])) if (batched_lines or addressing_lines or paged_lines or ragged_lines) else "# No tensor loading required"
+
+def _load_paged_single_page(tid: int, t, ctx: Context) -> List[str]:
+    block_ptr = _emit_block_ptr(
+        tid, t,
+        offset_var=f"tensor_{tid}_ptr_row_start",
+        block_dim0_expr=t.shape[1] * ctx.workload_chunk_size,
+    )
+    reshape = (
+        f"tl.reshape(tl.load(tensor_{tid}_block_ptr, boundary_check=(0, 1), "
+        f'padding_option="zero", cache_modifier=".cv"), '
+        f"({ctx.workload_chunk_size}, {t.shape[1]}, {t.shape[2]}))"
+    )
+    return [
+        f"tensor_{tid}_ptr_row_start = page_idx_i32 * {t.shape[1]}",
+        block_ptr,
+        f"tensor_{tid}_block = {_load_cast_expr(reshape, t)}",
+    ]
+
+
+def _load_paged_multi_page(tid: int, t, ctx: Context) -> List[str]:
+    reshape = (
+        f"tl.reshape(tl.load(tensor_{tid}_block_ptr, mask=page_valid[:, None], "
+        f'other=0.0, cache_modifier=".cv"), '
+        f"({ctx.workload_chunk_size}, {t.shape[1]}, {t.shape[2]}))"
+    )
+    return [
+        f"_tensor_{tid}_block_ptr = page_indices_i32[:,None] * "
+        f"{t.shape[1] * t.shape[2]} + tensor_{tid}_flat_ptr[None,:]",
+        f"tensor_{tid}_block_ptr = tensor_{tid}_ptr + _tensor_{tid}_block_ptr",
+        f"tensor_{tid}_block = {_load_cast_expr(reshape, t)}",
+    ]
+
+
+def _load_ragged(tid: int, t, ctx: Context) -> List[str]:
+    block_ptr = _emit_block_ptr(
+        tid, t,
+        offset_var=f"tensor_{tid}_ptr_row_start",
+        block_dim0_expr=t.shape[1] * ctx.workload_chunk_size,
+    )
+    reshape = (
+        f"tl.reshape(tl.load(tensor_{tid}_block_ptr, boundary_check=(0, 1), "
+        f'padding_option="zero",), '
+        f"({ctx.workload_chunk_size}, {t.shape[1]}, {t.shape[2]}))"
+    )
+    return [
+        f"tensor_{tid}_ptr_row_start = ragged_idx_i32 * {t.shape[1]}",
+        block_ptr,
+        f"tensor_{tid}_block = {_load_cast_expr(reshape, t)}",
+    ]
+
+
+def generate_load_tensor_str(sub_graph: Graph, ctx: Context) -> str:
+    """Emit input-tensor load code, grouped by FORMAT.
+
+    Layout: BATCHED (with the ``new_batch_idx_i32`` load prefix) →
+    addressing (``ragged_idx_i32`` + paged-index load) → PAGED → RAGGED.
+    """
+    batched: List[str] = []
+    paged: List[str] = []
+    ragged: List[str] = []
+
+    for tid in sub_graph.input_tensor_ids:
+        t = sub_graph.tensor_list[tid]
+        if t._format == FORMAT.BATCHED:
+            batched.extend(_load_batched(tid, t))
+        elif t._format == FORMAT.PAGED:
+            if ctx.num_pages_per_workload == 1:
+                paged.extend(_load_paged_single_page(tid, t, ctx))
+            else:
+                paged.extend(_load_paged_multi_page(tid, t, ctx))
+        elif t._format == FORMAT.RAGGED:
+            ragged.extend(_load_ragged(tid, t, ctx))
+
+    batched_str = (
+        "\n".join([
+            "new_batch_idx_i32 = tl.load(winfo_x_indices + i).to(tl.int32)",
+            "\n".join(batched),
+        ])
+        if batched else ""
+    )
+
+    if ctx.num_pages_per_workload == 1:
+        page_idx_line = "page_idx_i32 = tl.load(indices + ragged_idx_i32).to(tl.int32)"
+    else:
+        page_idx_line = (
+            f"page_indices_i32 = tl.load(indices + ragged_idx_i32 + "
+            f"page_idx_i32_ptr * {ctx.num_blocks_per_page}, mask=page_valid, "
+            f"other=0).to(tl.int32)"
+        )
+    addressing_str = "\n".join([
+        "ragged_idx_i32 = tl.load(winfo_y_offsets + i).to(tl.int32)",
+        page_idx_line,
+    ])
+
+    paged_str = "\n".join(paged) if paged else "# No paged tensor loading required"
+    ragged_str = "\n".join(ragged) if ragged else "# No ragged tensor loading required"
+
+    return _join_sections(
+        [batched_str, addressing_str, paged_str, ragged_str],
+        fallback="# No tensor loading required",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Store (per FORMAT)
+# --------------------------------------------------------------------------- #
+
+def _store_paged_single_page(tid: int, t, ctx: Context) -> List[str]:
+    block_ptr = _emit_block_ptr(
+        tid, t,
+        offset_var=f"tensor_{tid}_ptr_row_start",
+        block_dim0_expr=t.shape[1] * ctx.workload_chunk_size,
+    )
+    reshape = (
+        f"tl.reshape(tensor_{tid}_block, "
+        f"({t.shape[1] * ctx.workload_chunk_size}, {t.shape[2]}))"
+    )
+    return [
+        f"tensor_{tid}_ptr_row_start = page_idx_i32 * {t.shape[1]}",
+        block_ptr,
+        f"tl.store(tensor_{tid}_block_ptr, {_store_cast_expr(reshape, t.dtype)})",
+    ]
+
+
+def _store_paged_multi_page(tid: int, t, ctx: Context) -> List[str]:
+    ptr_expr = (
+        f"tensor_{tid}_block_ptr = tensor_{tid}_ptr "
+        f"+ page_indices_i32[:,None,None,None] * {t.shape[1] * t.shape[2]} "
+        f"+ block_i32_ptr[None,:,None,None] * {t.shape[1] * t.shape[2]} "
+        f"+ tensor_{tid}_dim1_ptr[None,None,:,None] * {t.shape[2]} "
+        f"+ tensor_{tid}_dim2_ptr[None,None,None,:]"
+    )
+    reshape = (
+        f"tl.reshape(tensor_{tid}_block, "
+        f"({ctx.num_pages_per_workload}, {ctx.num_blocks_per_page}, "
+        f"{t.shape[1]}, {t.shape[2]}))"
+    )
+    return [
+        ptr_expr,
+        f"tl.store(tensor_{tid}_block_ptr, "
+        f"{_store_cast_expr(reshape, t.dtype)}, "
+        f"mask=page_valid[:, None, None, None])",
+    ]
+
+
+def _store_ragged(tid: int, t) -> List[str]:
+    ptr_expr = (
+        f"tensor_{tid}_block_ptr = tensor_{tid}_ptr "
+        f"+ ragged_idx_i32 * {t.shape[1] * t.shape[2]} "
+        f"+ workload_ptr[:,None,None] * {t.shape[1] * t.shape[2]} "
+        f"+ tensor_{tid}_dim1_ptr[None,:,None] * {t.shape[2]} "
+        f"+ tensor_{tid}_dim2_ptr[None,None,:]"
+    )
+    return [
+        ptr_expr,
+        f"tl.store(tensor_{tid}_block_ptr, "
+        f"{_store_cast_expr(f'tensor_{tid}_block', t.dtype)}, "
+        f"mask=valid[:, None, None])",
+    ]
+
+
+def _store_batched(tid: int, t) -> List[str]:
+    """One slot per (batch, head). Multiple workloads can share the same
+    (batch, head) when its KV span exceeds workload_chunk_size, but only
+    the *first* such workload writes — gated by
+    ``winfo_is_first_workload_per_batch[i]`` (computed by the planner).
+    The gate load is hoisted by :func:`generate_store_tensor_str` so it
+    happens once per workload regardless of how many BATCHED outputs the
+    subgraph has."""
+    ptr_expr = (
+        f"tensor_{tid}_block_ptr = tensor_{tid}_ptr "
+        f"+ new_batch_idx_i32 * {t.shape[1] * t.shape[2]} "
+        f"+ tensor_{tid}_dim1_ptr[None, :, None] * {t.shape[2]} "
+        f"+ tensor_{tid}_dim2_ptr[None, None, :]"
+    )
+    return [
+        ptr_expr,
+        "if _is_first_workload != 0:",
+        f"    tl.store(tensor_{tid}_block_ptr, "
+        f"{_store_cast_expr(f'tensor_{tid}_block', t.dtype)})",
+    ]
 
 
 def generate_store_tensor_str(sub_graph: Graph, ctx: Context) -> str:
-    """
-    Generate the tensor storing code string for a given sub-graph.
+    """Emit output-tensor store code, grouped by FORMAT.
 
-    BATCHED outputs are written once per workload at the
-    ``new_batch_idx_i32`` slot. Multiple workloads sharing the same
-    ``(batch, head)`` write the same value (BATCHED outputs come from
-    page-independent compute, e.g. ``GeMM(BATCHED, BATCHED)``), so
-    redundant stores are safe.
+    Layout: PAGED → RAGGED (with the workload ``valid`` mask preamble
+    when single-page) → BATCHED (with the hoisted ``_is_first_workload``
+    gate load).
     """
-    paged_lines = []
-    ragged_lines = []
-    batched_lines = []
-    for local_tensor_id in sub_graph.output_tensor_ids:
-        t = sub_graph.tensor_list[local_tensor_id]
+    paged: List[str] = []
+    ragged: List[str] = []
+    batched: List[str] = []
+
+    for tid in sub_graph.output_tensor_ids:
+        t = sub_graph.tensor_list[tid]
         if t._format == FORMAT.PAGED:
             if ctx.num_pages_per_workload == 1:
-                paged_lines.append(
-                    f"tensor_{local_tensor_id}_ptr_row_start = page_idx_i32 * {t.shape[1]}"
-                )
-                paged_lines.append(
-                    "\n".join([
-                        f"tensor_{local_tensor_id}_block_ptr = tl.make_block_ptr(",
-                        f"{INDENT}base=tensor_{local_tensor_id}_ptr,",
-                        f"{INDENT}shape=(tensor_{local_tensor_id}_dim0 * {t.shape[1]}, {t.shape[2]}),",
-                        f"{INDENT}strides=({t.shape[2]}, 1),",
-                        f"{INDENT}offsets=(tensor_{local_tensor_id}_ptr_row_start, 0),",
-                        f"{INDENT}block_shape=({t.shape[1] * ctx.workload_chunk_size}, {t.shape[2]}),",
-                        f"{INDENT}order=(1, 0),",
-                        f")",
-                    ])
-                )
-                paged_reshape = f"tl.reshape(tensor_{local_tensor_id}_block, ({t.shape[1] * ctx.workload_chunk_size}, {t.shape[2]}))"
-                paged_lines.append(f"tl.store(tensor_{local_tensor_id}_block_ptr, {_store_cast_expr(paged_reshape, t.dtype)})")
+                paged.extend(_store_paged_single_page(tid, t, ctx))
             else:
-                paged_lines.append(f"tensor_{local_tensor_id}_block_ptr = tensor_{local_tensor_id}_ptr + page_indices_i32[:,None,None,None] * {t.shape[1] * t.shape[2]} + block_i32_ptr[None,:,None,None] * {t.shape[1] * t.shape[2]} + tensor_{local_tensor_id}_dim1_ptr[None,None,:,None] * {t.shape[2]} + tensor_{local_tensor_id}_dim2_ptr[None,None,None,:]")
-                paged_reshape = f"tl.reshape(tensor_{local_tensor_id}_block, ({ctx.num_pages_per_workload}, {ctx.num_blocks_per_page}, {t.shape[1]}, {t.shape[2]}))"
-                paged_lines.append(f"tl.store(tensor_{local_tensor_id}_block_ptr, {_store_cast_expr(paged_reshape, t.dtype)}, mask=page_valid[:, None, None, None])")
-
+                paged.extend(_store_paged_multi_page(tid, t, ctx))
         elif t._format == FORMAT.RAGGED:
-            ragged_lines.append(
-                "\n".join([
-                    f"tensor_{local_tensor_id}_block_ptr = tensor_{local_tensor_id}_ptr + ragged_idx_i32 * {t.shape[1] * t.shape[2]} + workload_ptr[:,None,None] * {t.shape[1] * t.shape[2]} + tensor_{local_tensor_id}_dim1_ptr[None,:,None] * {t.shape[2]} + tensor_{local_tensor_id}_dim2_ptr[None,None,:]",
-                ])
-            )
-
-            ragged_lines.append(f"tl.store(tensor_{local_tensor_id}_block_ptr, {_store_cast_expr(f'tensor_{local_tensor_id}_block', t.dtype)}, mask=valid[:, None, None])")
-
+            ragged.extend(_store_ragged(tid, t))
         elif t._format == FORMAT.BATCHED:
-            # One slot per (batch, head). Multiple workloads can share the
-            # same (batch, head) when its KV span exceeds workload_chunk_size,
-            # but only the *first* such workload should write the slot —
-            # ``winfo_is_first_workload_per_batch[i]`` is the gate computed
-            # by the planner (see ``planner_sglang.py``). The load itself
-            # is hoisted out of the per-tensor loop below so it happens
-            # exactly once per workload regardless of how many BATCHED
-            # outputs the subgraph has.
-            batched_lines.append(
-                f"tensor_{local_tensor_id}_block_ptr = tensor_{local_tensor_id}_ptr "
-                f"+ new_batch_idx_i32 * {t.shape[1] * t.shape[2]} "
-                f"+ tensor_{local_tensor_id}_dim1_ptr[None, :, None] * {t.shape[2]} "
-                f"+ tensor_{local_tensor_id}_dim2_ptr[None, None, :]"
-            )
-            batched_lines.append(
-                f"if _is_first_workload != 0:"
-            )
-            batched_lines.append(
-                f"    tl.store(tensor_{local_tensor_id}_block_ptr, "
-                f"{_store_cast_expr(f'tensor_{local_tensor_id}_block', t.dtype)})"
-            )
+            batched.extend(_store_batched(tid, t))
 
+    paged_str = "\n".join(paged) if paged else ""
 
-    if paged_lines:
-        paged_lines = "\n".join(paged_lines)
+    if ragged:
+        ragged_str = (
+            "\n".join([
+                "_len = tl.load(winfo_y_lens + i)",
+                "valid = workload_ptr < _len",
+                "\n".join(ragged),
+            ])
+            if ctx.num_pages_per_workload == 1 else "\n".join(ragged)
+        )
+    else:
+        ragged_str = ""
 
-    if ragged_lines:
-        ragged_lines = [
-            f"_len = tl.load(winfo_y_lens + i)",
-            f"valid = workload_ptr < _len",
-            "\n".join(ragged_lines)
-        ] if ctx.num_pages_per_workload == 1 else ragged_lines
-        ragged_lines = "\n".join(ragged_lines)
-
-    if batched_lines:
-        # Hoist the gate load — exactly one ``tl.load`` per workload, then
-        # every BATCHED store guards on the same scalar.
-        batched_lines = [
+    batched_str = (
+        "\n".join([
             "_is_first_workload = tl.load(winfo_is_first_workload_per_batch + i)",
-            "\n".join(batched_lines),
-        ]
-        batched_lines = "\n".join(batched_lines)
-    return "\n\n".join(filter(None, [paged_lines, ragged_lines, batched_lines])) if (paged_lines or ragged_lines or batched_lines) else "# No tensor loading required"
+            "\n".join(batched),
+        ])
+        if batched else ""
+    )
 
+    # Fallback comment kept verbatim from pre-refactor for byte-equivalent
+    # output (the original generated "# No tensor loading required" for
+    # the store fallback path; preserved to avoid drift in golden diffs).
+    return _join_sections(
+        [paged_str, ragged_str, batched_str],
+        fallback="# No tensor loading required",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Computation
+# --------------------------------------------------------------------------- #
 
 def generate_computation_str(sub_graph: Graph, ctx: Context) -> str:
-    
-    lines = []
-    for op_id, op in enumerate(sub_graph.op_list):
-        op_impl_func = get_impl_func(op)
-        impl_str = op_impl_func(sub_graph, op_id, ctx)
-        lines.append(impl_str)
+    lines = [
+        get_impl_func(op)(sub_graph, op_id, ctx)
+        for op_id, op in enumerate(sub_graph.op_list)
+    ]
     return "\n\n".join(lines) if lines else "# No computation required"
 
-def generate_triton_kernel(
-    sub_graph: Graph,
-    sub_graph_id: int,
-    ctx: Context
-) -> str:
-    """
-    Generate a Triton kernel definition for a given sub-graph.
-    """
-    kernel_arg_list = [
+
+# --------------------------------------------------------------------------- #
+# Kernel definition (W-scheduled)
+# --------------------------------------------------------------------------- #
+
+def _build_kernel_signature(sub_graph) -> List[str]:
+    """Kernel-argument lines in declaration order."""
+    args = [
         "indices,                            # int32",
         "winfo_x_indices,                    # int32",
     ]
     if _has_batched_output(sub_graph):
-        kernel_arg_list.append("winfo_is_first_workload_per_batch,  # uint8")
-    kernel_arg_list += [
+        args.append("winfo_is_first_workload_per_batch,  # uint8")
+    args += [
         "winfo_y_offsets,                    # int32",
         "winfo_y_lens,                       # int32",
         "winfo_num_workloads,                # int32",
     ]
-
-    # Collect input tensor kernel arguments. A tensor that's *both* an
-    # input (e.g. ``Load`` reads it) and an output (e.g. ``Save`` writes
-    # it) in the same subgraph must only appear once in the kernel
-    # signature; we bind it in the output-arg loop below.
-    output_set = set(sub_graph.output_tensor_ids)
-    for local_tensor_id in sub_graph.input_tensor_ids:
-        if local_tensor_id in output_set:
-            continue
-        tensor_name = f"tensor_{local_tensor_id}"
-        kernel_arg_list.extend([
-            f"{tensor_name}_ptr,",
-            f"{tensor_name}_dim0: tl.constexpr,",
+    for tid, _role in _iter_kernel_tensors(sub_graph):
+        args.extend([
+            f"tensor_{tid}_ptr,",
+            f"tensor_{tid}_dim0: tl.constexpr,",
         ])
+    return args
 
-    # Collect output tensor kernel arguments
-    for local_tensor_id in sub_graph.output_tensor_ids:
-        tensor_name = f"tensor_{local_tensor_id}"
-        kernel_arg_list.extend([
-            f"{tensor_name}_ptr,",
-            f"{tensor_name}_dim0: tl.constexpr,",
-        ])
 
-    kernel_args = "\n".join(f"{INDENT}{arg}" for arg in kernel_arg_list)
-    prepare_workload_lines = []
-    if ctx.num_pages_per_workload > 1:
-        prepare_workload_lines = [
-        f"_len = tl.load(winfo_y_lens + i)",
-        f"valid = workload_ptr < _len",
+def _build_workload_preamble(ctx: Context) -> str:
+    """Per-iteration ``_len`` / ``valid`` / ``_page`` / ``page_valid`` lines
+    (only needed when each workload spans multiple pages)."""
+    if ctx.num_pages_per_workload <= 1:
+        return "# No workload preparation required"
+    return "\n".join([
+        "_len = tl.load(winfo_y_lens + i)",
+        "valid = workload_ptr < _len",
         f"_page = (_len + {ctx.num_blocks_per_page - 1}) // {ctx.num_blocks_per_page}",
-        f"page_valid = page_idx_i32_ptr < _page",
-     ]
-    prepare_workload_str = "\n".join(prepare_workload_lines) if prepare_workload_lines else "# No workload preparation required"
+        "page_valid = page_idx_i32_ptr < _page",
+    ])
 
-    initialization_str = indent_block(generate_initialization_str(sub_graph,ctx), 1)
-    prepare_workload_str = indent_block(prepare_workload_str, 2)
+
+def generate_triton_kernel(
+    sub_graph: Graph,
+    sub_graph_id: int,
+    ctx: Context,
+) -> str:
+    """Emit the ``@triton.jit`` kernel string for a W-scheduled subgraph."""
+    kernel_args = "\n".join(f"{INDENT}{arg}" for arg in _build_kernel_signature(sub_graph))
+
+    initialization_str = indent_block(generate_initialization_str(sub_graph, ctx), 1)
+    prepare_workload_str = indent_block(_build_workload_preamble(ctx), 2)
     load_tensor_str = indent_block(generate_load_tensor_str(sub_graph, ctx), 2)
     store_tensor_str = indent_block(generate_store_tensor_str(sub_graph, ctx), 2)
     computation_str = indent_block(generate_computation_str(sub_graph, ctx), 2)
+
     kernel_str = f"""
 @triton.jit
 def {ctx.sparse_attention_name}_subgraph_{sub_graph_id}_kernel(
@@ -350,86 +493,57 @@ def {ctx.sparse_attention_name}_subgraph_{sub_graph_id}_kernel(
     return kernel_str.strip()
 
 
-def generate_triton_impl(
-    sub_graph: Graph,
-    sub_graph_id: int,
-    ctx: Context
-) -> str:
+# --------------------------------------------------------------------------- #
+# Python launcher / impl wrapper
+# --------------------------------------------------------------------------- #
+
+def _build_launcher_args(sub_graph) -> Tuple[List[str], List[str], List[str]]:
+    """Return ``(wrapper_args, kernel_call_inputs, fp8_rebind_lines)``.
+
+    FP8 reinterpret: any FP8 tensor (input or output) is bitcast to
+    ``uint8`` before being passed to the kernel, which bitcasts it back
+    to the matching ``tl.float8eX`` dtype on load and stores raw fp8
+    bits on write. Mirrors the cache-side convention.
     """
-    Generate a Triton kernel and its Python wrapper implementation.
-    """
-    ctx.compilation_header_lines.extend([
-        "import torch",
-        "import triton",
-        "import triton.language as tl",
-    ])
-    if sub_graph.schedule == Schedule.W:
-        kernel_str = generate_triton_kernel(sub_graph, sub_graph_id, ctx)
+    wrapper_args: List[str] = []
+    kernel_inputs: List[str] = [
+        "ctx.dense_kv_indices",
+        "ctx.winfo_q_indices",
+    ]
+    if _has_batched_output(sub_graph):
+        kernel_inputs.append("ctx.winfo_is_first_workload_per_batch")
+    kernel_inputs += [
+        "ctx.winfo_kv_offsets",
+        "ctx.winfo_kv_lens",
+        "ctx.winfo_num_workloads",
+    ]
+    fp8_rebind: List[str] = []
 
-        arg_list = []
-        kernel_input_list = [
-            "ctx.dense_kv_indices",
-            "ctx.winfo_q_indices",
-        ]
-        if _has_batched_output(sub_graph):
-            kernel_input_list.append("ctx.winfo_is_first_workload_per_batch")
-        kernel_input_list += [
-            "ctx.winfo_kv_offsets",
-            "ctx.winfo_kv_lens",
-            "ctx.winfo_num_workloads",
-        ]
+    for tid, _role in _iter_kernel_tensors(sub_graph):
+        name = f"tensor_{tid}"
+        wrapper_args.append(name)
+        kernel_inputs.extend([name, f"{name}.shape[0]"])
+        if _is_fp8(sub_graph.tensor_list[tid]):
+            fp8_rebind.append(f"{name} = {name}.view(torch.uint8)")
 
-        # FP8-aware wrapper: any FP8 tensor (input or output) is reinterpreted
-        # as ``uint8`` before being handed to the kernel, which bitcasts it
-        # back to the matching ``tl.float8eX`` dtype on load and stores raw
-        # fp8 bits on write. Mirrors the cache-side convention in
-        # ``cache.compiler.triton_impl.kernel_gen``.
-        fp8_rebind_lines: List[str] = []
+    wrapper_args.append("ctx")
+    kernel_inputs.append("num_warps=8")
+    kernel_inputs.append("num_stages=2")
 
-        # A tensor that's both an input and an output (e.g. a cache field
-        # both Load'd and Save'd in the same subgraph) must be passed
-        # exactly once — we bind it in the output-arg loop below.
-        output_set = set(sub_graph.output_tensor_ids)
+    return wrapper_args, kernel_inputs, fp8_rebind
 
-        # Collect input tensor arguments
-        for local_tensor_id in sub_graph.input_tensor_ids:
-            if local_tensor_id in output_set:
-                continue
-            tensor_name = f"tensor_{local_tensor_id}"
-            arg_list.append(tensor_name)
-            kernel_input_list.extend([
-                tensor_name,
-                f"{tensor_name}.shape[0]",
-            ])
-            if _is_fp8(sub_graph.tensor_list[local_tensor_id]):
-                fp8_rebind_lines.append(
-                    f"{tensor_name} = {tensor_name}.view(torch.uint8)"
-                )
 
-        # Collect output tensor arguments
-        for local_tensor_id in sub_graph.output_tensor_ids:
-            tensor_name = f"tensor_{local_tensor_id}"
-            arg_list.append(tensor_name)
-            kernel_input_list.extend([
-                tensor_name,
-                f"{tensor_name}.shape[0]",
-            ])
-            if _is_fp8(sub_graph.tensor_list[local_tensor_id]):
-                fp8_rebind_lines.append(
-                    f"{tensor_name} = {tensor_name}.view(torch.uint8)"
-                )
+def _generate_w_impl(sub_graph: Graph, sub_graph_id: int, ctx: Context) -> str:
+    kernel_str = generate_triton_kernel(sub_graph, sub_graph_id, ctx)
+    wrapper_args, kernel_inputs, fp8_rebind = _build_launcher_args(sub_graph)
 
-        # Append context argument
-        arg_list.append("ctx")
-        kernel_input_list.append("num_warps=8")
-        kernel_input_list.append("num_stages=2")
-        args_def = ",\n".join(f"{INDENT}{arg}" for arg in arg_list)
-        kernel_inputs = ",\n".join(f"{INDENT * 2}{arg}" for arg in kernel_input_list)
-        fp8_rebind_str = (
-            indent_block("\n".join(fp8_rebind_lines), 1) if fp8_rebind_lines else ""
-        )
+    args_def = ",\n".join(f"{INDENT}{arg}" for arg in wrapper_args)
+    kernel_inputs_str = ",\n".join(f"{INDENT * 2}{arg}" for arg in kernel_inputs)
+    fp8_rebind_str = (
+        indent_block("\n".join(fp8_rebind), 1) if fp8_rebind else ""
+    )
 
-        impl_str = f"""
+    impl_str = f"""
 {kernel_str}
 
 def {ctx.sparse_attention_name}_subgraph_{sub_graph_id}_impl(
@@ -437,26 +551,52 @@ def {ctx.sparse_attention_name}_subgraph_{sub_graph_id}_impl(
 ):
 {fp8_rebind_str}
     {ctx.sparse_attention_name}_subgraph_{sub_graph_id}_kernel[({ctx.num_sms * 4},)](
-{kernel_inputs}
+{kernel_inputs_str}
     )
 """
-        return impl_str.strip()
-    
-    else:
-        arg_list = []
-        for local_tensor_id in sub_graph.input_tensor_ids:
-            arg_list.append(f"tensor_{local_tensor_id}")
-        for local_tensor_id in sub_graph.output_tensor_ids:
-            arg_list.append(f"tensor_{local_tensor_id}")
-        arg_list.append("ctx")
-        args_def = ",\n".join(f"{INDENT}{arg}" for arg in arg_list)
-        assert len(sub_graph.op_list) == 1, "Expected exactly one operation in non-workload-scheduled sub-graph for direct implementation."
-        op_impl_func = get_impl_func(sub_graph.op_list[0])
-        op_impl_str = indent_block(op_impl_func(sub_graph, 0, ctx), 1)
-        impl_str = f"""
+    return impl_str.strip()
+
+
+def _generate_non_w_impl(sub_graph: Graph, sub_graph_id: int, ctx: Context) -> str:
+    """Direct op-impl wrapper for non-workload-scheduled subgraphs.
+
+    The single op carries all the codegen; this layer just stitches the
+    function signature and indents the op-impl body.
+    """
+    assert len(sub_graph.op_list) == 1, (
+        "Expected exactly one operation in non-workload-scheduled "
+        "sub-graph for direct implementation."
+    )
+
+    arg_list = [f"tensor_{tid}" for tid in sub_graph.input_tensor_ids]
+    arg_list += [f"tensor_{tid}" for tid in sub_graph.output_tensor_ids]
+    arg_list.append("ctx")
+    args_def = ",\n".join(f"{INDENT}{arg}" for arg in arg_list)
+
+    op_impl_str = indent_block(
+        get_impl_func(sub_graph.op_list[0])(sub_graph, 0, ctx), 1,
+    )
+
+    impl_str = f"""
 def {ctx.sparse_attention_name}_subgraph_{sub_graph_id}_impl(
 {args_def}
 ):
 {op_impl_str}
-""" 
-        return impl_str.strip()
+"""
+    return impl_str.strip()
+
+
+def generate_triton_impl(
+    sub_graph: Graph,
+    sub_graph_id: int,
+    ctx: Context,
+) -> str:
+    """Generate a Triton kernel and its Python wrapper implementation."""
+    ctx.compilation_header_lines.extend([
+        "import torch",
+        "import triton",
+        "import triton.language as tl",
+    ])
+    if sub_graph.schedule == Schedule.W:
+        return _generate_w_impl(sub_graph, sub_graph_id, ctx)
+    return _generate_non_w_impl(sub_graph, sub_graph_id, ctx)

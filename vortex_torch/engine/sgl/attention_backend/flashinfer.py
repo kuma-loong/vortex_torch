@@ -18,10 +18,10 @@ from vortex_torch.abs import as_vtensor, FORMAT
 from vortex_torch.indexer import Context
 from vortex_torch.indexer.compiler.compile import compile as compile_indexer
 from vortex_torch.indexer.utils_sglang import (
-    chunkwise_hn2nh_transpose,
-    chunkwise_nh2hn_transpose,
+    get_chunkwise_hn2nh_transpose,
+    get_chunkwise_nh2hn_transpose,
     get_decode_planner,
-    plan_prefill,
+    get_prefill_planner,
 )
 if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
     import logging
@@ -261,6 +261,9 @@ class VortexFlashInferBackend(AttentionBackend):
         ]
         
         self.plan_decode = get_decode_planner(model_runner.server_args.vortex_schedule_policy)
+        self.plan_prefill = get_prefill_planner()
+        self.chunkwise_nh2hn_transpose = get_chunkwise_nh2hn_transpose()
+        self.chunkwise_hn2nh_transpose = get_chunkwise_hn2nh_transpose()
 
         self.sparse_attention = model_runner.sparse_attention
         self.ctx = Context()
@@ -364,7 +367,7 @@ class VortexFlashInferBackend(AttentionBackend):
             extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
             bs = len(forward_batch.req_pool_indices)
             
-            plan_prefill(
+            self.plan_prefill(
                 cached_seq_lens=prefix_lens,
                 dense_kv_indptr=self.kv_indptr_prefill[:bs*self.num_kv_heads+1],
                 dense_kv_indices=self.kv_indices_prefill,
@@ -586,7 +589,7 @@ class VortexFlashInferBackend(AttentionBackend):
                 logits_soft_cap=logits_soft_cap,
                 )
             
-            q_t = chunkwise_nh2hn_transpose(
+            q_t = self.chunkwise_nh2hn_transpose(
                 q.view(-1, self.num_qo_heads, self.head_dim),
                 self.qo_indptr[0],
                 self.batch_table,
@@ -606,9 +609,9 @@ class VortexFlashInferBackend(AttentionBackend):
                 sm_scale=layer.scaling,
                 logits_soft_cap=logits_soft_cap,
                 )
-            o2_t, s2_t = chunkwise_hn2nh_transpose(
-                o2,  s2, 
-                self.qo_indptr[0], 
+            o2_t, s2_t = self.chunkwise_hn2nh_transpose(
+                o2,  s2,
+                self.qo_indptr[0],
                 self.batch_table,
                 self.num_qo_heads,
                 self.num_kv_heads,
