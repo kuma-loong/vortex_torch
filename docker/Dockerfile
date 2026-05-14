@@ -38,7 +38,7 @@ WORKDIR /workspace
 RUN git clone -b "${VORTEX_TORCH_REF}" --recursive \
     https://github.com/Infini-AI-Lab/vortex_torch.git
 
-WORKDIR /workspace/vortex_torch/third_party/sglang
+WORKDIR /workspace/vortex_torch/third_party/sglang/v0.4.9/sglang
 
 RUN bash install.sh
 

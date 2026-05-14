@@ -2,7 +2,7 @@
 
 This is a recipe for changing **how / when sglang evicts KV cache**. All
 file paths are under
-`third_party/sglang/python/sglang/`.
+`third_party/sglang/v0.4.9/sglang/python/sglang/`.
 
 There are **four independent knobs** you can turn. Pick the one that
 matches the change you want — most users only need #1 (swap the

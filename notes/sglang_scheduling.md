@@ -1,6 +1,6 @@
 # How sglang schedules requests, evicts KV cache, and retracts decode
 
-A code-pointer guide for `third_party/sglang/python/sglang/`. Every file
+A code-pointer guide for `third_party/sglang/v0.4.9/sglang/python/sglang/`. Every file
 path below is relative to that root. Line numbers are from the vendored
 copy on the `v0.4` branch — they may drift by a few lines after a
 rebase, so use the symbol names (which are stable) as the anchor.

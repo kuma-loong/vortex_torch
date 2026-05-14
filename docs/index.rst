@@ -8,9 +8,9 @@ Installation
 .. code-block:: bash
 
    git clone -b v1 --recursive https://github.com/Infini-AI-Lab/vortex_torch.git
-   cd third_party/sglang
+   cd third_party/sglang/v0.4.9/sglang
    bash install.sh
-   cd ../../
+   cd ../../../../
    cd vortex_torch
    pip install -e .
 
