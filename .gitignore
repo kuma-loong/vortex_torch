@@ -38,6 +38,10 @@ MANIFEST
 !vortex_torch/kernels/topk/k_*/configs/claude_opus_4_7/*.json
 !vortex_torch/kernels/topk/k_*/configs/claude_opus_4_7/**/*.json
 
+# Top-k kernel default configs — track them despite the global *.json rule.
+!vortex_torch/kernels/topk/configs/*.json
+!vortex_torch/kernels/topk/configs/**/*.json
+
 tests/
 *_backup.py
 # PyInstaller
