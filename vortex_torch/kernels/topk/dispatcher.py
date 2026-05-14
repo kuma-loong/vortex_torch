@@ -78,7 +78,7 @@ def get_kernel(
     filename: str | os.PathLike,
     substitutions: dict[str, object] | None = None,
     extra_cuda_cflags: tuple[str, ...] | None = None,
-    verbose: bool = False,
+    verbose: bool = True,
     build_dir_env: str = "VORTEX_TOPK_BUILD_DIR",
 ):
     """Compile and cache a top-k CUDA source.
@@ -145,7 +145,7 @@ def get_kernel(
 
 def load_submission(
     json_path: str | os.PathLike,
-    verbose: bool = False,
+    verbose: bool = True,
     build_dir_env: str = "VORTEX_TOPK_BUILD_DIR",
 ):
     """Compile a submission described by a JSON config.
@@ -214,7 +214,7 @@ _K128_WINNER_MAX_TOPK = 128
 _RADIX_WINNER_MAX_TOPK = 256
 
 
-def dispatch(max_topk: Optional[int] = None, *, verbose: bool = False):
+def dispatch(max_topk: Optional[int] = None, *, verbose: bool = True):
     """Pick the best-known top-k kernel for ``max_topk`` and return its callable.
 
       - ``max_topk <= 96`` → ``k_96/configs/claude_opus_4_7/batch_16_id3.json``

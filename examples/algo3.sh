@@ -33,7 +33,7 @@ for algo in "${sparse_algos[@]}"; do
             --generation-max-new-tokens 16384 \
             --max-input-length 4096 \
             --tp-size 1 \
-            --summary-dir summary-Qwen3-4B-Fast
+            --summary-dir summary-Qwen3-4B-WOVortexRadixCache
       done
     done
   done

@@ -28,7 +28,7 @@ def topk(
     max_num_pages: int,
     *,
     enable_fp8: bool = DEFAULT_ENABLE_FP8,
-    verbose: bool = False,
+    verbose: bool = True,
 ) -> None:
     """BOS/EOS-aware segmented top-k via CUB ``BlockRadixSort``.
 

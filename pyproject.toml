@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vortex_torch"
+version = "0.4.0"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.7",
+    "lighteval[math]==0.12.2",
+    "huggingface_hub==0.36.2",
+    "inspect-ai==0.3.207",
+    "transformers==4.57.6",
+    "s3fs==2025.9.0",
+    "wonderwords",
+    "langdetect",
+    "jsonlines",
+    "immutabledict",
+    "datasets",
+    "beautifulsoup4",
+    "accelerate",
+    "unitxt",
+]
+
+[tool.setuptools.packages.find]
+include = ["vortex_torch*"]

@@ -365,7 +365,7 @@ std::tuple<at::Tensor, at::Tensor> Chunkwise_HN2NH_Transpose(
 _MODULE = None
 
 
-def get_sglang_prefill_module(verbose: bool = False):
+def get_sglang_prefill_module(verbose: bool = True):
     """Compile (once) and return the load-inline module exposing
     ``sglang_plan_prefill``, ``Chunkwise_NH2HN_Transpose`` and
     ``Chunkwise_HN2NH_Transpose``."""

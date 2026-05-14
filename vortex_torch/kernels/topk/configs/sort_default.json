@@ -1,0 +1,5 @@
+{
+    "file": "../sort_topk.cu",
+    "substitutions": {},
+    "extra_cuda_cflags": []
+}

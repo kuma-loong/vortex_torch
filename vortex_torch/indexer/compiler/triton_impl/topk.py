@@ -52,9 +52,10 @@ def generate_topk_impl(graph: Graph, op_id: int, ctx: Context) -> str:
 
 def generate_approx_topk_impl(graph: Graph, op_id: int, ctx: Context) -> str:
     """Codegen for `approxTopK(tolerate_ratio=...)` — the adaptive 8-bit
-    radix variant. Reads `tolerate_ratio` off the op instance and
-    inlines it as a literal in the C call."""
-    ctx.compilation_header_lines.append("from vortex_torch_C import approx_topk_output")
+    radix variant. Reads `tolerate_ratio` off the op instance at codegen
+    time and bakes it into a compile-time substitution for the
+    JIT-built ``approx_topk.cu`` kernel under
+    ``vortex_torch/kernels/topk/``."""
     input_tensor_id, output_tensor_id = _check_topk_io(graph, op_id)
 
     op = graph.op_list[op_id]
@@ -62,9 +63,25 @@ def generate_approx_topk_impl(graph: Graph, op_id: int, ctx: Context) -> str:
     # the op type via (approxTopK, Schedule.S). Still guard the attribute.
     tolerate_ratio = float(getattr(op, "tolerate_ratio", 0.0))
 
+    # tolerate_ratio is a compile-time knob; each op-id pins its own
+    # callable. The dispatcher de-dupes by (file, substitutions), so
+    # two ops with the same tolerate_ratio share a compiled module.
+    callable_name = f"_vortex_approx_topk_{op_id}"
+    ctx.compilation_header_lines.extend([
+        "from vortex_torch.kernels.topk.dispatcher import get_kernel as _vortex_topk_get_kernel",
+        f"{callable_name} = _vortex_topk_get_kernel(",
+        f'{INDENT}"approx_topk.cu",',
+        f"{INDENT}substitutions={{",
+        f'{INDENT * 2}"__THREADS_PER_BLOCK__": 1024,',
+        f'{INDENT * 2}"__VORTEX_MAX_TOPK__": 2048,',
+        f'{INDENT * 2}"__TOLERATE_RATIO__": {tolerate_ratio!r},',
+        f"{INDENT}}},",
+        f").topk",
+    ])
+
     impl_lines = [
-        f"approx_topk_output(",
-        f"{INDENT * 2}tensor_{input_tensor_id},"
+        f"{callable_name}(",
+        f"{INDENT * 2}tensor_{input_tensor_id},",
         f"{INDENT * 2}ctx.dense_kv_indptr,",
         f"{INDENT * 2}ctx.sparse_kv_indptr,",
         f"{INDENT * 2}ctx.dense_kv_indices,",
@@ -73,7 +90,6 @@ def generate_approx_topk_impl(graph: Graph, op_id: int, ctx: Context) -> str:
         f"{INDENT * 2}ctx.block_reserved_bos,",
         f"{INDENT * 2}ctx.block_reserved_eos,",
         f"{INDENT * 2}ctx.max_num_blocks_per_request,",
-        f"{INDENT * 2}{tolerate_ratio!r},",
         f")",
     ]
     return "\n".join(impl_lines)

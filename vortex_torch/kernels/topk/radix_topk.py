@@ -64,7 +64,7 @@ def topk(
     threads_per_block: int = DEFAULT_THREADS_PER_BLOCK,
     max_topk: int = DEFAULT_MAX_TOPK,
     smem_bytes: int = DEFAULT_SMEM_BYTES,
-    verbose: bool = False,
+    verbose: bool = True,
 ) -> None:
     """BOS/EOS-aware segmented radix top-k with index remap.
 

@@ -1,0 +1,9 @@
+{
+    "file": "../approx_topk.cu",
+    "substitutions": {
+        "__THREADS_PER_BLOCK__": 1024,
+        "__VORTEX_MAX_TOPK__": 2048,
+        "__TOLERATE_RATIO__": 0.1
+    },
+    "extra_cuda_cflags": []
+}

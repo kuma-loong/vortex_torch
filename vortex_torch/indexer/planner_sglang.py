@@ -466,7 +466,7 @@ def _module_name_from_policy(policy_body: str) -> str:
     return f"sglang_plan_decode_v2_ext_{digest}"
 
 
-def _compile_module(policy_body: str, verbose: bool = False):
+def _compile_module(policy_body: str, verbose: bool = True):
     module_name = _module_name_from_policy(policy_body)
 
     if module_name in _MODULE_CACHE:
@@ -493,7 +493,7 @@ def _compile_module(policy_body: str, verbose: bool = False):
 
 def get_sglang_plan_decode_v2_module(
     policy_body: str | None = None,
-    verbose: bool = False,
+    verbose: bool = True,
     fallback_to_default: bool = True,
 ):
     effective_policy = DEFAULT_POLICY_BODY if policy_body is None else policy_body
