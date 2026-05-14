@@ -46,7 +46,7 @@ _SET_KV_LAUNCHERS = {
 }
 
 """
-Sparse Attention Memory pool.
+Vortex Sparse Attention Memory pool.
 
 In addition to Memory Pool in the original SGLang
 We 

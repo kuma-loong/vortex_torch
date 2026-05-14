@@ -29,12 +29,9 @@ if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
     torch._logging.set_logs(dynamo=logging.ERROR)
     torch._dynamo.config.suppress_errors = True
 
-from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.layers.attention.flashinfer_backend import should_use_tensor_core
 if TYPE_CHECKING:
@@ -94,18 +91,18 @@ class VortexFlashInferBackend(AttentionBackend):
         self.dispatch_reason = None
 
         # Qwen2/Qwen3 models require higher flashinfer workspace size
-        if (
-            "Qwen2ForCausalLM" in model_runner.model_config.hf_config.architectures
-            or "Qwen3ForCausalLM" in model_runner.model_config.hf_config.architectures
-            or "MiMoForCausalLM" in model_runner.model_config.hf_config.architectures
-        ):
-            global_config.flashinfer_workspace_size = 512 * 1024 * 1024
+        # if (
+        #     "Qwen2ForCausalLM" in model_runner.model_config.hf_config.architectures
+        #     or "Qwen3ForCausalLM" in model_runner.model_config.hf_config.architectures
+        #     or "MiMoForCausalLM" in model_runner.model_config.hf_config.architectures
+        # ):
+        #     global_config.flashinfer_workspace_size = 512 * 1024 * 1024
 
         # Allocate buffers
         global global_workspace_buffer
         if global_workspace_buffer is None:
             global_workspace_buffer = torch.empty(
-                global_config.flashinfer_workspace_size,
+                512 * 1024 * 1024,
                 dtype=torch.uint8,
                 device=model_runner.device,
             )
@@ -435,7 +432,7 @@ class VortexFlashInferBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        spec_info,
     ):  
         assert bs == num_tokens
         
@@ -512,7 +509,7 @@ class VortexFlashInferBackend(AttentionBackend):
         seq_lens_sum: int,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        spec_info,
         seq_lens_cpu: Optional[torch.Tensor],
     ):
         assert forward_mode.is_decode_or_idle()
