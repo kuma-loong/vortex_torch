@@ -13,6 +13,10 @@ class Context(ContextBase):
     __slots__ =  ContextBase.__slots__ + (
         # indices / indptr
         "dense_kv_indices", "sparse_kv_indices", "dense_kv_indptr", "sparse_kv_indptr", "kv_last_page_len", "batch_size", "max_bs",
+        # per-(req, kv-head) seq_lens for trtllm-style decode (None unless a
+        # backend opts in, e.g. VortexTRTLLMBackend wires its seq_lens_decode
+        # buffers in _compile).
+        "dense_seqlens", "sparse_seqlens",
         # winfo
         "winfo_q_indices", "winfo_is_first_workload_per_batch", "winfo_kv_offsets", "winfo_kv_lens", "winfo_num_workloads", "winfo_chunk_size", "max_num_workloads",
         # chunk limits
@@ -45,6 +49,8 @@ class Context(ContextBase):
     kv_last_page_len: int            #: Length of the last KV page.
     batch_size: int                  #: Active batch size.
     max_bs: int                      #: Maximum batch size (allocation budget).
+    dense_seqlens: torch.Tensor      #: Per-(req, kv-head) seq_lens for the dense decode path (None by default).
+    sparse_seqlens: torch.Tensor     #: Per-(req, kv-head) seq_lens for the sparse decode path (None by default).
 
     # --- workload info (winfo) ---
     winfo_q_indices: torch.Tensor    #: Query indices used in workload scheduling.
@@ -111,7 +117,9 @@ class Context(ContextBase):
             elif name == "batch_size":
                 object.__setattr__(self, name, 0)
             elif name == "mode":
-                object.__setattr__(self, name, Mode.profile) 
+                object.__setattr__(self, name, Mode.profile)
+            elif name in ("dense_seqlens", "sparse_seqlens"):
+                object.__setattr__(self, name, None)
             else:
                 object.__setattr__(self, name, UNSET)
 

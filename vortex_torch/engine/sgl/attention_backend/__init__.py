@@ -21,4 +21,8 @@ from vortex_torch.engine.sgl.attention_backend.flashinfer import (
     VortexFlashInferBackend,
 )
 
-__all__ = ["VortexFlashInferBackend"]
+from vortex_torch.engine.sgl.attention_backend.trtllm import (
+    VortexTRTLLMBackend,
+)
+
+__all__ = ["VortexFlashInferBackend", "VortexTRTLLMBackend"]

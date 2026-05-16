@@ -26,8 +26,12 @@ def create_flashinfer_backend(runner):
 
     if not runner.use_mla_backend:
         if runner.server_args.enable_vortex_sparsity:
-            from vortex_torch.engine.sgl.attention_backend import VortexFlashInferBackend
-            return VortexFlashInferBackend(runner)
+            if runner.server_args.vortex_attention_backend == "flashinfer":
+                from vortex_torch.engine.sgl.attention_backend import VortexFlashInferBackend
+                return VortexFlashInferBackend(runner)
+            elif runner.server_args.vortex_attention_backend == "trtllm":
+                from vortex_torch.engine.sgl.attention_backend import VortexTRTLLMBackend
+                return VortexTRTLLMBackend(runner)
         else:
             from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 

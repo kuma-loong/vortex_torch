@@ -579,6 +579,7 @@ class ServerArgs:
     vortex_topk_ratio: float = 0.0
     vortex_compilation_cache_dir: str = None
     vortex_schedule_policy: str = None
+    vortex_attention_backend: Optional[str] = "flashinfer"
 
     # Offloading
     cpu_offload_gb: int = 0
@@ -5156,6 +5157,11 @@ class ServerArgs:
             "--vortex-topk-ratio",
             type=float,
             default=ServerArgs.vortex_topk_ratio,
+        )
+        parser.add_argument(
+            "--vortex-attention-backend",
+            type=str,
+            default=ServerArgs.vortex_attention_backend,
         )
 
     @classmethod

@@ -26,6 +26,7 @@ return max(static_kv_budget, dynamic_kv_budget);
                     vortex_block_reserved_eos=2,
                     vortex_layers_skip=list(range(1)),
                     vortex_module_name="block_sparse_attention",
+                    vortex_attention_backend="trtllm",
                     #vortex_module_path="submissions/example_block_sparse_attention.py",
                     vortex_max_seq_lens=8192,
                     mem_fraction_static=0.8,

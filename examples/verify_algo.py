@@ -37,6 +37,7 @@ kv_cache_dtype: str = "auto"
                     vortex_block_size=block_size,
                     page_size=page_size,
                     vortex_topk_val=topk_val,
+                    vortex_max_topk_val=256,
                     tp_size=tp_size,
                     kv_cache_dtype=kv_cache_dtype,
                     disable_overlap_schedule=True,
@@ -238,6 +239,12 @@ def parse_args():
         help="Directory to read prior summaries from and write this run's summary to (default: summary_ratio).",
     )
 
+    parser.add_argument(
+        "--skip-already-finished-check",
+        action="store_true",
+        help="Skip checking for prior matching summaries and always run.",
+    )
+
     return parser.parse_args()
 
 def already_finished(summary_dir, args):
@@ -270,7 +277,7 @@ def already_finished(summary_dir, args):
 if __name__ == "__main__":
     args = parse_args()
 
-    existing = already_finished(args.summary_dir, args)
+    existing = None if args.skip_already_finished_check else already_finished(args.summary_dir, args)
     if existing is not None:
         print(
             f"Skip: already finished "
