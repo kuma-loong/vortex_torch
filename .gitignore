@@ -6,6 +6,7 @@ debug/
 debug*
 
 # sglang vendored debug_utils — track despite the global debug* rule.
+!third_party/sglang/v0.4.9/sglang/python/sglang/srt/debug_utils.py
 !third_party/sglang/v0.5.9/sglang/python/sglang/srt/debug_utils/
 !third_party/sglang/v0.5.9/sglang/python/sglang/srt/debug_utils/**
 
