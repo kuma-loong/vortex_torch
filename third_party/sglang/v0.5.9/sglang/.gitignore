@@ -271,3 +271,16 @@ sgl-kernel/csrc/**/*_musa/
 
 # MUSA core dump files
 *.mudmp
+
+# Track vendored upstream content despite the noise rules above.
+# Directory rules must be negated before their contents become re-includable.
+!**/tests/
+!**/tests/**
+!**/scripts/
+!**/scripts/**
+!**/debug*
+!**/debug*/**
+!**/*.json
+!**/*.jsonl
+!**/*.png
+!**/*.pdf
