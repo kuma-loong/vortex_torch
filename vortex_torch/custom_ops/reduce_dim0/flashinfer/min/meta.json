@@ -1,0 +1,8 @@
+{
+    "name": "min",
+    "description": "Reduce-dim0 (min) over RAGGED CSR blocks (flashinfer).",
+    "constraints": {
+        "variant": "min"
+    },
+    "priority": 100
+}

@@ -1,0 +1,7 @@
+{
+    "name": "default",
+    "description": "TopK(k) \u2014 k-largest blocks per row + bos/eos restoration (catch-all, trtllm).",
+    "constraints": {},
+    "priority": 0,
+    "default": true
+}

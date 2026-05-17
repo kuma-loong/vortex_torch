@@ -39,7 +39,7 @@ self.output_func(score, o, ctx=ctx)   # score.shape == [S, 1, 1]
 the surviving page indices to `o`. Downstream, flashinfer attends only
 to those pages.
 
-Two terminal-op choices:
+Two terminal-op choices for single-stream flows:
 
 - **`topK()`** — exact top-k (sorted output). Use unless `topK` cost
   shows up as a bottleneck.
@@ -49,6 +49,17 @@ Two terminal-op choices:
   `(score, o, ctx=ctx)` call shape; same BOS/EOS reservation;
   output indices unsorted within each segment. See
   `indexer_op.md §9` for the full math + tuning guidance.
+
+For **trtllm-backend flows** that need to union two independent
+selection streams (e.g. an importance score plus a recency / coverage
+signal) there's also `TopK(k) + Union()` — see `indexer_op.md §9b`.
+Each `TopK(k)` returns `(block_tables, seqlens)` as auto-allocated
+intermediates (it does **not** write `o`), and `Union()` is the
+terminal output op that merges two such pairs into the final `o` +
+`sparse_seqlens`, with the dense path's true last block correctly
+placed at the tail (so trtllm decode reads the right partial token
+count). Both ops are trtllm-only — flashinfer flows must stick with
+the single-stream `topK` / `approxTopK` above.
 
 Every op between `forward_indexer(self, q, o, cache, ctx)` and
 `self.output_func(score, o, ctx)` just transforms `[S, D_0, D_1]` tensors

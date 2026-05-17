@@ -39,9 +39,6 @@ void sglang_plan_decode_v2(
 
 void sglang_plan_decode_v2_trtllm(
     const at::Tensor& cached_seq_lens,
-    at::Tensor& dense_kv_indptr,
-    at::Tensor& sparse_kv_indptr,
-    at::Tensor& dense_kv_indices,
     at::Tensor& kv_last_page_len,
     at::Tensor& dense_block_tables,
     at::Tensor& sparse_block_tables,
@@ -148,11 +145,33 @@ __global__ void Sgl_Decode_Plan_Indptr_V2_Kernel(
     }
 }
 
-template <int ITEM_PER_THREAD>
+// IS_TRTLLM controls both per-row data source and ``winfo_kv_offsets[j]``
+// encoding:
+//   * false (flashinfer / CSR) — reads ``dense_kv_indptr`` / ``sparse_kv_indptr``
+//                                (length ``eff_bs+1``) for per-row block
+//                                counts; emits flat CSR offsets
+//                                (``dense_kv_indptr[row] + col``) into
+//                                ``dense_kv_indices``.
+//   * true  (trtllm / BT)      — reads ``dense_seqlens`` / ``sparse_seqlens``
+//                                (length ``eff_bs``, in **tokens**) and
+//                                converts to block counts via
+//                                ``ceil(tokens / block_size)``; emits
+//                                linear BT offsets
+//                                (``row * max_blocks_per_seq + col``) into
+//                                the flattened ``dense_block_tables``.
+// The Schedule.W kernel preamble does
+//   ``page_idx_i32 = tl.load(indices + ragged_idx_i32)``
+// and ``ragged_idx_i32 * shape[1]`` for RAGGED store/load addresses, so
+// matching ``indices`` to the offset encoding is the *only* knob the
+// consumer side needs to flip — see the matching launcher branch in
+// ``vortex_torch/indexer/compiler/triton_impl/kernel_gen.py``.
+template <int ITEM_PER_THREAD, bool IS_TRTLLM>
 __launch_bounds__(1024, 1)
 __global__ void Sgl_Decode_Plan_Workload_V2_Kernel(
-    const int* __restrict__ dense_kv_indptr,
-    const int* __restrict__ sparse_kv_indptr,
+    // CSR path consumes the first two as indptr (length eff_bs+1);
+    // BT  path consumes the same slots as seqlens (length eff_bs, tokens).
+    const int* __restrict__ row_a,
+    const int* __restrict__ row_b,
     int* __restrict__ winfo_q_indices,
     uint8_t* __restrict__ winfo_is_first_workload_per_batch,
     int* __restrict__ winfo_kv_offsets,
@@ -162,7 +181,9 @@ __global__ void Sgl_Decode_Plan_Workload_V2_Kernel(
     const int workload_chunk_size,
     const int eff_batch_size,
     const int block_reserved_bos,
-    const int block_reserved_eos
+    const int block_reserved_eos,
+    const int max_blocks_per_seq,   // only used when IS_TRTLLM
+    const int block_size            // only used when IS_TRTLLM
 ) {
     const int tx = threadIdx.x;
     using BlockScanInt = cub::BlockScan<int, 1024>;
@@ -181,13 +202,22 @@ __global__ void Sgl_Decode_Plan_Workload_V2_Kernel(
     for (int i = 0; i < ITEM_PER_THREAD; ++i) {
         int16_t w = 0;
         if ((tx_offset + i) < eff_batch_size) {
-            const int16_t dense_seqlen_i =
-                dense_kv_indptr[tx_offset + i + 1] - dense_kv_indptr[tx_offset + i];
-            const int16_t sparse_seqlen_i =
-                sparse_kv_indptr[tx_offset + i + 1] - sparse_kv_indptr[tx_offset + i];
+            int16_t dense_blocks_i;
+            int16_t sparse_blocks_i;
+            if constexpr (IS_TRTLLM) {
+                // row_a = dense_seqlens (tokens), row_b = sparse_seqlens (tokens)
+                const int dense_tokens  = row_a[tx_offset + i];
+                const int sparse_tokens = row_b[tx_offset + i];
+                dense_blocks_i  = int16_t((dense_tokens  + block_size - 1) / block_size);
+                sparse_blocks_i = int16_t((sparse_tokens + block_size - 1) / block_size);
+            } else {
+                // row_a = dense_kv_indptr, row_b = sparse_kv_indptr (block-granular indptr)
+                dense_blocks_i  = int16_t(row_a[tx_offset + i + 1] - row_a[tx_offset + i]);
+                sparse_blocks_i = int16_t(row_b[tx_offset + i + 1] - row_b[tx_offset + i]);
+            }
 
-            if (dense_seqlen_i > sparse_seqlen_i) {
-                w = dense_seqlen_i - block_reserved_eos;
+            if (dense_blocks_i > sparse_blocks_i) {
+                w = dense_blocks_i - block_reserved_eos;
             } else {
                 w = 0;
             }
@@ -217,11 +247,21 @@ __global__ void Sgl_Decode_Plan_Workload_V2_Kernel(
                 last_len = workload_chunk_size;
             }
 
+            const int row = tx_offset + i;
+            // CSR base = flat prefix-sum into dense_kv_indices (row_a is indptr).
+            // BT  base = row * max_blocks_per_seq (linear into flattened
+            //            dense_block_tables, see Schedule.W launcher).
+            int row_base;
+            if constexpr (IS_TRTLLM) {
+                row_base = row * max_blocks_per_seq;
+            } else {
+                row_base = row_a[row];   // row_a == dense_kv_indptr in CSR mode
+            }
             for (int j = start; j < end; ++j) {
-                winfo_q_indices[j] = tx_offset + i;
+                winfo_q_indices[j] = row;
                 winfo_kv_lens[j] = (j != end - 1) ? workload_chunk_size : last_len;
                 winfo_kv_offsets[j] =
-                    dense_kv_indptr[tx_offset + i] + (j - start) * workload_chunk_size;
+                    row_base + (j - start) * workload_chunk_size;
                 winfo_is_first_workload_per_batch[j] = (j == start) ? 1 : 0;
             }
         }
@@ -386,8 +426,9 @@ void sglang_plan_decode_v2(
         static_cast<int>(block_reserved_eos)
     );
 
+    // CSR path: pass IS_TRTLLM=false and 0 for max_blocks_per_seq (unused).
     if (eff_batch_size <= 1024) {
-        Sgl_Decode_Plan_Workload_V2_Kernel<1><<<1, 1024, 0, stream>>>(
+        Sgl_Decode_Plan_Workload_V2_Kernel<1, false><<<1, 1024, 0, stream>>>(
             dense_kv_indptr.data_ptr<int>(),
             sparse_kv_indptr.data_ptr<int>(),
             winfo_q_indices.data_ptr<int>(),
@@ -399,10 +440,12 @@ void sglang_plan_decode_v2(
             static_cast<int>(workload_chunk_size),
             eff_batch_size,
             static_cast<int>(block_reserved_bos),
-            static_cast<int>(block_reserved_eos)
+            static_cast<int>(block_reserved_eos),
+            0,
+            0
         );
     } else if (eff_batch_size <= 2048) {
-        Sgl_Decode_Plan_Workload_V2_Kernel<2><<<1, 1024, 0, stream>>>(
+        Sgl_Decode_Plan_Workload_V2_Kernel<2, false><<<1, 1024, 0, stream>>>(
             dense_kv_indptr.data_ptr<int>(),
             sparse_kv_indptr.data_ptr<int>(),
             winfo_q_indices.data_ptr<int>(),
@@ -414,10 +457,12 @@ void sglang_plan_decode_v2(
             static_cast<int>(workload_chunk_size),
             eff_batch_size,
             static_cast<int>(block_reserved_bos),
-            static_cast<int>(block_reserved_eos)
+            static_cast<int>(block_reserved_eos),
+            0,
+            0
         );
     } else if (eff_batch_size <= 4096) {
-        Sgl_Decode_Plan_Workload_V2_Kernel<4><<<1, 1024, 0, stream>>>(
+        Sgl_Decode_Plan_Workload_V2_Kernel<4, false><<<1, 1024, 0, stream>>>(
             dense_kv_indptr.data_ptr<int>(),
             sparse_kv_indptr.data_ptr<int>(),
             winfo_q_indices.data_ptr<int>(),
@@ -429,10 +474,12 @@ void sglang_plan_decode_v2(
             static_cast<int>(workload_chunk_size),
             eff_batch_size,
             static_cast<int>(block_reserved_bos),
-            static_cast<int>(block_reserved_eos)
+            static_cast<int>(block_reserved_eos),
+            0,
+            0
         );
     } else if (eff_batch_size <= 8192) {
-        Sgl_Decode_Plan_Workload_V2_Kernel<8><<<1, 1024, 0, stream>>>(
+        Sgl_Decode_Plan_Workload_V2_Kernel<8, false><<<1, 1024, 0, stream>>>(
             dense_kv_indptr.data_ptr<int>(),
             sparse_kv_indptr.data_ptr<int>(),
             winfo_q_indices.data_ptr<int>(),
@@ -444,7 +491,9 @@ void sglang_plan_decode_v2(
             static_cast<int>(workload_chunk_size),
             eff_batch_size,
             static_cast<int>(block_reserved_bos),
-            static_cast<int>(block_reserved_eos)
+            static_cast<int>(block_reserved_eos),
+            0,
+            0
         );
     } else {
         TORCH_CHECK(false, "eff_batch_size > 8192 is not supported");
@@ -475,35 +524,78 @@ void sglang_plan_decode_v2(
 }
 
 // ---------------------------------------------------------------------------
-// trtllm-flavoured indices kernel: instead of writing a flat CSR
-// (dense_kv_indices / sparse_kv_indices), it writes
+// trtllm-flavoured planner (indptr-free): writes
 //   - dense_block_tables  : [eff_bs, max_blocks_per_seq] int32
 //   - sparse_block_tables : [eff_bs, max_blocks_per_seq] int32  (BOS+EOS only)
-//   - dense_seqlens       : [eff_bs] int32
-//   - sparse_seqlens      : [eff_bs] int32
+//   - dense_seqlens       : [eff_bs] int32   (tokens)
+//   - sparse_seqlens      : [eff_bs] int32   (tokens)
+//   - kv_last_page_len    : [eff_bs] int32
 // where eff_bs == batch_size * num_kv_heads. The middle slots of every
 // sparse_block_tables row (between BOS and EOS) are intentionally NOT touched
 // here — they are filled by the topk kernel.
 // ---------------------------------------------------------------------------
+
+// (1) Seqlens kernel: emits ``dense_seqlens`` / ``sparse_seqlens`` (tokens)
+// for every (req, kv_head) row. Must run BEFORE the workload scheduler in
+// trtllm mode, since the trtllm workload scheduler reads seqlens to derive
+// per-row block counts (replacing the CSR-mode indptr diff).
+__launch_bounds__(1024, 1)
+__global__ void Sgl_Decode_Plan_Seqlens_V2_Trtllm_Kernel(
+    const int* __restrict__ cached_seq_lens,
+    int* __restrict__ dense_seqlens,
+    int* __restrict__ sparse_seqlens,
+    const int batch_size,
+    const int num_kv_heads,
+    const int block_size,
+    const int topk_val,
+    const float topk_ratio,
+    const int block_reserved_bos,
+    const int block_reserved_eos
+) {
+    const int tx = threadIdx.x;
+    if (tx >= batch_size) return;
+
+    const int cached_seq_len = cached_seq_lens[tx];
+    const int block_len = (cached_seq_len + block_size - 1) / block_size;
+    const int kv_budget_raw = ComputeKvBudget(
+        block_len, topk_val, topk_ratio,
+        block_reserved_bos, block_reserved_eos);
+    const int sparse_block_len = (kv_budget_raw < block_len) ? kv_budget_raw : block_len;
+
+    const int last_len_mod = cached_seq_len % block_size;
+    const int last_block_len = (last_len_mod == 0) ? block_size : last_len_mod;
+
+    const int dense_tokens  = cached_seq_len;
+    const int sparse_tokens = (sparse_block_len > 0)
+        ? ((sparse_block_len - 1) * block_size + last_block_len)
+        : 0;
+
+    // Replicate per (req, kv_head). Layout matches ``row = bx*kv_heads + by``.
+    #pragma unroll
+    for (int i = 0; i < num_kv_heads; ++i) {
+        const int row = tx * num_kv_heads + i;
+        dense_seqlens[row]  = dense_tokens;
+        sparse_seqlens[row] = sparse_tokens;
+    }
+}
+
+// (3) Indices kernel: emits block_tables + kv_last_page_len. Indptr-free —
+// re-derives ``kv_budget`` from the policy locally rather than reading from
+// a planner-emitted indptr buffer.
 __global__ void Sgl_Decode_Plan_Indices_V2_Trtllm_Kernel(
     const int* __restrict__ req_to_token,
     const int64_t* __restrict__ req_indices,
     const int* __restrict__ cache_seq_lens,
-    const int* __restrict__ dense_kv_indptr,
-    const int* __restrict__ sparse_kv_indptr,
-    int* __restrict__ dense_kv_indices,       // TODO(opt-b): drop once the
-                                              // indexer score-gather codegen
-                                              // reads dense_block_tables.
     int* __restrict__ dense_block_tables,
     int* __restrict__ sparse_block_tables,
-    int* __restrict__ dense_seqlens,
-    int* __restrict__ sparse_seqlens,
     int* __restrict__ kv_last_block_len,
     const int max_blocks_per_seq,
     const int req_to_token_stride,
     const int page_size,
     const int block_size,
     const int num_kv_heads,
+    const int topk_val,
+    const float topk_ratio,
     const int block_reserved_bos,
     const int block_reserved_eos
 ) {
@@ -522,33 +614,26 @@ __global__ void Sgl_Decode_Plan_Indices_V2_Trtllm_Kernel(
     const int last_block_len = (last_len_mod == 0) ? block_size : last_len_mod;
     const int num_blocks_per_page = page_size / block_size;
 
-    const int kv_budget =
-        sparse_kv_indptr[row + 1] - sparse_kv_indptr[row];
-    const int sparse_block_len = (kv_budget < block_len) ? kv_budget : block_len;
+    const int kv_budget_raw = ComputeKvBudget(
+        block_len, topk_val, topk_ratio,
+        block_reserved_bos, block_reserved_eos);
+    const int kv_budget = (kv_budget_raw < block_len) ? kv_budget_raw : block_len;
 
     if (tx == 0) {
         kv_last_block_len[row] = last_block_len;
-        dense_seqlens[row]  = (block_len - 1) * block_size + last_block_len;
-        sparse_seqlens[row] = (sparse_block_len - 1) * block_size + last_block_len;
     }
 
     int* dense_output  = dense_block_tables  + row * max_blocks_per_seq;
     int* sparse_output = sparse_block_tables + row * max_blocks_per_seq;
-    // TODO(opt-b): dense_kv_indices is written here only because the indexer
-    // score-gather codegen still reads from it. Once that codegen is taught
-    // to read dense_block_tables directly, this 1D write and the
-    // dense_kv_indices tensor can be removed from the trtllm planner.
-    int* dense_csr_output = dense_kv_indices + dense_kv_indptr[row];
 
-    // ---- Dense: write every block_len entry to both layouts. -------------
+    // ---- Dense: write every block_len entry. ----------------------------
     int pos = tx;
     while (pos < block_len) {
         const int data = token_indices[pos * block_size];
         const int page_id = (data / page_size) * num_kv_heads + by;
         const int block_id =
             page_id * num_blocks_per_page + (data % page_size) / block_size;
-        dense_output[pos]     = block_id;
-        dense_csr_output[pos] = block_id;
+        dense_output[pos] = block_id;
         pos += nblk;
     }
 
@@ -584,9 +669,6 @@ __global__ void Sgl_Decode_Plan_Indices_V2_Trtllm_Kernel(
 
 void sglang_plan_decode_v2_trtllm(
     const at::Tensor& cached_seq_lens,
-    at::Tensor& dense_kv_indptr,
-    at::Tensor& sparse_kv_indptr,
-    at::Tensor& dense_kv_indices,
     at::Tensor& kv_last_page_len,
     at::Tensor& dense_block_tables,
     at::Tensor& sparse_block_tables,
@@ -610,9 +692,6 @@ void sglang_plan_decode_v2_trtllm(
     const int64_t workload_chunk_size
 ) {
     TORCH_CHECK(cached_seq_lens.is_cuda(), "cached_seq_lens must be a CUDA tensor");
-    TORCH_CHECK(dense_kv_indptr.is_cuda(), "dense_kv_indptr must be a CUDA tensor");
-    TORCH_CHECK(sparse_kv_indptr.is_cuda(), "sparse_kv_indptr must be a CUDA tensor");
-    TORCH_CHECK(dense_kv_indices.is_cuda(), "dense_kv_indices must be a CUDA tensor");
     TORCH_CHECK(kv_last_page_len.is_cuda(), "kv_last_page_len must be a CUDA tensor");
     TORCH_CHECK(dense_block_tables.is_cuda(), "dense_block_tables must be a CUDA tensor");
     TORCH_CHECK(sparse_block_tables.is_cuda(), "sparse_block_tables must be a CUDA tensor");
@@ -630,9 +709,6 @@ void sglang_plan_decode_v2_trtllm(
     TORCH_CHECK(req_to_token.dtype() == torch::kInt32, "req_to_token must be int32");
     TORCH_CHECK(req_indices.dtype() == torch::kInt64, "req_indices must be int64");
     TORCH_CHECK(cached_seq_lens.dtype() == torch::kInt32, "cached_seq_lens must be int32");
-    TORCH_CHECK(dense_kv_indptr.dtype() == torch::kInt32, "dense_kv_indptr must be int32");
-    TORCH_CHECK(sparse_kv_indptr.dtype() == torch::kInt32, "sparse_kv_indptr must be int32");
-    TORCH_CHECK(dense_kv_indices.dtype() == torch::kInt32, "dense_kv_indices must be int32");
     TORCH_CHECK(kv_last_page_len.dtype() == torch::kInt32, "kv_last_page_len must be int32");
     TORCH_CHECK(dense_block_tables.dtype() == torch::kInt32, "dense_block_tables must be int32");
     TORCH_CHECK(sparse_block_tables.dtype() == torch::kInt32, "sparse_block_tables must be int32");
@@ -666,16 +742,18 @@ void sglang_plan_decode_v2_trtllm(
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK(batch_size <= 1024,
-        "Sgl_Decode_Plan_Indptr_V2_Kernel assumes batch_size <= 1024");
+        "Sgl_Decode_Plan_Seqlens_V2_Trtllm_Kernel assumes batch_size <= 1024");
 
-    // (1) indptr — identical to the non-trtllm path.
-    Sgl_Decode_Plan_Indptr_V2_Kernel<<<1, 1024, 0, stream>>>(
+    // (1) Seqlens — writes dense_seqlens / sparse_seqlens (tokens) for the
+    // workload scheduler in (2) and the trtllm topk / decode kernels at
+    // forward time. Replaces the CSR-mode Indptr kernel; no indptr is ever
+    // emitted in trtllm mode.
+    Sgl_Decode_Plan_Seqlens_V2_Trtllm_Kernel<<<1, 1024, 0, stream>>>(
         cached_seq_lens.data_ptr<int>(),
-        dense_kv_indptr.data_ptr<int>(),
-        sparse_kv_indptr.data_ptr<int>(),
+        dense_seqlens.data_ptr<int>(),
+        sparse_seqlens.data_ptr<int>(),
         batch_size,
         static_cast<int>(num_kv_heads),
-        static_cast<int>(page_size),
         static_cast<int>(block_size),
         static_cast<int>(topk_val),
         static_cast<float>(topk_ratio),
@@ -683,12 +761,16 @@ void sglang_plan_decode_v2_trtllm(
         static_cast<int>(block_reserved_eos)
     );
 
-    // (2) workload — identical to the non-trtllm path.
+    // (2) Workload — IS_TRTLLM=true reads seqlens (in tokens), converts
+    // to blocks via ``ceil(tokens / block_size)``, and bakes
+    // ``winfo_kv_offsets[j] = row*max_blocks_per_seq + col`` so the
+    // Schedule.W kernel preamble (with ``indices = dense_block_tables.view(-1)``)
+    // resolves page ids correctly.
     auto launch_workload = [&](auto items_per_thread) {
         constexpr int IPT = decltype(items_per_thread)::value;
-        Sgl_Decode_Plan_Workload_V2_Kernel<IPT><<<1, 1024, 0, stream>>>(
-            dense_kv_indptr.data_ptr<int>(),
-            sparse_kv_indptr.data_ptr<int>(),
+        Sgl_Decode_Plan_Workload_V2_Kernel<IPT, true><<<1, 1024, 0, stream>>>(
+            dense_seqlens.data_ptr<int>(),
+            sparse_seqlens.data_ptr<int>(),
             winfo_q_indices.data_ptr<int>(),
             winfo_is_first_workload_per_batch.data_ptr<uint8_t>(),
             winfo_kv_offsets.data_ptr<int>(),
@@ -698,7 +780,9 @@ void sglang_plan_decode_v2_trtllm(
             static_cast<int>(workload_chunk_size),
             eff_batch_size,
             static_cast<int>(block_reserved_bos),
-            static_cast<int>(block_reserved_eos)
+            static_cast<int>(block_reserved_eos),
+            max_blocks_per_seq,
+            static_cast<int>(block_size)
         );
     };
     if (eff_batch_size <= 1024) {
@@ -713,7 +797,7 @@ void sglang_plan_decode_v2_trtllm(
         TORCH_CHECK(false, "eff_batch_size > 8192 is not supported");
     }
 
-    // (3) NEW indices kernel — emits block_tables + seqlens directly.
+    // (3) Indices — block_tables + kv_last_page_len. No CSR side-output.
     const int req_to_token_stride = static_cast<int>(req_to_token.size(1));
     dim3 nblks(batch_size, static_cast<unsigned int>(num_kv_heads));
     dim3 nthrs(512);
@@ -722,19 +806,16 @@ void sglang_plan_decode_v2_trtllm(
         req_to_token.data_ptr<int>(),
         req_indices.data_ptr<int64_t>(),
         cached_seq_lens.data_ptr<int>(),
-        dense_kv_indptr.data_ptr<int>(),
-        sparse_kv_indptr.data_ptr<int>(),
-        dense_kv_indices.data_ptr<int>(),
         dense_block_tables.data_ptr<int>(),
         sparse_block_tables.data_ptr<int>(),
-        dense_seqlens.data_ptr<int>(),
-        sparse_seqlens.data_ptr<int>(),
         kv_last_page_len.data_ptr<int>(),
         max_blocks_per_seq,
         req_to_token_stride,
         static_cast<int>(page_size),
         static_cast<int>(block_size),
         static_cast<int>(num_kv_heads),
+        static_cast<int>(topk_val),
+        static_cast<float>(topk_ratio),
         static_cast<int>(block_reserved_bos),
         static_cast<int>(block_reserved_eos)
     );

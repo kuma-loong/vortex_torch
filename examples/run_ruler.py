@@ -3,7 +3,7 @@ import sys
 import sglang as sgl
 from transformers import AutoTokenizer
 def main():
-    model_name = "Qwen/Qwen3-30B-A3B-FP8"
+    model_name = "MiniMaxAI/MiniMax-M2.5"
 
     default_policy = r"""
 const int static_kv_budget = topk_val + block_reserved_bos + block_reserved_eos;
@@ -21,17 +21,19 @@ return max(static_kv_budget, dynamic_kv_budget);
                     vortex_dtype="bfloat16",
                     attention_backend="flashinfer",
                     vortex_schedule_policy=default_policy,
-                    enable_vortex_sparsity=True,
+                    enable_vortex_sparsity=False,
                     vortex_block_reserved_bos=1,
                     vortex_block_reserved_eos=2,
                     vortex_layers_skip=list(range(1)),
                     vortex_module_name="block_sparse_attention",
                     vortex_attention_backend="trtllm",
+                    trust_remote_code=True,
                     #vortex_module_path="submissions/example_block_sparse_attention.py",
                     vortex_max_seq_lens=8192,
                     mem_fraction_static=0.8,
                     vortex_workload_chunk_size=32,
                     vortex_compilation_cache_dir="~/.vortex_compilation_cache",
+                    tp_size=2,
                     )
     
     with open("examples/validation.jsonl", "r", encoding="utf-8") as f:

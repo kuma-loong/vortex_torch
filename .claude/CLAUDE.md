@@ -82,6 +82,12 @@ modifying the compiler itself, not when writing a submission.
   score must be RAGGED `[S, 1, 1]`. `approxTopK` is a faster
   adaptive 8-bit radix variant; `tolerate_ratio ∈ [0.0, 1.0]`
   where `0.0` = exact, higher = cheaper but looser.
+  *Trtllm-only alternative:* with
+  `"vortex_attention_backend": "trtllm"` you can instead end in
+  `Union()((bt_a, sl_a), (bt_b, sl_b), o, ctx=ctx)` fed by two
+  `TopK(k=...)(score, ctx=ctx) → (block_tables, seqlens)` calls.
+  `TopK` / `Union` assert at profile time if used under flashinfer
+  (see `AI/tutorials/indexer_op.md §9b`).
 - **Cache-side reductions support `dim ∈ {1, 2}` only.** Cross-block
   reductions (`dim=0`) belong on the indexer side.
 - **If a field is read+written across steps via `Load`/`Save`, zero

@@ -559,6 +559,123 @@ is identical.
 
 ---
 
+## 9b. `TopK(k)` + `Union()` — trtllm-only multi-stream selection
+
+**Backend gate.** These two ops are **only available when
+`vortex_attention_backend == "trtllm"` in the engine JSON.** Both
+`profile()` and the codegen path assert this; flashinfer/CSR flows
+must keep using `topK()` / `approxTopK()`.
+
+The pair lets you build a flow that selects pages from **two
+independent score streams** and unions them into the final block-table
+that's fed to `trtllm_batch_decode_with_kv_cache`. The flow shape is
+
+```
+score_a, score_b = … compute two scores per page …
+bt_a, sl_a = self.topk_a(score_a, ctx=ctx)    # TopK(k_a)
+bt_b, sl_b = self.topk_b(score_b, ctx=ctx)    # TopK(k_b)
+self.output_func((bt_a, sl_a), (bt_b, sl_b), o, ctx=ctx)   # Union()
+```
+
+### `TopK(k=…)` — intermediate block-table selector (`vortex_torch.indexer.select.TopK`)
+
+Distinct from `topK()` (lowercase `t`, the existing output op). This
+one is **not** an output function — it does not write `o`. Instead it
+allocates and returns two auto-managed intermediates:
+
+```python
+from vortex_torch.indexer import TopK
+
+self.topk_a = TopK(k=29)         # k is explicit, set at construction
+...
+block_tables, seqlens = self.topk_a(score, ctx=ctx)
+```
+
+Per-row behavior (using `bos = ctx.block_reserved_bos`,
+`eos = ctx.block_reserved_eos`,
+`block_len = ceil(dense_seqlens[i] / block_size)`):
+
+  * If `block_len ≤ bos + k + eos` → copies the entire dense row into
+    `block_tables[i, :block_len]` and sets `seqlens[i] = dense_seqlens[i]`.
+    No selection is needed; the row already fits the budget.
+  * Otherwise → writes
+      - `[0:bos)`               ← first `bos` dense blocks
+      - `[bos:bos+k)`           ← top-`k` blocks by score from
+                                  `[bos, block_len-eos)` of the dense row
+      - `[bos+k:bos+k+eos)`     ← last `eos` dense blocks
+    and sets `seqlens[i] = (bos+k+eos-1) * block_size + last_block_len`,
+    where `last_block_len` is the partial token count of the dense
+    sequence's trailing block.
+
+Output buffers (allocated automatically in `memory_initiazation_str`):
+
+  * `block_tables` — `FORMAT.RAGGED` int32; leading dim
+    `ctx.max_num_blocks` (= `eff_bs * max_blocks_per_seq`). The CUDA
+    kernel treats it as contiguous `[eff_bs, max_blocks_per_seq]` memory.
+  * `seqlens` — `FORMAT.BATCHED` int32; leading dim
+    `ctx.max_bs * ctx.num_kv_heads` (= `eff_bs`), in **tokens**.
+
+`k` is fixed per op instance. If you need multiple budgets, instantiate
+multiple `TopK(k=…)` ops.
+
+### `Union()` — multi-stream output op (`vortex_torch.indexer.output_func.Union`)
+
+Takes two `(block_table, seqlens)` tuples (typically produced by `TopK`
+calls) and computes their per-row deduplicated union into the final
+`o` / `sparse_seqlens`. The pair is shaped so trtllm decode reads
+the right `seq_lens[bx]` and last-block partial token count.
+
+```python
+from vortex_torch.indexer import Union
+
+self.output_func = Union()
+...
+self.output_func((bt_a, sl_a), (bt_b, sl_b), o, ctx=ctx)
+```
+
+Per-row union algorithm:
+
+  1. Derives `last_block_id = dense_block_tables[i, dense_block_len-1]`
+     and `last_block_len = dense_seqlens[i] mod block_size` (or
+     `block_size` when the remainder is zero).
+  2. Walks `bt_a[i, :blocks_a]` then `bt_b[i, :blocks_b]`
+     (`blocks_j = ceil(sl_j[i] / block_size)`). Each id ≠ `last_block_id`
+     is added to a shared-memory dedup buffer if not already present.
+     Duplicate BOS, middle, and inner-EOS slots are all collapsed.
+  3. Writes the deduped union to `o[i, :u)`, then `o[i, u] = last_block_id`
+     so trtllm decode sees the partial last block at the tail.
+  4. Sets `sparse_seqlens[i] = u * block_size + last_block_len`.
+
+Constraints:
+
+  * Must be called **exactly once** per `forward_indexer` (it claims
+    `o`), in place of `topK()` / `approxTopK()`.
+  * Both `bt_*` inputs must be `FORMAT.RAGGED` (which is what `TopK`
+    produces).
+  * trtllm-only — see backend gate above.
+
+The op overwrites `ctx.metadata.sparse_seqlens` as a side effect (no
+graph output tracks it), matching the pattern that the legacy `topK`
+uses for `sparse_kv_indices` writes.
+
+### When to use this pair vs. `topK` / `approxTopK`
+
+  * **CSR / flashinfer flows** — use the legacy `topK()` / `approxTopK()`
+    (single score → single selection → writes `o`). Lower per-op
+    overhead, no Union dedup cost.
+  * **trtllm flows** with **one** scoring head — use either the legacy
+    `topK()` (works fine in trtllm too) or a single `TopK(k) + Union()`
+    with a second dummy stream. Usually not worth the extra op.
+  * **trtllm flows** with **two distinct scoring criteria** (e.g. an
+    importance score plus a recency / coverage signal) — use
+    `TopK(k_a) + TopK(k_b) + Union()`. The union budget per row is
+    `≤ bos + k_a + k_b + eos`; collisions in the middle selections
+    are deduped automatically. The Union kernel guarantees the dense
+    path's true last block sits at the tail with the correct partial
+    token count.
+
+---
+
 ## 10. Quick-reference cheat sheet
 
 | op | shape transformation | math |
@@ -582,6 +699,8 @@ is identical.
 | `Save()(x, F)` | writes `F` | persist `x` into cache field |
 | `topK()(score, o)` | `[S, 1, 1] →` writes `o` | pick top-k pages (exact, sorted) |
 | `approxTopK(t)(score, o)` | `[S, 1, 1] →` writes `o` | pick top-k pages (adaptive radix; `t ∈ [0,1]` cheaper-but-looser at higher t; output unsorted) |
+| `TopK(k)(score)` → `(block_tables, seqlens)` | `[S, 1, 1] →` two new intermediates | **trtllm-only**, explicit `k`, allocates own outputs; no write to `o`. Pair into a `Union()` |
+| `Union()((bt₀, sl₀), (bt₁, sl₁), o)` | merges two `(block_table, seqlens)` pairs, writes `o` + `sparse_seqlens` | **trtllm-only** output op; deduplicated union with last-block partial token count preserved |
 
 ---
 

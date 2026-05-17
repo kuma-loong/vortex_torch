@@ -1,0 +1,6 @@
+{
+    "_doc": "Single-threaded O(n^2) dedup baseline — kept around as the reference for benchmark_union.py. Not the runtime default; see union_default_trtllm.json.",
+    "file": "../union_trtllm.cu",
+    "substitutions": {},
+    "extra_cuda_cflags": []
+}

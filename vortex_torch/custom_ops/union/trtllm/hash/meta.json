@@ -1,0 +1,9 @@
+{
+    "name": "hash",
+    "description": "Union() dedup (hash variant, trtllm).",
+    "constraints": {
+        "variant": "hash"
+    },
+    "priority": 100,
+    "default": true
+}

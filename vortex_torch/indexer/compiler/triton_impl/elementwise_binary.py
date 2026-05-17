@@ -8,7 +8,7 @@ def generate_elementwise_binary_impl(graph: Graph, op_id: int, ctx: Context) -> 
     
     input_tensor_id_0 = graph.op_to_input_tensor_list[op_id][0]
     input_tensor_id_1 = graph.op_to_input_tensor_list[op_id][1]
-    output_tensor_id = graph.op_to_output_tensor_list[op_id]
+    output_tensor_id = graph.op_to_output_tensor_list[op_id][0]
     op = graph.op_list[op_id]
     t_i0 = graph.tensor_list[input_tensor_id_0]
     t_i1 = graph.tensor_list[input_tensor_id_1]

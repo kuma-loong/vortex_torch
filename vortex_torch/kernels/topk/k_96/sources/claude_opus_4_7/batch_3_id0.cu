@@ -485,21 +485,21 @@ void TopKOutput_Kernel(
     const int*    __restrict__ sparse_kv_indptr,
     const int*    __restrict__ dense_kv_indices,
     int*          __restrict__ sparse_kv_indices,
-    const int     page_reserved_bos,
-    const int     page_reserved_eos)
+    const int     block_reserved_bos,
+    const int     block_reserved_eos)
 {
     const int bx = blockIdx.x;
 
-    const int start = dense_kv_indptr[bx] + page_reserved_bos;
-    const int end   = dense_kv_indptr[bx + 1] - page_reserved_eos;
+    const int start = dense_kv_indptr[bx] + block_reserved_bos;
+    const int end   = dense_kv_indptr[bx + 1] - block_reserved_eos;
     const int topk_val = sparse_kv_indptr[bx + 1] - sparse_kv_indptr[bx]
-                       - page_reserved_bos - page_reserved_eos;
+                       - block_reserved_bos - block_reserved_eos;
     const int nblk  = end - start;
     if (nblk <= topk_val) return;
 
     const int* __restrict__ idx_blk = dense_kv_indices + start;
     int*       __restrict__ out_blk = sparse_kv_indices + sparse_kv_indptr[bx]
-                                    + page_reserved_bos;
+                                    + block_reserved_bos;
 
     __shared__ int s_indices[VORTEX_MAX_TOPK];
 

@@ -18,21 +18,22 @@ def get_decode_planner(policy: str = None):
         req_indices: torch.Tensor,
         ctx: Context
     ):
+        md = ctx.metadata
         module.sglang_plan_decode_v2(
             cached_seq_lens,
-            ctx.dense_kv_indptr,
-            ctx.dense_kv_indices,
-            ctx.sparse_kv_indptr,
-            ctx.sparse_kv_indices,
-            ctx.kv_last_page_len,
+            md.dense_kv_indptr,
+            md.dense_kv_indices,
+            md.sparse_kv_indptr,
+            md.sparse_kv_indices,
+            md.kv_last_page_len,
             req_to_token,
             req_indices,
-            ctx.winfo_q_indices,
-            ctx.winfo_is_first_workload_per_batch,
-            ctx.winfo_kv_offsets,
-            ctx.winfo_kv_lens,
-            ctx.winfo_num_workloads,
-            ctx.winfo_chunk_size,
+            md.winfo_q_indices,
+            md.winfo_is_first_workload_per_batch,
+            md.winfo_kv_offsets,
+            md.winfo_kv_lens,
+            md.winfo_num_workloads,
+            md.winfo_chunk_size,
             ctx.page_size,
             ctx.block_size,
             ctx.num_kv_heads,
@@ -43,7 +44,7 @@ def get_decode_planner(policy: str = None):
             ctx.workload_chunk_size
         )
 
-        ctx.set_batch_size(cached_seq_lens.shape[0])
+        md.set_batch_size(cached_seq_lens.shape[0])
 
     return plan_decode
 
@@ -51,23 +52,22 @@ def get_decode_planner(policy: str = None):
 def get_decode_planner_trtllm(policy: str = None):
     """Decode planner variant that emits trtllm-ready outputs directly.
 
-    Outputs filled by the underlying CUDA kernel:
+    The trtllm planner is **indptr-free**: it never reads or writes
+    ``dense_kv_indptr`` / ``sparse_kv_indptr`` / ``dense_kv_indices`` /
+    ``sparse_kv_indices``. Outputs filled by the underlying CUDA kernel:
+
       * ``ctx.dense_block_tables``  — every selected page for the dense path
       * ``ctx.sparse_block_tables`` — only the BOS+EOS slots; the middle is
         filled by the topk kernel later
       * ``ctx.dense_seqlens`` / ``ctx.sparse_seqlens`` — int32 token counts
-      * ``ctx.dense_kv_indptr`` / ``ctx.sparse_kv_indptr`` — still needed by
-        the workload scheduler and by topk
-      * ``ctx.dense_kv_indices`` — written in addition to
-        ``dense_block_tables`` because the indexer's score-gather codegen
-        still consults the CSR form (see TODO below)
+        consumed by ``trtllm_batch_decode_with_kv_cache``, the trtllm topk
+        kernels, and the Schedule.S Triton kernels (which derive per-row
+        block counts via ``ceil(tokens / block_size)``)
       * ``ctx.kv_last_page_len`` — same semantics as before
-
-    TODO(opt-b): teach the score-gather codegen (and any other indexer op
-    that still reads ``ctx.dense_kv_indices`` in trtllm mode) to consume
-    ``ctx.dense_block_tables`` instead. Once that's done, drop the
-    ``dense_kv_indices`` write from the CUDA kernel and the argument from
-    this Python wrapper — saves one int32-per-block store per plan call.
+      * ``ctx.winfo_*`` — workload-scheduler outputs; ``winfo_kv_offsets[j]``
+        carries ``row * max_blocks_per_seq + col`` so the Schedule.W kernel
+        preamble (with ``indices = dense_block_tables.view(-1)``) resolves
+        page ids correctly.
     """
     module = get_sglang_plan_decode_v2_module(
         policy_body=policy,
@@ -81,24 +81,22 @@ def get_decode_planner_trtllm(policy: str = None):
         req_indices: torch.Tensor,
         ctx: Context,
     ):
+        md = ctx.metadata
         module.sglang_plan_decode_v2_trtllm(
             cached_seq_lens,
-            ctx.dense_kv_indptr,
-            ctx.sparse_kv_indptr,
-            ctx.dense_kv_indices,  # TODO(opt-b): drop with codegen migration.
-            ctx.kv_last_page_len,
-            ctx.dense_block_tables,
-            ctx.sparse_block_tables,
-            ctx.dense_seqlens,
-            ctx.sparse_seqlens,
+            md.kv_last_page_len,
+            md.dense_block_tables,
+            md.sparse_block_tables,
+            md.dense_seqlens,
+            md.sparse_seqlens,
             req_to_token,
             req_indices,
-            ctx.winfo_q_indices,
-            ctx.winfo_is_first_workload_per_batch,
-            ctx.winfo_kv_offsets,
-            ctx.winfo_kv_lens,
-            ctx.winfo_num_workloads,
-            ctx.winfo_chunk_size,
+            md.winfo_q_indices,
+            md.winfo_is_first_workload_per_batch,
+            md.winfo_kv_offsets,
+            md.winfo_kv_lens,
+            md.winfo_num_workloads,
+            md.winfo_chunk_size,
             ctx.page_size,
             ctx.block_size,
             ctx.num_kv_heads,
@@ -108,7 +106,7 @@ def get_decode_planner_trtllm(policy: str = None):
             ctx.block_reserved_eos,
             ctx.workload_chunk_size,
         )
-        ctx.set_batch_size(cached_seq_lens.shape[0])
+        md.set_batch_size(cached_seq_lens.shape[0])
 
     return plan_decode_trtllm
 

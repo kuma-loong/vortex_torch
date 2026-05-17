@@ -1,0 +1,7 @@
+{
+    "name": "default",
+    "description": "Per-row 1D causal conv over RAGGED CSR blocks (catch-all, flashinfer).",
+    "constraints": {},
+    "priority": 0,
+    "default": true
+}

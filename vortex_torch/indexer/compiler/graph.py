@@ -144,7 +144,7 @@ class Graph:
         op_list: List[vOp],
         output_tensor_to_op_list: List[Optional[int]],
         op_to_input_tensor_list: List[List[int]],
-        op_to_output_tensor_list: List[int],
+        op_to_output_tensor_list: List[List[int]],
         input_tensor_ids: List[int],
         output_tensor_ids: List[int],
         global_input_tensor_ids: List[int],
@@ -154,7 +154,11 @@ class Graph:
         self.op_list: List[vOp] = op_list
         self.output_tensor_to_op_list: List[Optional[int]] = output_tensor_to_op_list
         self.op_to_input_tensor_list: List[List[int]] = op_to_input_tensor_list
-        self.op_to_output_tensor_list: List[int] = op_to_output_tensor_list
+        # List of output tensor ids per op. Single-output ops carry a
+        # one-element list; multi-output ops (e.g. ``TopK`` returning
+        # ``(block_table, seqlens)``) carry one entry per output. Codegens
+        # that only need the first output should index with ``[op_id][0]``.
+        self.op_to_output_tensor_list: List[List[int]] = op_to_output_tensor_list
         self.input_tensor_ids: List[int] = input_tensor_ids
         self.output_tensor_ids: List[int] = output_tensor_ids
         self.global_input_tensor_ids: List[int] = global_input_tensor_ids
@@ -238,15 +242,19 @@ def _build_local_graph(
         for gid in selected_global_op_ids
     ]
 
-    local_op_to_output_tensor_list: List[int] = []
+    # Multi-output ops are supported: each entry is the list of output
+    # tensor_ids (1+) for that op. Codegens that only consume the first
+    # output index with ``[op_id][0]``.
+    local_op_to_output_tensor_list: List[List[int]] = []
     for gid in selected_global_op_ids:
         outs = global_op_to_output_tensor_ids[gid]
-        if len(outs) != 1:
+        if len(outs) < 1:
             raise RuntimeError(
-                f"Graph.op_to_output_tensor_list expects one output per op, "
-                f"but op {gid} has outputs {outs}"
+                f"Graph.op_to_output_tensor_list: op {gid} has no outputs"
             )
-        local_op_to_output_tensor_list.append(global_tensor_id_to_local[outs[0]])
+        local_op_to_output_tensor_list.append(
+            [global_tensor_id_to_local[t] for t in outs]
+        )
 
     return Graph(
         tensor_list=local_tensor_list,

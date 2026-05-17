@@ -1,0 +1,8 @@
+{
+    "name": "l2norm",
+    "description": "Reduce-dim0 (l2norm) over RAGGED block-table blocks (trtllm).",
+    "constraints": {
+        "variant": "l2norm"
+    },
+    "priority": 100
+}

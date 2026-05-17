@@ -1,0 +1,5 @@
+{
+    "file": "../union_trtllm_sort.cu",
+    "substitutions": {},
+    "extra_cuda_cflags": []
+}

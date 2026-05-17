@@ -1,0 +1,11 @@
+{
+    "_doc": "topk_output trtllm/BT k_256 (radix) winner — indptr-free ABI. Copied from kernels/topk/k_256/configs/claude_opus_4_7/batch_24_id1_trtllm.json.",
+    "file": "kernel.cu",
+    "substitutions": {
+        "__THREADS_PER_BLOCK__": 512,
+        "__VORTEX_MAX_TOPK__": 256,
+        "__SMEM_BYTES__": 8192,
+        "__TRANSFORM_TYPE__": 1
+    },
+    "extra_cuda_cflags": []
+}

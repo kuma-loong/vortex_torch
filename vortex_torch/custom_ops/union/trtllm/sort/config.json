@@ -1,0 +1,6 @@
+{
+    "_doc": "Union() trtllm/BT — CUB BlockRadixSort + adjacent-difference + scan compaction. Order-deterministic alternative to the hash variant; slower in benchmark but useful when reproducible block_table ordering matters.",
+    "file": "kernel.cu",
+    "substitutions": {},
+    "extra_cuda_cflags": []
+}

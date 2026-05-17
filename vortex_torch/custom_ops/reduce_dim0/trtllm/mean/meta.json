@@ -1,0 +1,8 @@
+{
+    "name": "mean",
+    "description": "Reduce-dim0 (mean) over RAGGED block-table blocks (trtllm).",
+    "constraints": {
+        "variant": "mean"
+    },
+    "priority": 100
+}

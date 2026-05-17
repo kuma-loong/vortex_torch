@@ -261,7 +261,12 @@ def _read_hf_model_shapes(model_path: str) -> Dict[str, int]:
     return {"G": nq // nkv, "num_kv_heads": nkv, "head_dim": D}
 
 
-def _check_compilable(module_path: Path, module_name: str, model_path: str) -> None:
+def _check_compilable(
+    module_path: Path,
+    module_name: str,
+    model_path: str,
+    config: Dict[str, Any] | None = None,
+) -> None:
     """Load the user file, build the registered vFlow, and run a tiny
     compile sweep using the GQA shapes from ``model_path``'s
     ``config.json`` (local file when ``model_path`` is a directory,
@@ -270,9 +275,9 @@ def _check_compilable(module_path: Path, module_name: str, model_path: str) -> N
     # Imports are local: avoid pulling vortex_torch.flow at module-import
     # time of vortex_torch.engine, since that drags in the whole compiler
     # surface for callers that only want ``get_engine``.
-    from ..flow.loader import build_vflow
-    from ..flow.verify import verify_flow_compilable
-    from ..flow.registry import has as _is_registered
+    from ...flow.loader import build_vflow
+    from ...flow.verify import verify_flow_compilable
+    from ...flow.registry import has as _is_registered
 
     # Re-executing the file would re-run its top-level ``@register`` and
     # trip the "already exists" guard. Once the name is in the registry we
@@ -290,6 +295,11 @@ def _check_compilable(module_path: Path, module_name: str, model_path: str) -> N
     shapes = _read_hf_model_shapes(model_path)
     G, num_kv_heads, D = shapes["G"], shapes["num_kv_heads"], shapes["head_dim"]
 
+    # Honour the JSON-declared attention backend so trtllm-only ops
+    # (e.g. ``TopK(k)``) survive verify's profile() asserts.
+    vortex_attention_backend = (
+        (config or {}).get("vortex_attention_backend") or "flashinfer"
+    )
     with tempfile.TemporaryDirectory(prefix="vortex_check_") as cache_dir:
         report = verify_flow_compilable(
             flow,
@@ -301,6 +311,7 @@ def _check_compilable(module_path: Path, module_name: str, model_path: str) -> N
             max_new_tokens_per_batch=64,
             cache_dir=cache_dir,
             verify_indexer=True, verify_cache=True,
+            vortex_attention_backend=vortex_attention_backend,
         )
         if not report.ok:
             first = report.failed[0]
@@ -403,7 +414,7 @@ def check_engine_config(config_path: Union[str, Path]) -> Dict[str, Any]:
         raise EngineConfigError(
             f"model_path must be a non-empty string, got {model_path!r}"
         )
-    _check_compilable(module_path, module_name, model_path)
+    _check_compilable(module_path, module_name, model_path, config=config)
 
     # 9. Save() in indexer ⇒ disable_radix_cache must be true
     _check_disable_radix_cache(module_path, config)

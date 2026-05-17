@@ -1,0 +1,6 @@
+{
+    "_doc": "Union() trtllm/BT — single-threaded O(n^2) linear-scan dedup baseline. Reference implementation for benchmark_union.py; not used in production.",
+    "file": "kernel.cu",
+    "substitutions": {},
+    "extra_cuda_cflags": []
+}

@@ -1,0 +1,8 @@
+{
+    "name": "baseline",
+    "description": "Union() dedup (baseline variant, trtllm).",
+    "constraints": {
+        "variant": "baseline"
+    },
+    "priority": 80
+}

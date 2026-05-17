@@ -5,7 +5,7 @@ from ....abs import FORMAT
 def generate_gemm_impl(graph: Graph, op_id: int, ctx: Context) -> str:
     
     input_tensor_id0, input_tensor_id1 = graph.op_to_input_tensor_list[op_id]
-    output_tensor_id = graph.op_to_output_tensor_list[op_id]
+    output_tensor_id = graph.op_to_output_tensor_list[op_id][0]
     t_i0 = graph.tensor_list[input_tensor_id0]
     t_i1 = graph.tensor_list[input_tensor_id1]
     t_o = graph.tensor_list[output_tensor_id]

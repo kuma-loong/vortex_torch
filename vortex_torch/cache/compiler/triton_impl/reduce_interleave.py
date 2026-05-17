@@ -26,7 +26,7 @@ from ...reduce_interleave import ReduceInterleave
 
 def generate_reduce_interleave_impl(graph: Graph, op_id: int, ctx: Context) -> str:
     input_tensor_id = graph.op_to_input_tensor_list[op_id][0]
-    output_tensor_id = graph.op_to_output_tensor_list[op_id]
+    output_tensor_id = graph.op_to_output_tensor_list[op_id][0]
     op = graph.op_list[op_id]
     assert issubclass(op.__class__, ReduceInterleave), (
         f"Expected a ReduceInterleave op, got {op.__class__.__name__}"

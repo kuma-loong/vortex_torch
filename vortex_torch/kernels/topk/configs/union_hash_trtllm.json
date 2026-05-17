@@ -1,0 +1,5 @@
+{
+    "file": "../union_trtllm_hash.cu",
+    "substitutions": {},
+    "extra_cuda_cflags": []
+}

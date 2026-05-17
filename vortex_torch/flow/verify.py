@@ -33,6 +33,7 @@ import torch
 from ..abs import vTensor, FORMAT
 from ..utils import Mode, resolve_dtype
 from ..indexer.context import Context as IndexerContext
+from ..indexer.metadata import MetaData as IndexerMetaData
 from ..indexer.compiler.compile import compile as compile_indexer
 from ..cache.context import Context as CacheContext
 from ..cache.compiler.compile import compile as compile_cache
@@ -163,6 +164,7 @@ def _make_indexer_ctx(
     cache_dir: str,
     sparse_attention_name: str,
     tensor_device: str = "cpu",
+    vortex_attention_backend: str = "flashinfer",
 ) -> IndexerContext:
     """Build an indexer ``Context`` honoring the invariants from ``create()``.
 
@@ -212,7 +214,6 @@ def _make_indexer_ctx(
     )
 
     # --- misc indexer knobs ---
-    ctx.batch_size = cfg.B
     ctx.max_bs = cfg.B
     ctx.side_effect_op_ids = []
     ctx.topk_val = 256
@@ -220,21 +221,17 @@ def _make_indexer_ctx(
     ctx.block_reserved_bos = 2
     ctx.block_reserved_eos = 2
     ctx.vortex_dtype = torch.bfloat16
+    # ``ctx.vortex_attention_backend`` is overridden later by the caller
+    # (see ``_make_indexer_ctx`` callers) — default to flashinfer so any
+    # caller that doesn't pin a backend still gets the historical
+    # CSR/flashinfer codegen path.
+    ctx.vortex_attention_backend = vortex_attention_backend
 
-    # --- tensor-valued fields (real small CPU tensors) ---
-    i32 = torch.int32
-    ctx.dense_kv_indices = torch.zeros((ctx.max_num_blocks,), dtype=i32, device=tensor_device)
-    ctx.sparse_kv_indices = torch.zeros((ctx.max_num_blocks,), dtype=i32, device=tensor_device)
-    ctx.dense_kv_indptr = torch.zeros((cfg.B + 1,), dtype=i32, device=tensor_device)
-    ctx.sparse_kv_indptr = torch.zeros((cfg.B + 1,), dtype=i32, device=tensor_device)
-    ctx.kv_last_page_len = torch.zeros((cfg.B,), dtype=i32, device=tensor_device)
-
-    ctx.winfo_q_indices = torch.zeros((ctx.max_num_workloads,), dtype=i32, device=tensor_device)
-    ctx.winfo_is_first_workload_per_batch = torch.zeros((ctx.max_num_workloads,), dtype=torch.uint8, device=tensor_device)
-    ctx.winfo_kv_offsets = torch.zeros((ctx.max_num_workloads,), dtype=i32, device=tensor_device)
-    ctx.winfo_kv_lens = torch.zeros((ctx.max_num_workloads,), dtype=i32, device=tensor_device)
-    ctx.winfo_num_workloads = torch.zeros((1,), dtype=i32, device=tensor_device)
-    ctx.winfo_chunk_size = torch.zeros((1,), dtype=i32, device=tensor_device)
+    # --- per-forward-batch state — own MetaData with small CPU tensors so
+    # that any user-side ``profile()`` that reads them (.shape / .dtype)
+    # works without a CUDA allocation. Honours ctx.vortex_attention_backend.
+    ctx.metadata = IndexerMetaData.preallocate(ctx, device=tensor_device)
+    ctx.metadata.set_batch_size(cfg.B)
 
     # --- graph + codegen scratch ---
     ctx.tensor_list = []
@@ -399,6 +396,7 @@ def verify_flow_compilable(
     verify_indexer: bool = True,
     verify_cache: bool = True,
     verbose: bool = False,
+    vortex_attention_backend: str = "flashinfer",
 ) -> VerifyReport:
     """Run compile-only verification over a configuration sweep.
 
@@ -496,6 +494,7 @@ def verify_flow_compilable(
                                     max_num_pages_per_request=max_num_pages_per_request,
                                     max_new_tokens_per_batch=max_new_tokens_per_batch,
                                     vortex_dtype=intermediate_dtype,
+                                    vortex_attention_backend=vortex_attention_backend,
                                 )
                             except Exception:
                                 phase_error = Failure(
@@ -541,6 +540,7 @@ def _compile_indexer_once(
     max_num_pages_per_request: int,
     max_new_tokens_per_batch: int,
     vortex_dtype: torch.dtype = torch.bfloat16,
+    vortex_attention_backend: str = "flashinfer",
 ) -> None:
     name = f"verify_idx_{uuid.uuid4().hex[:8]}"
     ctx = _make_indexer_ctx(
@@ -549,6 +549,7 @@ def _compile_indexer_once(
         max_new_tokens_per_batch=max_new_tokens_per_batch,
         cache_dir=cache_dir,
         sparse_attention_name=name,
+        vortex_attention_backend=vortex_attention_backend,
     )
     ctx.vortex_dtype = vortex_dtype
     q, o, cache = _seed_indexer_tensors(

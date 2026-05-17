@@ -11,12 +11,14 @@ def generate_save_impl(graph: Graph, op_id: int, ctx: Context) -> str:
 
     The surrounding workload kernel already handles the per-format
     addressing: it loads the RAGGED input chunk into ``tensor_<x>_block``
-    and, for the PAGED output, scatters via ``ctx.dense_kv_indices``
-    using ``page_idx_i32 = indices[ragged_idx_i32]``. So the op itself
+    and, for the PAGED output, scatters via ``indices[ragged_idx_i32]``
+    — where ``indices`` is bound by the launcher to either
+    ``ctx.metadata.dense_kv_indices`` (flashinfer / CSR) or
+    ``ctx.metadata.dense_block_tables.view(-1)`` (trtllm / BT). So the op itself
     just renames the block.
     """
     input_tensor_id = graph.op_to_input_tensor_list[op_id][0]
-    output_tensor_id = graph.op_to_output_tensor_list[op_id]
+    output_tensor_id = graph.op_to_output_tensor_list[op_id][0]
     op = graph.op_list[op_id]
     assert issubclass(op.__class__, Save), f"Expected a save op, got {graph.op_list[op_id]}"
 
@@ -33,12 +35,14 @@ def generate_load_impl(graph: Graph, op_id: int, ctx: Context) -> str:
     Inline (Schedule.W) codegen for ``Load`` (PAGED -> RAGGED).
 
     The surrounding workload kernel gathers the PAGED input via
-    ``page_idx_i32 = ctx.dense_kv_indices[ragged_idx_i32]`` into
-    ``tensor_<x>_block`` and stores the RAGGED output contiguously,
-    so this op only needs to rename the block.
+    ``page_idx_i32 = indices[ragged_idx_i32]`` into ``tensor_<x>_block``
+    — where ``indices`` is bound by the launcher to
+    ``ctx.metadata.dense_kv_indices`` (flashinfer/CSR) or
+    ``ctx.metadata.dense_block_tables.view(-1)`` (trtllm/BT) — and stores the
+    RAGGED output, so this op only needs to rename the block.
     """
     input_tensor_id = graph.op_to_input_tensor_list[op_id][0]
-    output_tensor_id = graph.op_to_output_tensor_list[op_id]
+    output_tensor_id = graph.op_to_output_tensor_list[op_id][0]
     op = graph.op_list[op_id]
     assert issubclass(op.__class__, Load), f"Expected a load op, got {graph.op_list[op_id]}"
 

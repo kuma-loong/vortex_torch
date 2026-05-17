@@ -1,0 +1,6 @@
+{
+    "_doc": "TopK(k) (the new multi-output intermediate op) — trtllm/BT, indptr-free. Single implementation today (block_table_topk_trtllm.cu); level-2 dispatch can grow per-k variants in sibling folders (k_64/, k_128/, k_256/) later.",
+    "file": "kernel.cu",
+    "substitutions": {},
+    "extra_cuda_cflags": []
+}

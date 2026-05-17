@@ -1,0 +1,8 @@
+{
+    "name": "k_256",
+    "description": "Radix winner for max_topk_val <= 256 (block-table/trtllm).",
+    "constraints": {
+        "max_topk_val": {"le": 256}
+    },
+    "priority": 80
+}

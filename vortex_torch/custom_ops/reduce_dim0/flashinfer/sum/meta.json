@@ -1,0 +1,8 @@
+{
+    "name": "sum",
+    "description": "Reduce-dim0 (sum) over RAGGED CSR blocks (flashinfer).",
+    "constraints": {
+        "variant": "sum"
+    },
+    "priority": 100
+}

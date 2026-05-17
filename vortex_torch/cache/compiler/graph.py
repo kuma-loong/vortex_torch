@@ -152,7 +152,7 @@ class Graph:
         op_list: List[vOp],
         output_tensor_to_op_list: List[Optional[int]],
         op_to_input_tensor_list: List[List[int]],
-        op_to_output_tensor_list: List[int],
+        op_to_output_tensor_list: List[List[int]],
         input_tensor_ids: List[int],
         output_tensor_ids: List[int],
         global_input_tensor_ids: List[int],
@@ -162,7 +162,8 @@ class Graph:
         self.op_list: List[vOp] = op_list
         self.output_tensor_to_op_list: List[Optional[int]] = output_tensor_to_op_list
         self.op_to_input_tensor_list: List[List[int]] = op_to_input_tensor_list
-        self.op_to_output_tensor_list: List[int] = op_to_output_tensor_list
+        # See ``indexer/compiler/graph.py`` for the multi-output convention.
+        self.op_to_output_tensor_list: List[List[int]] = op_to_output_tensor_list
         self.input_tensor_ids: List[int] = input_tensor_ids
         self.output_tensor_ids: List[int] = output_tensor_ids
         self.global_input_tensor_ids: List[int] = global_input_tensor_ids
@@ -242,15 +243,19 @@ def _build_local_graph(
         for gid in selected_global_op_ids
     ]
 
-    local_op_to_output_tensor_list: List[int] = []
+    # Multi-output ops supported — see indexer/compiler/graph.py for the
+    # convention. Codegens that only consume the first output index with
+    # ``[op_id][0]``.
+    local_op_to_output_tensor_list: List[List[int]] = []
     for gid in selected_global_op_ids:
         outs = global_op_to_output_tensor_ids[gid]
-        if len(outs) != 1:
+        if len(outs) < 1:
             raise RuntimeError(
-                f"Graph.op_to_output_tensor_list expects one output per op, "
-                f"but op {gid} has outputs {outs}"
+                f"Graph.op_to_output_tensor_list: op {gid} has no outputs"
             )
-        local_op_to_output_tensor_list.append(global_tensor_id_to_local[outs[0]])
+        local_op_to_output_tensor_list.append(
+            [global_tensor_id_to_local[t] for t in outs]
+        )
 
     return Graph(
         tensor_list=local_tensor_list,

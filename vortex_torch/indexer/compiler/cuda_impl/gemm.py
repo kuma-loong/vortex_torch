@@ -37,7 +37,7 @@ from .dtype_cast import cast_smem_to_float, cast_float_to_smem
 
 def generate_gemm_impl(graph: Graph, op_id: int, ctx: Context) -> str:
     input_id_x, input_id_y = graph.op_to_input_tensor_list[op_id]
-    output_id = graph.op_to_output_tensor_list[op_id]
+    output_id = graph.op_to_output_tensor_list[op_id][0]
     op = graph.op_list[op_id]
     assert issubclass(op.__class__, GeMM), (
         f"Expected a GeMM op, got {op.__class__.__name__}"

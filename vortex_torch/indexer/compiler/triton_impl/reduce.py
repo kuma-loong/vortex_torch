@@ -1,10 +1,9 @@
 from ..graph import Graph
-from typing import Dict, Tuple, Callable
 from ...context import Context
 from ...reduce import Reduce
 from ....abs import FORMAT
 from ....utils import INDENT, ReduceType, Schedule
-from .dtype_cast import store_cast_expr as _store_cast_expr
+from .backend import get_backend
 
 
 def generate_reduce_impl(graph: Graph, op_id: int, ctx: Context) -> str:
@@ -14,7 +13,7 @@ def generate_reduce_impl(graph: Graph, op_id: int, ctx: Context) -> str:
     ``[workload_chunk_size, D_0, D_1]``; ``op.dim`` is in ``{1, 2}``.
     """
     input_tensor_id = graph.op_to_input_tensor_list[op_id][0]
-    output_tensor_id = graph.op_to_output_tensor_list[op_id]
+    output_tensor_id = graph.op_to_output_tensor_list[op_id][0]
     op = graph.op_list[op_id]
     t_i = graph.tensor_list[input_tensor_id]
     assert issubclass(op.__class__, Reduce), f"Expected a reduce op, got {graph.op_list[op_id]}"
@@ -50,103 +49,31 @@ def generate_reduce_impl(graph: Graph, op_id: int, ctx: Context) -> str:
 # Schedule.S: cross-row reduce over the packed RAGGED leading axis.
 #
 # One Triton program per (batch, kv_head). Each program walks the
-# ``[start, end)`` segment of pages described by ``ctx.dense_kv_indptr``,
-# applies the reduction over the page axis, and writes a single
-# ``[D_0, D_1]`` tile into the BATCHED output at index ``pid``.
+# ``[start, end)`` segment of *blocks* (block_size tokens each) described
+# by the backend-specific per-row source (``dense_kv_indptr`` in CSR mode,
+# ``dense_seqlens`` + ``block_size`` in trtllm mode), applies the
+# reduction over the block axis, and writes a single ``[D_0, D_1]`` tile
+# into the BATCHED output at index ``pid``.
 #
 # bos/eos mirror the softmax convention: the first ``bos`` and last ``eos``
-# pages of each segment are excluded (they're typically always-on tokens).
+# blocks of each segment are excluded (they're typically always-on tokens).
 # Set them to ``0`` if you want the whole segment.
+#
+# The kernel body lives in ``vortex_torch.custom_ops.reduce_dim0.<backend>.
+# <reduce_type>.<kernel>`` (one specialised ``@triton.jit`` per reduce_type
+# × backend). Each leaf's ``dispatch()`` returns a plain Python callable
+# (Triton kernels wrapped via
+# :func:`vortex_torch.custom_ops._triton_launcher.make_launcher`), so the
+# call site is identical in shape to the CUDA-backed leaves' — no
+# ``[grid]`` indexing, no ``num_warps`` / ``num_stages`` kwargs;
+# ``eff_batch_size`` is the trailing positional arg.
 # ---------------------------------------------------------------------------
 
-def _reduce_dim0_kernel_body(reduce_type: ReduceType, store_cast: str) -> str:
-    """Build the kernel body for one reduce_type, with the right init /
-    accumulate / finalize snippets and a dtype-correct store cast."""
-    if reduce_type == ReduceType.Sum:
-        init = "tl.zeros((x_D0, x_D1), dtype=tl.float32)"
-        accum = "acc += tl.sum(slab, axis=0)"
-        finalize = ""
-    elif reduce_type == ReduceType.Mean:
-        init = "tl.zeros((x_D0, x_D1), dtype=tl.float32)"
-        accum = "acc += tl.sum(slab, axis=0)"
-        finalize = "acc = acc / num_pages.to(tl.float32)"
-    elif reduce_type == ReduceType.Max:
-        init = "tl.full((x_D0, x_D1), -1e30, dtype=tl.float32)"
-        accum = (
-            "slab = tl.where(p_mask[:, None, None], slab, -1e30)\n"
-            "        acc = tl.maximum(acc, tl.max(slab, axis=0))"
-        )
-        finalize = ""
-    elif reduce_type == ReduceType.Min:
-        init = "tl.full((x_D0, x_D1), 1e30, dtype=tl.float32)"
-        accum = (
-            "slab = tl.where(p_mask[:, None, None], slab, 1e30)\n"
-            "        acc = tl.minimum(acc, tl.min(slab, axis=0))"
-        )
-        finalize = ""
-    elif reduce_type == ReduceType.L2Norm:
-        init = "tl.zeros((x_D0, x_D1), dtype=tl.float32)"
-        accum = "acc += tl.sum(slab * slab, axis=0)"
-        finalize = "acc = tl.sqrt(acc)"
-    else:
-        raise NotImplementedError(
-            f"reduce_dim0 codegen: unsupported reduce_type {reduce_type}"
-        )
-
-    finalize_block = f"\n    {finalize}" if finalize else ""
-
-    return f"""
-@triton.jit
-def {{kernel_name}}(
-    x,
-    out,
-    indptr,
-    bos: tl.constexpr,
-    eos: tl.constexpr,
-    x_D0: tl.constexpr,
-    x_D1: tl.constexpr,
-    BLOCK_P: tl.constexpr = 512,
-):
-    pid = tl.program_id(0)
-    start = tl.load(indptr + pid) + bos
-    end = tl.load(indptr + pid + 1) - eos
-
-    page_stride = x_D0 * x_D1
-    d0_idx = tl.arange(0, x_D0)
-    d1_idx = tl.arange(0, x_D1)
-    out_ptr = out + pid * page_stride + d0_idx[:, None] * x_D1 + d1_idx[None, :]
-
-    if end <= start:
-        zero = tl.zeros((x_D0, x_D1), dtype=tl.float32)
-        tl.store(out_ptr, {store_cast.format(block_expr='zero')})
-        return
-
-    num_pages = end - start
-    acc = {init}
-
-    p_idx = tl.arange(0, BLOCK_P)
-    base_ptr = x + start * page_stride
-
-    for p in range(0, num_pages, BLOCK_P):
-        kp = tl.minimum(BLOCK_P, num_pages - p)
-        p_mask = p_idx < kp
-        offs = (
-            (p + p_idx)[:, None, None] * page_stride
-            + d0_idx[None, :, None] * x_D1
-            + d1_idx[None, None, :]
-        ).to(tl.int32)
-        slab = tl.load(base_ptr + offs, mask=p_mask[:, None, None], other=0.0).to(tl.float32)
-        {accum}{finalize_block}
-
-    tl.store(out_ptr, {store_cast.format(block_expr='acc')})
-"""
-
-
 def generate_reduce_dim0_impl(graph: Graph, op_id: int, ctx: Context) -> str:
-    """Schedule.S reduce — emit a standalone kernel that collapses the
-    packed leading axis of a RAGGED input into a BATCHED output."""
+    """Schedule.S reduce — emit a launcher that resolves the per-reduce_type
+    kernel via :func:`vortex_torch.custom_ops.find` at runtime."""
     input_tensor_id = graph.op_to_input_tensor_list[op_id][0]
-    output_tensor_id = graph.op_to_output_tensor_list[op_id]
+    output_tensor_id = graph.op_to_output_tensor_list[op_id][0]
     op = graph.op_list[op_id]
     t_i = graph.tensor_list[input_tensor_id]
     t_o = graph.tensor_list[output_tensor_id]
@@ -163,33 +90,36 @@ def generate_reduce_dim0_impl(graph: Graph, op_id: int, ctx: Context) -> str:
         f"generate_reduce_dim0_impl: output must be BATCHED, got {t_o._format}"
     )
 
-    # Each reduce_type gets its own specialized kernel — disambiguated by
-    # ``sparse_attention_name`` so multiple flow instances don't collide.
     rt_name = op.reduce_type.name.lower()
-    kernel_name = f"{ctx.sparse_attention_name}_reduce_dim0_{rt_name}_kernel"
+    bk = get_backend(ctx)
+    callable_name = f"_vortex_reduce_dim0_{rt_name}_kernel_{op_id}"
+    ctx.compilation_header_lines.extend([
+        "from vortex_torch.custom_ops import find as _vortex_custom_ops_find",
+        f"{callable_name} = _vortex_custom_ops_find("
+        f"'reduce_dim0', '{bk.name}', variant='{rt_name}')()",
+    ])
 
-    # ``_store_cast_expr`` returns a fully-formed ``<expr>.to(...)`` string.
-    # We re-template it via ``{block_expr}`` so the kernel body can drop in
-    # either ``acc`` or ``zero`` at the right places.
-    store_cast_template = _store_cast_expr("{block_expr}", t_o.dtype)
-
-    func_def = _reduce_dim0_kernel_body(op.reduce_type, store_cast_template).format(
-        kernel_name=kernel_name
-    )
-    ctx.auxilary_func_def_lines.append(func_def)
+    if bk.name == "trtllm":
+        per_row_launch = "ctx.metadata.dense_seqlens"
+        extra_launch_block = (
+            f"{INDENT*2}ctx.block_size,\n"
+            f"{INDENT*2}ctx.metadata.dense_block_tables.shape[1],\n"
+        )
+    else:
+        per_row_launch = "ctx.metadata.dense_kv_indptr"
+        extra_launch_block = ""
 
     impl_lines = [
-        f"{INDENT}eff_batch_size = ctx.batch_size * ctx.num_kv_heads",
-        f"{INDENT}{kernel_name}[(eff_batch_size,)](",
+        f"{INDENT}eff_batch_size = ctx.metadata.batch_size * ctx.num_kv_heads",
+        f"{INDENT}{callable_name}(",
         f"{INDENT*2}tensor_{input_tensor_id},",
         f"{INDENT*2}tensor_{output_tensor_id},",
-        f"{INDENT*2}ctx.dense_kv_indptr,",
+        f"{INDENT*2}{per_row_launch},",
         f"{INDENT*2}ctx.block_reserved_bos,",
         f"{INDENT*2}ctx.block_reserved_eos,",
         f"{INDENT*2}tensor_{input_tensor_id}.shape[-2],",
         f"{INDENT*2}tensor_{input_tensor_id}.shape[-1],",
-        f"{INDENT*2}num_warps=4,",
-        f"{INDENT*2}num_stages=1,",
+        f"{extra_launch_block}{INDENT*2}eff_batch_size,",
         f"{INDENT})",
     ]
     return "\n".join(impl_lines)

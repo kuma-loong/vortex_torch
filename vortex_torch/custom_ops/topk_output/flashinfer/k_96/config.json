@@ -1,0 +1,13 @@
+{
+    "_doc": "topk_output (the legacy ``topK()`` op) — flashinfer/CSR backend, k_96 winner. Copied from kernels/topk/k_96/configs/claude_opus_4_7/batch_16_id3.json.",
+    "file": "kernel.cu",
+    "substitutions": {
+        "__THREADS_PER_BLOCK__": 512,
+        "__VORTEX_MAX_TOPK__": 128,
+        "__SMEM_BYTES__": 4096,
+        "__TRANSFORM_TYPE__": 2,
+        "__TOLERATE_THRESH__": 10,
+        "__MAX_ITERS__": 2
+    },
+    "extra_cuda_cflags": []
+}

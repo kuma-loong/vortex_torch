@@ -1,0 +1,7 @@
+{
+    "name": "TODO_RENAME_ME",
+    "description": "TODO: one-line summary of this reduce_dim0/trtllm specialisation.",
+    "constraints": {},
+    "priority": 100,
+    "default": false
+}

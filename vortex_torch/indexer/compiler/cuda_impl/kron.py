@@ -41,7 +41,7 @@ def generate_kron_impl(graph: Graph, op_id: int, ctx: Context) -> str:
         f"Kron expects 2 inputs, got {len(input_ids)}"
     )
     input_id_x, input_id_y = input_ids
-    output_id = graph.op_to_output_tensor_list[op_id]
+    output_id = graph.op_to_output_tensor_list[op_id][0]
     op = graph.op_list[op_id]
     assert issubclass(op.__class__, Kron), (
         f"Expected a Kron op, got {op.__class__.__name__}"

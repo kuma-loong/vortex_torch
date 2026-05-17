@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, List, Optional, Union, Dict
 import torch
 from vortex_torch import is_hopper
 from vortex_torch.abs import as_vtensor, FORMAT
-from vortex_torch.indexer import Context
+from vortex_torch.indexer import Context, MetaData
 from vortex_torch.indexer.compiler.compile import compile as compile_indexer
 from vortex_torch.indexer.utils_sglang import (
     get_chunkwise_hn2nh_transpose,
@@ -128,24 +128,12 @@ class VortexTRTLLMBackend(AttentionBackend):
         )
 
         # ===========================
-        # Decode KV-indptr buffers
+        # Decode-path buffers live on ``self.ctx.metadata`` (pre-allocated
+        # in ``_compile``), NOT on this object. See ``MetaData.preallocate``.
         # ===========================
 
-        self.kv_indptr_decode = [
-            torch.zeros(
-                (max_bs * self.num_kv_heads + 1,),
-                dtype=torch.int32,
-                device=model_runner.device
-            ),
-            torch.zeros(
-                (max_bs * self.num_kv_heads + 1,),
-                dtype=torch.int32,
-                device=model_runner.device
-            ),
-        ]
-
         # ===========================
-        # KV indices (prefill)
+        # KV indices (prefill) — still used by the flashinfer prefill wrapper.
         # ===========================
 
         self.kv_indices_prefill = torch.zeros(
@@ -158,39 +146,10 @@ class VortexTRTLLMBackend(AttentionBackend):
         )
 
         # ===========================
-        # KV indices (decode)
-        # ===========================
-
-        self.kv_indices_decode = [
-            torch.zeros(
-                (
-                    (max_bs * self.num_kv_heads * model_runner.model_config.context_len + self.block_size - 1)
-                    // self.block_size,
-                ),
-                dtype=torch.int32,
-                device=model_runner.device
-            ),
-            torch.zeros(
-                (
-                    (max_bs * self.num_kv_heads * model_runner.model_config.context_len + self.block_size - 1)
-                    // self.block_size,
-                ),
-                dtype=torch.int32,
-                device=model_runner.device
-            ),
-        ]
-
-        # ===========================
-        # KV last page length tracking
+        # KV last page length tracking (prefill — decode lives on MetaData).
         # ===========================
 
         self.kv_last_page_len_prefill = torch.ones(
-            (max_bs * self.num_kv_heads,),
-            dtype=torch.int32,
-            device=model_runner.device
-        )
-
-        self.kv_last_page_len_decode = torch.ones(
             (max_bs * self.num_kv_heads,),
             dtype=torch.int32,
             device=model_runner.device
@@ -235,40 +194,15 @@ class VortexTRTLLMBackend(AttentionBackend):
                     )
 
         # ===========================
-        # trtllm decode buffers
+        # trtllm decode buffers are pre-allocated on ``self.ctx.metadata``
+        # in ``_compile`` — block_tables / seq_lens / winfo all live there.
         # ===========================
-        # block_tables shape  : [max_bs * num_kv_heads, max_blocks_per_seq]
-        # seq_lens shape      : [max_bs * num_kv_heads]
         # Effective batch is `bs * num_kv_heads` because each kv-head is folded
         # into the batch dim (MQA-style) with num_kv_heads=1 for the kernel.
         self.max_blocks_per_seq = (
             (model_runner.model_config.context_len + self.block_size - 1)
             // self.block_size
         )
-        self.block_tables_decode = [
-            torch.zeros(
-                (max_bs * self.num_kv_heads, self.max_blocks_per_seq),
-                dtype=torch.int32,
-                device=model_runner.device,
-            ),
-            torch.zeros(
-                (max_bs * self.num_kv_heads, self.max_blocks_per_seq),
-                dtype=torch.int32,
-                device=model_runner.device,
-            ),
-        ]
-        self.seq_lens_decode = [
-            torch.zeros(
-                (max_bs * self.num_kv_heads,),
-                dtype=torch.int32,
-                device=model_runner.device,
-            ),
-            torch.zeros(
-                (max_bs * self.num_kv_heads,),
-                dtype=torch.int32,
-                device=model_runner.device,
-            ),
-        ]
         # trtllm requires a workspace zero-initialised on first use; keep it
         # independent of the flashinfer prefill workspace.
         self.trtllm_workspace_buffer = torch.zeros(
@@ -302,13 +236,11 @@ class VortexTRTLLMBackend(AttentionBackend):
         indexer = self.sparse_attention.forward_indexer
 
         self.ctx.create(self, model_runner)
-        # Expose trtllm seq_lens + block_tables buffers to the indexer context.
-        # The decode planner writes the dense slots and BOS/EOS of the sparse
-        # slots; the topk kernel fills the middle of ctx.sparse_block_tables.
-        self.ctx.dense_seqlens = self.seq_lens_decode[0]
-        self.ctx.sparse_seqlens = self.seq_lens_decode[1]
-        self.ctx.dense_block_tables = self.block_tables_decode[0]
-        self.ctx.sparse_block_tables = self.block_tables_decode[1]
+        # Allocate every per-forward-batch buffer (winfo_*, dense/sparse
+        # block_tables + seqlens, kv_last_page_len) on a single MetaData
+        # owned by the context. The decode planner writes into this
+        # MetaData; the indexer kernels read from it.
+        self.ctx.metadata = MetaData.preallocate(self.ctx, device=device)
         self.ctx.assert_created()
         self.ctx.profile()
 
@@ -370,14 +302,15 @@ class VortexTRTLLMBackend(AttentionBackend):
 
             eff_bs = bs * self.num_kv_heads
 
+            md = self.ctx.metadata
             self.forward_metadata = DecodeMetadata(
                 block_tables=[
-                    self.block_tables_decode[0][:eff_bs],
-                    self.block_tables_decode[1][:eff_bs],
+                    md.dense_block_tables[:eff_bs],
+                    md.sparse_block_tables[:eff_bs],
                 ],
                 seq_lens=[
-                    self.seq_lens_decode[0][:eff_bs],
-                    self.seq_lens_decode[1][:eff_bs],
+                    md.dense_seqlens[:eff_bs],
+                    md.sparse_seqlens[:eff_bs],
                 ],
                 bs=eff_bs,
             )
@@ -464,14 +397,15 @@ class VortexTRTLLMBackend(AttentionBackend):
 
             eff_bs = bs * self.num_kv_heads
 
+            md = self.ctx.metadata
             metadata = DecodeMetadata(
                 block_tables=[
-                    self.block_tables_decode[0][:eff_bs],
-                    self.block_tables_decode[1][:eff_bs],
+                    md.dense_block_tables[:eff_bs],
+                    md.sparse_block_tables[:eff_bs],
                 ],
                 seq_lens=[
-                    self.seq_lens_decode[0][:eff_bs],
-                    self.seq_lens_decode[1][:eff_bs],
+                    md.dense_seqlens[:eff_bs],
+                    md.sparse_seqlens[:eff_bs],
                 ],
                 bs=eff_bs,
             )
@@ -634,12 +568,12 @@ class VortexTRTLLMBackend(AttentionBackend):
             # Prepare Q in grouped shape expected by sparse path
             q = q.contiguous().view(-1, self.group_size, layer.head_dim)
 
-            # In trtllm mode the topk kernel writes the selected page ids
-            # directly into the 2D block_tables_decode[1]; BOS+EOS slots
-            # and seq_lens[1] were prefilled by plan_decode.
+            # In trtllm mode the topk kernel writes the selected block ids
+            # directly into the 2D ``sparse_block_tables``; BOS+EOS slots
+            # and ``sparse_seqlens`` were prefilled by plan_decode.
             self.compiled_indexer.forward(
                 q=q,
-                o=self.block_tables_decode[1],
+                o=self.ctx.metadata.sparse_block_tables,
                 cache=cache,
                 ctx=self.ctx,
             )

@@ -1,0 +1,6 @@
+{
+    "_doc": "Union() trtllm/BT — parallel open-address hash dedup. **Default winner** (geomean 17-364x over the single-threaded baseline across k=64/128/256; see kernels/topk/reports/union_bench.md).",
+    "file": "kernel.cu",
+    "substitutions": {},
+    "extra_cuda_cflags": []
+}

@@ -16,7 +16,7 @@ def generate_elementwise_binary_impl(graph: Graph, op_id: int, ctx: Context) -> 
         f"Elementwise_Binary expects 2 inputs, got {len(input_ids)}"
     )
     input_tensor_id0, input_tensor_id1 = input_ids
-    output_tensor_id = graph.op_to_output_tensor_list[op_id]
+    output_tensor_id = graph.op_to_output_tensor_list[op_id][0]
     op = graph.op_list[op_id]
     assert issubclass(op.__class__, Elementwise_Binary), (
         f"Expected an Elementwise_Binary op, got {op.__class__.__name__}"

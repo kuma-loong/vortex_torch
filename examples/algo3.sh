@@ -13,6 +13,8 @@ trials=(
 32
 )
 topk_val=(
+61
+125
 253
 )
 for algo in "${sparse_algos[@]}"; do

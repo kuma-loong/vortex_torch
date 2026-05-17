@@ -13,7 +13,7 @@ from ...elementwise import Elementwise
 
 def generate_elementwise_impl(graph: Graph, op_id: int, ctx: Context) -> str:
     input_tensor_id = graph.op_to_input_tensor_list[op_id][0]
-    output_tensor_id = graph.op_to_output_tensor_list[op_id]
+    output_tensor_id = graph.op_to_output_tensor_list[op_id][0]
     op = graph.op_list[op_id]
     assert issubclass(op.__class__, Elementwise), (
         f"Expected an Elementwise op, got {op.__class__.__name__}"

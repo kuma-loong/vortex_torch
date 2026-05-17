@@ -235,3 +235,99 @@ class approxTopK(topK):
                 f"typical sweet spot 0.05 - 0.15."
             )
         self.tolerate_ratio = tol
+
+
+class Union(vOp):
+    r"""Merge two ``(block_table, seqlens)`` pairs into the final sparse output.
+
+    Output function for the trtllm backend that takes two
+    ``(block_table_i, seqlens_i)`` tuples (typically produced by
+    :class:`vortex_torch.indexer.TopK` calls), computes the per-row
+    deduplicated union of their block ids, and overwrites the final
+    ``sparse_block_tables`` + ``sparse_seqlens`` buffers so the pair can
+    be fed straight to ``trtllm_batch_decode_with_kv_cache``.
+
+    Per-row behavior, with
+    ``dense_block_len = ceil(dense_seqlens[i] / block_size)`` and
+    ``last_block_len = dense_seqlens[i] mod block_size`` (treated as
+    ``block_size`` when the remainder is zero):
+
+      * Compute the deduped union of block ids drawn from
+        ``block_table_0[i, :blocks_0]`` and ``block_table_1[i, :blocks_1]``,
+        where ``blocks_j = ceil(seqlens_j[i] / block_size)``. The dense
+        path's true last block id (``dense_block_tables[i, dense_block_len-1]``)
+        is excluded from the dedup walk and re-inserted at the **tail**
+        of the union so trtllm decode reads the partial token count from
+        the right slot.
+      * Write the deduped tail-canonical union into ``o[i, :u+1]`` and
+        set ``sparse_seqlens[i] = u * block_size + last_block_len``
+        (where ``u`` is the dedup count, excluding the appended last
+        block).
+
+    Invocation
+    ----------
+    ::
+
+        self.output_func = Union()
+        ...
+        self.output_func(i_0, i_1, o, ctx=ctx)
+        # i_0 = (block_table_0, seqlens_0)
+        # i_1 = (block_table_1, seqlens_1)
+
+    ``o`` is the framework-provided final block-table output (the trtllm
+    backend wires it to ``ctx.metadata.sparse_block_tables``). The op
+    additionally writes ``ctx.metadata.sparse_seqlens`` as a side effect
+    so the seqlens buffer the trtllm decode call reads is up to date.
+    """
+
+    _supported_formats: FrozenSet[FORMAT] = frozenset({FORMAT.RAGGED})
+
+    def __init__(self):
+        super().__init__()
+        self.schedule = Schedule.S
+
+    def profile(self, i_0, i_1, o: vTensor, ctx: Context):
+        prefix = self._prefix()
+
+        assert isinstance(i_0, tuple) and len(i_0) == 2, (
+            f"{prefix}i_0 must be a (block_table, seqlens) tuple; got {type(i_0).__name__}"
+        )
+        assert isinstance(i_1, tuple) and len(i_1) == 2, (
+            f"{prefix}i_1 must be a (block_table, seqlens) tuple; got {type(i_1).__name__}"
+        )
+        bt_0, sl_0 = i_0
+        bt_1, sl_1 = i_1
+        for name, t in (("bt_0", bt_0), ("sl_0", sl_0),
+                        ("bt_1", bt_1), ("sl_1", sl_1),
+                        ("o",    o)):
+            assert isinstance(t, vTensor), (
+                f"{prefix}{name} must be a vTensor; got {type(t).__name__}"
+            )
+        assert bt_0._format in self._supported_formats, (
+            f"{prefix}bt_0._format={bt_0._format} not supported"
+        )
+        assert bt_1._format in self._supported_formats, (
+            f"{prefix}bt_1._format={bt_1._format} not supported"
+        )
+        assert o._format in self._supported_formats, (
+            f"{prefix}o._format={o._format} not supported"
+        )
+
+        backend = (
+            getattr(ctx, "vortex_attention_backend", None) or "flashinfer"
+        ).lower()
+        assert backend == "trtllm", (
+            f"{prefix}Union() is only supported under the trtllm attention "
+            f"backend; got vortex_attention_backend={backend!r}."
+        )
+
+        # Claim ``o`` as the op's single output.
+        ctx.output_tensor_to_op_list[o.tensor_id] = len(ctx.op_list)
+        ctx.op_list.append(self)
+        ctx.op_to_input_tensor_list.append([
+            bt_0.tensor_id, sl_0.tensor_id,
+            bt_1.tensor_id, sl_1.tensor_id,
+        ])
+        ctx.op_to_output_tensor_list.append([o.tensor_id])
+
+

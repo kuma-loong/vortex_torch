@@ -1,0 +1,6 @@
+{
+    "_doc": "Default Union() kernel — picked by benchmark_union.py reports/union_bench.md. Currently the parallel-hash variant (~18-360x faster than the single-threaded baseline across k=64/128/256, all batch/seq cells).",
+    "file": "../union_trtllm_hash.cu",
+    "substitutions": {},
+    "extra_cuda_cflags": []
+}

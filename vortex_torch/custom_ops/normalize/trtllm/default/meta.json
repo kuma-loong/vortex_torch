@@ -1,0 +1,7 @@
+{
+    "name": "default",
+    "description": "Per-row L1 normalize over RAGGED block-table blocks (catch-all, trtllm).",
+    "constraints": {},
+    "priority": 0,
+    "default": true
+}

@@ -65,7 +65,7 @@ def generate_elementwise_impl(graph: Graph, op_id: int, ctx: Context) -> str:
     GEMM / reduce ops will too).
     """
     input_tensor_id = graph.op_to_input_tensor_list[op_id][0]
-    output_tensor_id = graph.op_to_output_tensor_list[op_id]
+    output_tensor_id = graph.op_to_output_tensor_list[op_id][0]
     op = graph.op_list[op_id]
     t_i = graph.tensor_list[input_tensor_id]
     t_o = graph.tensor_list[output_tensor_id]

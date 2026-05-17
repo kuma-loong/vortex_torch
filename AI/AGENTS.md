@@ -178,6 +178,12 @@ The user's mental model (used throughout the tutorials):
    oriented variant (adaptive 8-bit radix; `tolerate_ratio ∈
    [0.0, 1.0]`, `0.0` = exact, higher = cheaper-but-looser; output
    indices unsorted within each segment).
+   *Trtllm-only multi-stream alternative:* if
+   `"vortex_attention_backend": "trtllm"` is set in the JSON, the
+   terminal op can instead be `Union()` fed by two
+   `TopK(k=…)(score, ctx=ctx) → (block_tables, seqlens)` calls — see
+   `AI/tutorials/indexer_op.md §9b`. `TopK` / `Union` will assert at
+   profile time if used under flashinfer.
 5. **Every declared cache field needs a writer and a reader.** A
    field nobody writes stays silently at stale bytes; a field nobody
    reads is wasted bandwidth.
@@ -221,6 +227,7 @@ from vortex_torch.indexer import (
     Save, Load, MaskSlice, Reshape,
     WhereEqual, WhereNotEqual, WhereGreater,
     WhereGreaterEqual, WhereLess, WhereLessEqual,
+    TopK, Union,        # trtllm-only: TopK(k)+Union() multi-stream selection
 )
 from vortex_torch.cache import (
     Mean as CMean, Max as CMax, Min as CMin, L2Norm as CL2Norm,

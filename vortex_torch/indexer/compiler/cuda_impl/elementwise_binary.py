@@ -117,7 +117,7 @@ def generate_elementwise_binary_impl(
     """
     input_tensor_id_0 = graph.op_to_input_tensor_list[op_id][0]
     input_tensor_id_1 = graph.op_to_input_tensor_list[op_id][1]
-    output_tensor_id  = graph.op_to_output_tensor_list[op_id]
+    output_tensor_id  = graph.op_to_output_tensor_list[op_id][0]
     op = graph.op_list[op_id]
     t_x = graph.tensor_list[input_tensor_id_0]
     t_y = graph.tensor_list[input_tensor_id_1]

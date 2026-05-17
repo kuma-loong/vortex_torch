@@ -1,151 +1,150 @@
 from __future__ import annotations
-from typing import Any, Final, Union
-import torch
-from ..abs import ContextBase
-from ..utils import UNSET, Mode, resolve_dtype
+
+from typing import Any, Final, Optional, Union
 import uuid
 
+import torch
+
+from ..abs import ContextBase
+from ..utils import UNSET, Mode, resolve_dtype
+from .metadata import MetaData
+
+
 class Context(ContextBase):
+    """Static, single-instance indexer context.
+
+    Holds **only** configuration that's fixed for the lifetime of the
+    compiled indexer — shapes, page/block sizes, head counts, allocation
+    budgets, codegen scratch (op/tensor lists), backend identity, …
+
+    Per-forward-batch buffers (winfo_*, dense/sparse_kv_indptr+indices,
+    dense/sparse_seqlens, dense/sparse_block_tables, kv_last_page_len)
+    and ``batch_size`` live on a separate :class:`MetaData` object,
+    pre-allocated at attention-backend ``__init__`` and exposed as
+    ``ctx.metadata``. Codegen emits ``ctx.metadata.<field>`` for any
+    value that varies between forward batches.
+
+    Build pattern (from each attention backend's ``_compile``):
+        ctx = Context()
+        ctx.create(self, model_runner)              # static fields
+        ctx.metadata = MetaData.preallocate(ctx, device=...)
     """
-    Mutable, single-instance context; populate later via .create(...).
-    """
-    
-    __slots__ =  ContextBase.__slots__ + (
-        # indices / indptr
-        "dense_kv_indices", "sparse_kv_indices", "dense_kv_indptr", "sparse_kv_indptr", "kv_last_page_len", "batch_size", "max_bs",
-        # per-(req, kv-head) seq_lens for trtllm-style decode (None unless a
-        # backend opts in, e.g. VortexTRTLLMBackend wires its seq_lens_decode
-        # buffers in _compile).
-        "dense_seqlens", "sparse_seqlens",
-        # 2D trtllm-style block tables [eff_bs, max_blocks_per_seq] (None unless
-        # a backend opts in). The decode planner writes the dense path fully
-        # and the sparse path's BOS/EOS slots; topk fills the middle.
-        "dense_block_tables", "sparse_block_tables",
-        # Active attention backend: "flashinfer" (CSR indices, default) or
-        # "trtllm" (2D block_tables). Set by Context.create() from
-        # server_args.vortex_attention_backend; consumed by codegen
-        # (e.g. topk dispatch) to pick the right kernel + tensor layout.
+
+    __slots__ = ContextBase.__slots__ + (
+        # ---- per-forward-batch state (pre-allocated MetaData) ----
+        "metadata",
+        # ---- batch budget ----
+        "max_bs",
+        # ---- active attention backend ----
+        # "flashinfer" (CSR indices, default) or "trtllm" (2D block_tables).
+        # Set by Context.create() from server_args.vortex_attention_backend;
+        # consumed by the indexer compiler's IndexerBackend traits.
         "vortex_attention_backend",
-        # winfo
-        "winfo_q_indices", "winfo_is_first_workload_per_batch", "winfo_kv_offsets", "winfo_kv_lens", "winfo_num_workloads", "winfo_chunk_size", "max_num_workloads",
-        # chunk limits
+        # ---- workload-scheduler shape ----
+        "max_num_workloads",
         "workload_chunk_size",
-        # head / shape
+        # ---- head / shape ----
         "group_size", "num_kv_heads", "num_qo_heads", "head_dim",
-        # hardware / paging
-        "num_sms", "page_size", "max_num_pages", "max_num_pages_per_request", "block_size", "max_num_blocks", "max_num_blocks_per_request", "num_blocks_per_page", "num_pages_per_workload",
-        # misc
-        "topk_val", "topk_ratio", "block_reserved_bos", "block_reserved_eos", "max_topk_val",
-        
-        # auxilary memory in graph
-        "_aux_total_bytes",
-        
-        # auxilary flops in graph
-        "_aux_total_flops",
-
-        "tensor_list", "op_list", "output_tensor_to_op_list", "op_to_input_tensor_list", "op_to_output_tensor_list", "side_effect_op_ids",
-
-        "sparse_attention_name", "impl_backend", "tensor_id_to_tensor_name_map", "compilation_header_lines", "auxilary_func_def_lines",
-
+        # ---- hardware / paging ----
+        "num_sms", "page_size", "max_num_pages", "max_num_pages_per_request",
+        "block_size", "max_num_blocks", "max_num_blocks_per_request",
+        "num_blocks_per_page", "num_pages_per_workload",
+        # ---- topk / reserved-slot policy ----
+        "topk_val", "topk_ratio", "block_reserved_bos", "block_reserved_eos",
+        "max_topk_val",
+        # ---- auxiliary accounting ----
+        "_aux_total_bytes", "_aux_total_flops",
+        # ---- codegen / graph scratch ----
+        "tensor_list", "op_list", "output_tensor_to_op_list",
+        "op_to_input_tensor_list", "op_to_output_tensor_list",
+        "side_effect_op_ids",
+        "sparse_attention_name", "impl_backend", "tensor_id_to_tensor_name_map",
+        "compilation_header_lines", "auxilary_func_def_lines",
         "compilation_cache_dir",
-        )
-    
-    # --- index tensors ---
-    dense_kv_indices: torch.Tensor  #: Dense KV index tensor for mapping keys/values.
-    sparse_kv_indices: torch.Tensor  #: Sparse KV index tensor for irregular KV layout.
-    dense_kv_indptr: torch.Tensor    #: CSR-style indptr for dense KV segments.
-    sparse_kv_indptr: torch.Tensor   #: CSR-style indptr for sparse KV segments.
-    kv_last_page_len: int            #: Length of the last KV page.
-    batch_size: int                  #: Active batch size.
-    max_bs: int                      #: Maximum batch size (allocation budget).
-    dense_seqlens: torch.Tensor      #: Per-(req, kv-head) seq_lens for the dense decode path (None by default).
-    sparse_seqlens: torch.Tensor     #: Per-(req, kv-head) seq_lens for the sparse decode path (None by default).
-    dense_block_tables: torch.Tensor   #: [eff_bs, max_blocks_per_seq] trtllm block_tables, dense path (None by default).
-    sparse_block_tables: torch.Tensor  #: [eff_bs, max_blocks_per_seq] trtllm block_tables, sparse path (None by default).
-    vortex_attention_backend: str      #: "flashinfer" (CSR) or "trtllm" (2D block_tables).
+    )
 
-    # --- workload info (winfo) ---
-    winfo_q_indices: torch.Tensor    #: Query indices used in workload scheduling.
-    winfo_is_first_workload_per_batch: torch.Tensor  #: uint8 flag per workload: 1 iff first workload of its (batch, head).
-    winfo_kv_offsets: torch.Tensor   #: KV offsets per workload.
-    winfo_kv_lens: torch.Tensor      #: KV lengths per workload.
-    winfo_num_workloads: int         #: Number of workloads in the current batch.
-    winfo_chunk_size: int            #: Chunk size for workload partitioning.
-    max_num_workloads: int           #: Maximum number of workloads allowed.
+    # ---- type hints (declarations only) ----
+    metadata: Optional[MetaData]
+    max_bs: int
+    vortex_attention_backend: str
+    max_num_workloads: int
+    workload_chunk_size: int
+    group_size: int
+    num_kv_heads: int
+    num_qo_heads: int
+    head_dim: int
+    num_sms: int
+    page_size: int
+    max_num_pages: int
+    max_num_pages_per_request: int
+    block_size: int
+    max_num_blocks: int
+    max_num_blocks_per_request: int
+    num_blocks_per_page: int
+    num_pages_per_workload: int
+    topk_val: int
+    topk_ratio: float
+    block_reserved_bos: int
+    block_reserved_eos: int
+    max_topk_val: Union[int, None]
+    _aux_total_bytes: int
+    _aux_total_flops: int
+    tensor_list: list
+    op_list: list
+    output_tensor_to_op_list: list
+    op_to_input_tensor_list: list
+    op_to_output_tensor_list: list
+    side_effect_op_ids: list
+    sparse_attention_name: str
+    impl_backend: str
+    tensor_id_to_tensor_name_map: dict
+    compilation_header_lines: list
+    auxilary_func_def_lines: list
+    compilation_cache_dir: str
 
-    # --- chunk limits ---
-    workload_chunk_size: int              #: allowed chunk size.
-
-    # --- head / shape configuration ---
-    group_size: int                  #: Group size for grouped attention.
-    num_kv_heads: int                #: Number of KV heads.
-    num_qo_heads: int                #: Number of query/output heads.
-    head_dim: int                    #: Dimension per attention head.
-
-    # --- hardware / paging ---
-    num_sms: int                     #: Number of streaming multiprocessors (SMs).
-    page_size: int                   #: Page size used for memory paging.
-    block_size: int                   #: Page size used for memory paging.
-    max_num_pages: int               #: Total available pages.
-    max_num_pages_per_request: int   #: Page limit per individual request.
-    max_num_blocks: int               #: Total available pages.
-    max_num_blocks_per_request: int   #: Page limit per individual request.
-    num_blocks_per_page: int        #: Number of blocks contained in a single page.
-    num_pages_per_workload: int      #: Number of pages processed per workload (derived from chunk size).
-
-    # --- miscellaneous ---
-    topk_val: int                    #: Top-K value used in pruning or selection.
-    topk_ratio: float                #: Top-K ratio used in pruning or selection.
-    block_reserved_bos: int           #: Reserved page count for BOS (begin-of-sequence).
-    block_reserved_eos: int           #: Reserved page count for EOS (end-of-sequence).
-    max_topk_val: Union[int, None]   #: Optional maximum Top-K value to dispatch topk kernel variants.
-
-    # --- auxiliary ---
-    _aux_total_bytes: int            #: Accumulated auxiliary memory in bytes.
-    _aux_total_flops: int            #: Accumulated auxiliary flops.
-    tensor_list: list                #: List of tensors used in the graph.
-    op_list: list                    #: List of operations in the graph.
-    output_tensor_to_op_list: list    #: Mapping from output tensors to their producing operations.
-    op_to_input_tensor_list: list     #: Mapping from operations to their input tensors.
-    op_to_output_tensor_list: list    #: Mapping from operations to their output tensors.
-    side_effect_op_ids: list          #: Op ids that are pure side-effect writers (e.g. Save into a cache field).
-    sparse_attention_name: str          #: Name of the sparse attention implementation to use.
-    impl_backend: str       #: Implementation backend to use for code generation.
-    tensor_id_to_tensor_name_map: dict #: Mapping from tensor IDs to human-readable names for debugging.
-    compilation_header_lines: list       #: Header string to prepend to generated code during compilation.
-    auxilary_func_def_lines: list       #: List of auxiliary function definitions to include in the generated code.
-    compilation_cache_dir: str          #: Directory path for caching compiled kernels.
     def __init__(self) -> None:
-        # Start as an empty shell (no big allocations).
         for name in self.__slots__:
             if name == "_created":
                 object.__setattr__(self, name, False)
             elif name == "name":
                 object.__setattr__(self, name, "Indexer")
             elif name == "_aux_total_bytes":
-                object.__setattr__(self, name, 0)  # start from 0 bytes
+                object.__setattr__(self, name, 0)
             elif name == "_aux_total_flops":
-                object.__setattr__(self, name, 0)  # start from 0 flops
-            elif name == "batch_size":
                 object.__setattr__(self, name, 0)
             elif name == "mode":
                 object.__setattr__(self, name, Mode.profile)
-            elif name in ("dense_seqlens", "sparse_seqlens",
-                          "dense_block_tables", "sparse_block_tables"):
+            elif name == "metadata":
                 object.__setattr__(self, name, None)
             else:
                 object.__setattr__(self, name, UNSET)
 
-    
-    def set_batch_size(self, n: int) -> None:
-        
-        self.batch_size = n
-        
-    
-    def create(self, parent: Any, model_runner: Any, *, overwrite: bool = False) -> "Context":
+    # ------------------------------------------------------------------
+    # Per-batch convenience accessors — forward to ``self.metadata``.
+    # ------------------------------------------------------------------
+    @property
+    def batch_size(self) -> int:
+        """Current batch size — proxied from ``self.metadata``.
+
+        Kept as a property (not a slot) so the only writable copy lives on
+        ``self.metadata``; ``ctx.batch_size`` is now read-only.
         """
-        Populate this instance once (no locking). Set overwrite=True to allow re-init.
-        NOTE: Without locking, concurrent callers may race; call from a single thread.
+        return 0 if self.metadata is None else self.metadata.batch_size
+
+    def set_batch_size(self, n: int) -> None:
+        """Compatibility shim — forwards to ``self.metadata.set_batch_size``."""
+        if self.metadata is None:
+            raise RuntimeError(
+                "Context.set_batch_size called before MetaData was preallocated; "
+                "did you forget `ctx.metadata = MetaData.preallocate(ctx, device=...)`?"
+            )
+        self.metadata.set_batch_size(n)
+
+    # ------------------------------------------------------------------
+    def create(self, parent: Any, model_runner: Any, *, overwrite: bool = False) -> "Context":
+        """Populate the static fields. Per-batch ``MetaData`` is allocated
+        separately by the caller via ``MetaData.preallocate(ctx, device=...)``
+        — see this class's docstring.
         """
         if self._created and not overwrite:
             raise RuntimeError("Context.create() already called; pass overwrite=True to reinitialize.")
@@ -158,13 +157,6 @@ class Context(ContextBase):
         )
         max_bs = int(model_runner.req_to_token_pool.size)
         self.max_bs = max_bs
-
-        # Backend-known fields
-        self.dense_kv_indices = parent.kv_indices_decode[0]
-        self.sparse_kv_indices = parent.kv_indices_decode[1]
-        self.dense_kv_indptr = parent.kv_indptr_decode[0]
-        self.sparse_kv_indptr = parent.kv_indptr_decode[1]
-        self.kv_last_page_len = parent.kv_last_page_len_decode
 
         self.workload_chunk_size = sa.vortex_workload_chunk_size
 
@@ -191,21 +183,13 @@ class Context(ContextBase):
         self.vortex_dtype = resolve_dtype(
             getattr(sa, "vortex_dtype", "bfloat16"), default=torch.bfloat16
         )
-        
+
         self.block_reserved_bos = sa.vortex_block_reserved_bos
         self.block_reserved_eos = sa.vortex_block_reserved_eos
 
         self.max_num_workloads = (
             (self.max_num_blocks // max(1, self.workload_chunk_size)) + max_bs * self.num_kv_heads
         )
-
-        device = getattr(model_runner, "device", "cpu")
-        self.winfo_q_indices = torch.zeros((self.max_num_workloads,), dtype=torch.int32, device=device)
-        self.winfo_is_first_workload_per_batch = torch.zeros((self.max_num_workloads,), dtype=torch.uint8, device=device)
-        self.winfo_kv_offsets = torch.zeros((self.max_num_workloads,), dtype=torch.int32, device=device)
-        self.winfo_kv_lens = torch.zeros((self.max_num_workloads,), dtype=torch.int32, device=device)
-        self.winfo_num_workloads = torch.zeros((1,), dtype=torch.int32, device=device)
-        self.winfo_chunk_size = torch.zeros((1,), dtype=torch.int32, device=device)
 
         self.tensor_list = []
         self.op_list = []
@@ -217,7 +201,7 @@ class Context(ContextBase):
         self.compilation_header_lines = []
         self.auxilary_func_def_lines = []
         self.compilation_cache_dir = sa.vortex_compilation_cache_dir
-        self.sparse_attention_name = parent.sparse_attention.__class__.__name__.lower() + f"_{uuid.uuid4().hex[:8]}"  # unique name for this attention instance 
+        self.sparse_attention_name = parent.sparse_attention.__class__.__name__.lower() + f"_{uuid.uuid4().hex[:8]}"  # unique name for this attention instance
         self.impl_backend = "triton"  # default to triton; can be overridden by user
         self.vortex_attention_backend = getattr(
             sa, "vortex_attention_backend", "flashinfer"
@@ -226,11 +210,12 @@ class Context(ContextBase):
         return self
 
 
-
 # Module-level singleton (part of the public package API)
 ctx: Final[Context] = Context()
+
 
 def get_ctx() -> Context:
     return ctx
 
-__all__ = ["Context", "ctx", "get_ctx"]
+
+__all__ = ["Context", "MetaData", "ctx", "get_ctx"]

@@ -26,6 +26,7 @@ from ...context import Context
 from ....abs import FORMAT
 from ....utils import Schedule, INDENT
 from .register import get_impl_func
+from .backend import get_backend
 from .dtype_cast import (
     is_fp8 as _is_fp8,
     load_cast_expr as _load_cast_expr,
@@ -513,7 +514,7 @@ def {ctx.sparse_attention_name}_subgraph_{sub_graph_id}_kernel(
 # Python launcher / impl wrapper
 # --------------------------------------------------------------------------- #
 
-def _build_launcher_args(sub_graph) -> Tuple[List[str], List[str], List[str]]:
+def _build_launcher_args(sub_graph, ctx: Context) -> Tuple[List[str], List[str], List[str]]:
     """Return ``(wrapper_args, kernel_call_inputs, fp8_rebind_lines)``.
 
     FP8 reinterpret: any FP8 tensor (input or output) is bitcast to
@@ -522,16 +523,22 @@ def _build_launcher_args(sub_graph) -> Tuple[List[str], List[str], List[str]]:
     bits on write. Mirrors the cache-side convention.
     """
     wrapper_args: List[str] = []
+    # The Schedule.W kernel preamble does
+    #   ``page_idx_i32 = tl.load(indices + ragged_idx_i32)``
+    # and ``ragged_idx_i32 * shape[1]`` for RAGGED store/load addresses.
+    # Every backend-specific consumer-side detail (which tensor ``indices``
+    # binds to, plus the matching ``winfo_kv_offsets`` encoding emitted by
+    # the planner) is captured in :mod:`triton_impl.backend`.
     kernel_inputs: List[str] = [
-        "ctx.dense_kv_indices",
-        "ctx.winfo_q_indices",
+        get_backend(ctx).indices_src,
+        "ctx.metadata.winfo_q_indices",
     ]
     if _has_batched_output(sub_graph):
-        kernel_inputs.append("ctx.winfo_is_first_workload_per_batch")
+        kernel_inputs.append("ctx.metadata.winfo_is_first_workload_per_batch")
     kernel_inputs += [
-        "ctx.winfo_kv_offsets",
-        "ctx.winfo_kv_lens",
-        "ctx.winfo_num_workloads",
+        "ctx.metadata.winfo_kv_offsets",
+        "ctx.metadata.winfo_kv_lens",
+        "ctx.metadata.winfo_num_workloads",
     ]
     fp8_rebind: List[str] = []
 
@@ -551,7 +558,7 @@ def _build_launcher_args(sub_graph) -> Tuple[List[str], List[str], List[str]]:
 
 def _generate_w_impl(sub_graph: Graph, sub_graph_id: int, ctx: Context) -> str:
     kernel_str = generate_triton_kernel(sub_graph, sub_graph_id, ctx)
-    wrapper_args, kernel_inputs, fp8_rebind = _build_launcher_args(sub_graph)
+    wrapper_args, kernel_inputs, fp8_rebind = _build_launcher_args(sub_graph, ctx)
 
     args_def = ",\n".join(f"{INDENT}{arg}" for arg in wrapper_args)
     kernel_inputs_str = ",\n".join(f"{INDENT * 2}{arg}" for arg in kernel_inputs)

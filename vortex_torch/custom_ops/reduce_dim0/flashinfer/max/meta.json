@@ -1,0 +1,8 @@
+{
+    "name": "max",
+    "description": "Reduce-dim0 (max) over RAGGED CSR blocks (flashinfer).",
+    "constraints": {
+        "variant": "max"
+    },
+    "priority": 100
+}

@@ -1,0 +1,7 @@
+{
+    "name": "default",
+    "description": "CUB-sort baseline — catch-all for arbitrary max_topk_val (CSR/flashinfer).",
+    "constraints": {},
+    "priority": 0,
+    "default": true
+}

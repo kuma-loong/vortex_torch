@@ -103,7 +103,7 @@ def generate_save_impl(graph: Graph, op_id: int, ctx: Context) -> str:
     the store codegen knows to flush it.
     """
     input_tensor_id  = graph.op_to_input_tensor_list[op_id][0]
-    output_tensor_id = graph.op_to_output_tensor_list[op_id]
+    output_tensor_id = graph.op_to_output_tensor_list[op_id][0]
     op = graph.op_list[op_id]
     assert issubclass(op.__class__, Save), (
         f"Expected a Save op, got {op.__class__.__name__}"
@@ -131,7 +131,7 @@ def generate_load_impl(graph: Graph, op_id: int, ctx: Context) -> str:
     just mirrors the populated PAGED tile into the RAGGED output tile.
     """
     input_tensor_id  = graph.op_to_input_tensor_list[op_id][0]
-    output_tensor_id = graph.op_to_output_tensor_list[op_id]
+    output_tensor_id = graph.op_to_output_tensor_list[op_id][0]
     op = graph.op_list[op_id]
     assert issubclass(op.__class__, Load), (
         f"Expected a Load op, got {op.__class__.__name__}"

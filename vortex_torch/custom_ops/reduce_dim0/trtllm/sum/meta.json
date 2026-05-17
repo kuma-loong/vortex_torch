@@ -1,0 +1,8 @@
+{
+    "name": "sum",
+    "description": "Reduce-dim0 (sum) over RAGGED block-table blocks (trtllm).",
+    "constraints": {
+        "variant": "sum"
+    },
+    "priority": 100
+}

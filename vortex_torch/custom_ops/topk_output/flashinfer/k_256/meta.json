@@ -1,0 +1,8 @@
+{
+    "name": "k_256",
+    "description": "Regcache-unrolled radix winner for max_topk_val <= 256 (CSR/flashinfer).",
+    "constraints": {
+        "max_topk_val": {"le": 256}
+    },
+    "priority": 80
+}

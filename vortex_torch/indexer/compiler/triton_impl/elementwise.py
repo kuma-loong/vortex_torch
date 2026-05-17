@@ -7,7 +7,7 @@ from ....utils import ElementwiseOpType
 def generate_elementwise_impl(graph: Graph, op_id: int, ctx: Context) -> str:
 
     input_tensor_id_0 = graph.op_to_input_tensor_list[op_id][0]
-    output_tensor_id = graph.op_to_output_tensor_list[op_id]
+    output_tensor_id = graph.op_to_output_tensor_list[op_id][0]
     op = graph.op_list[op_id]
     t_i0 = graph.tensor_list[input_tensor_id_0]
     t_o = graph.tensor_list[output_tensor_id]

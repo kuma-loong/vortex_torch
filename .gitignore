@@ -56,6 +56,10 @@ MANIFEST
 !vortex_torch/kernels/topk/configs/*.json
 !vortex_torch/kernels/topk/configs/**/*.json
 
+# custom_ops leaf metadata + JIT configs — track all JSON under custom_ops/.
+!vortex_torch/custom_ops/**/meta.json
+!vortex_torch/custom_ops/**/config.json
+
 tests/
 *_backup.py
 # PyInstaller

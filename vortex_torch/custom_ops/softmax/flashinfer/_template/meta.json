@@ -1,0 +1,7 @@
+{
+    "name": "TODO_RENAME_ME",
+    "description": "TODO: one-line summary of this softmax/flashinfer specialisation.",
+    "constraints": {},
+    "priority": 100,
+    "default": false
+}

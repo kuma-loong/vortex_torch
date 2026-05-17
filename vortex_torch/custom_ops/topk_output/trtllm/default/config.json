@@ -1,0 +1,6 @@
+{
+    "_doc": "topk_output trtllm/BT fallback — CUB BlockRadixSort variant (sort_topk_trtllm.cu). Picked when no k bucket matches.",
+    "file": "kernel.cu",
+    "substitutions": {},
+    "extra_cuda_cflags": []
+}

@@ -1,0 +1,6 @@
+{
+    "_doc": "topk_output flashinfer/CSR fallback — CUB BlockRadixSort baseline (sort_topk.cu). Picked when no k bucket matches.",
+    "file": "kernel.cu",
+    "substitutions": {},
+    "extra_cuda_cflags": []
+}

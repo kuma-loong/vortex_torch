@@ -15,7 +15,7 @@ from functools import partial
 import torch
 from vortex_torch import is_hopper
 from vortex_torch.abs import as_vtensor, FORMAT
-from vortex_torch.indexer import Context
+from vortex_torch.indexer import Context, MetaData
 from vortex_torch.indexer.compiler.compile import compile as compile_indexer
 from vortex_torch.indexer.utils_sglang import (
     get_chunkwise_hn2nh_transpose,
@@ -138,24 +138,14 @@ class VortexFlashInferBackend(AttentionBackend):
         )
 
         # ===========================
-        # Decode KV-indptr buffers
+        # Decode-path buffers live on ``self.ctx.metadata`` (pre-allocated
+        # in ``_compile``). The flashinfer wrappers consume them directly
+        # via ``self.ctx.metadata.dense_kv_indptr`` etc.
         # ===========================
 
-        self.kv_indptr_decode = [
-            torch.zeros(
-                (max_bs * self.num_kv_heads + 1,),
-                dtype=torch.int32,
-                device=model_runner.device
-            ),
-            torch.zeros(
-                (max_bs * self.num_kv_heads + 1,),
-                dtype=torch.int32,
-                device=model_runner.device
-            ),
-        ]
-
         # ===========================
-        # KV indices (prefill)
+        # KV indices (prefill) — still owned by this object (the flashinfer
+        # prefill wrapper has its own indptr/indices arrays).
         # ===========================
 
         self.kv_indices_prefill = torch.zeros(
@@ -168,39 +158,10 @@ class VortexFlashInferBackend(AttentionBackend):
         )
 
         # ===========================
-        # KV indices (decode)
-        # ===========================
-
-        self.kv_indices_decode = [
-            torch.zeros(
-                (
-                    (max_bs * self.num_kv_heads * model_runner.model_config.context_len + self.block_size - 1)
-                    // self.block_size,
-                ),
-                dtype=torch.int32,
-                device=model_runner.device
-            ),
-            torch.zeros(
-                (
-                    (max_bs * self.num_kv_heads * model_runner.model_config.context_len + self.block_size - 1)
-                    // self.block_size,
-                ),
-                dtype=torch.int32,
-                device=model_runner.device
-            ),
-        ]
-
-        # ===========================
-        # KV last page length tracking
+        # KV last-page-len (prefill — decode lives on MetaData)
         # ===========================
 
         self.kv_last_page_len_prefill = torch.ones(
-            (max_bs * self.num_kv_heads,),
-            dtype=torch.int32,
-            device=model_runner.device
-        )
-
-        self.kv_last_page_len_decode = torch.ones(
             (max_bs * self.num_kv_heads,),
             dtype=torch.int32,
             device=model_runner.device
@@ -278,6 +239,12 @@ class VortexFlashInferBackend(AttentionBackend):
         indexer = self.sparse_attention.forward_indexer
 
         self.ctx.create(self, model_runner)
+        # Allocate every per-forward-batch buffer (winfo_*, dense/sparse
+        # kv_indptr+indices, kv_last_page_len) on a single MetaData owned
+        # by the context. The decode planner writes into this MetaData;
+        # the indexer kernels read from it, and the flashinfer decode
+        # wrappers below take pointers into it.
+        self.ctx.metadata = MetaData.preallocate(self.ctx, device=device)
         self.ctx.assert_created()
         self.ctx.profile()
 
@@ -334,9 +301,9 @@ class VortexFlashInferBackend(AttentionBackend):
             )
             
             self.decode_wrappers[0].plan(
-                indptr=self.kv_indptr_decode[0][:bs*self.num_kv_heads+1],
-                indices=self.kv_indices_decode[0],
-                last_page_len=self.kv_last_page_len_decode[:bs*self.num_kv_heads],
+                indptr=self.ctx.metadata.dense_kv_indptr[:bs*self.num_kv_heads+1],
+                indices=self.ctx.metadata.dense_kv_indices,
+                last_page_len=self.ctx.metadata.kv_last_page_len[:bs*self.num_kv_heads],
                 num_qo_heads=self.group_size,
                 num_kv_heads=1,
                 head_dim=self.head_dim,
@@ -346,9 +313,9 @@ class VortexFlashInferBackend(AttentionBackend):
             )
             
             self.decode_wrappers[1].plan(
-                indptr=self.kv_indptr_decode[1][:bs*self.num_kv_heads+1],
-                indices=self.kv_indices_decode[1],
-                last_page_len=self.kv_last_page_len_decode[:bs*self.num_kv_heads],
+                indptr=self.ctx.metadata.sparse_kv_indptr[:bs*self.num_kv_heads+1],
+                indices=self.ctx.metadata.sparse_kv_indices,
+                last_page_len=self.ctx.metadata.kv_last_page_len[:bs*self.num_kv_heads],
                 num_qo_heads=self.group_size,
                 num_kv_heads=1,
                 head_dim=self.head_dim,
@@ -443,9 +410,9 @@ class VortexFlashInferBackend(AttentionBackend):
                         "NHD",
                         use_cuda_graph=True,
                         use_tensor_cores=self.decode_use_tensor_cores,
-                        paged_kv_indptr_buffer=self.kv_indptr_decode[0][:bs*self.num_kv_heads + 1],
-                        paged_kv_indices_buffer=self.kv_indices_decode[0],
-                        paged_kv_last_page_len_buffer=self.kv_last_page_len_decode[
+                        paged_kv_indptr_buffer=self.ctx.metadata.dense_kv_indptr[:bs*self.num_kv_heads + 1],
+                        paged_kv_indices_buffer=self.ctx.metadata.dense_kv_indices,
+                        paged_kv_last_page_len_buffer=self.ctx.metadata.kv_last_page_len[
                             :bs*self.num_kv_heads
                         ],
                     ),
@@ -455,9 +422,9 @@ class VortexFlashInferBackend(AttentionBackend):
                         "NHD",
                         use_cuda_graph=True,
                         use_tensor_cores=self.decode_use_tensor_cores,
-                        paged_kv_indptr_buffer=self.kv_indptr_decode[1][:bs*self.num_kv_heads + 1],
-                        paged_kv_indices_buffer=self.kv_indices_decode[1],
-                        paged_kv_last_page_len_buffer=self.kv_last_page_len_decode[
+                        paged_kv_indptr_buffer=self.ctx.metadata.sparse_kv_indptr[:bs*self.num_kv_heads + 1],
+                        paged_kv_indices_buffer=self.ctx.metadata.sparse_kv_indices,
+                        paged_kv_last_page_len_buffer=self.ctx.metadata.kv_last_page_len[
                             :bs*self.num_kv_heads
                         ],
                     ),
@@ -472,9 +439,9 @@ class VortexFlashInferBackend(AttentionBackend):
             )
             
             decode_wrappers[0].plan(
-                indptr=self.kv_indptr_decode[0][:bs*self.num_kv_heads+1],
-                indices=self.kv_indices_decode[0],
-                last_page_len=self.kv_last_page_len_decode[:bs*self.num_kv_heads],
+                indptr=self.ctx.metadata.dense_kv_indptr[:bs*self.num_kv_heads+1],
+                indices=self.ctx.metadata.dense_kv_indices,
+                last_page_len=self.ctx.metadata.kv_last_page_len[:bs*self.num_kv_heads],
                 num_qo_heads=self.group_size,
                 num_kv_heads=1,
                 head_dim=self.head_dim,
@@ -484,9 +451,9 @@ class VortexFlashInferBackend(AttentionBackend):
             )
             
             decode_wrappers[1].plan(
-                indptr=self.kv_indptr_decode[1][:bs*self.num_kv_heads+1],
-                indices=self.kv_indices_decode[1],
-                last_page_len=self.kv_last_page_len_decode[:bs*self.num_kv_heads],
+                indptr=self.ctx.metadata.sparse_kv_indptr[:bs*self.num_kv_heads+1],
+                indices=self.ctx.metadata.sparse_kv_indices,
+                last_page_len=self.ctx.metadata.kv_last_page_len[:bs*self.num_kv_heads],
                 num_qo_heads=self.group_size,
                 num_kv_heads=1,
                 head_dim=self.head_dim,
@@ -522,9 +489,9 @@ class VortexFlashInferBackend(AttentionBackend):
             )
         
         self.decode_cuda_graph_metadata[bs][0].plan(
-            indptr=self.kv_indptr_decode[0][:bs*self.num_kv_heads+1],
-            indices=self.kv_indices_decode[0],
-            last_page_len=self.kv_last_page_len_decode[:bs*self.num_kv_heads],
+            indptr=self.ctx.metadata.dense_kv_indptr[:bs*self.num_kv_heads+1],
+            indices=self.ctx.metadata.dense_kv_indices,
+            last_page_len=self.ctx.metadata.kv_last_page_len[:bs*self.num_kv_heads],
             num_qo_heads=self.group_size,
             num_kv_heads=1,
             head_dim=self.head_dim,
@@ -534,9 +501,9 @@ class VortexFlashInferBackend(AttentionBackend):
         )
         
         self.decode_cuda_graph_metadata[bs][1].plan(
-            indptr=self.kv_indptr_decode[1][:bs*self.num_kv_heads+1],
-            indices=self.kv_indices_decode[1],
-            last_page_len=self.kv_last_page_len_decode[:bs*self.num_kv_heads],
+            indptr=self.ctx.metadata.sparse_kv_indptr[:bs*self.num_kv_heads+1],
+            indices=self.ctx.metadata.sparse_kv_indices,
+            last_page_len=self.ctx.metadata.kv_last_page_len[:bs*self.num_kv_heads],
             num_qo_heads=self.group_size,
             num_kv_heads=1,
             head_dim=self.head_dim,
