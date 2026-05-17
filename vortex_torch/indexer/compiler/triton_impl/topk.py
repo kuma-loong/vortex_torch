@@ -17,34 +17,58 @@ def _check_topk_io(graph: Graph, op_id: int) -> tuple[int, int]:
 
 def generate_topk_impl(graph: Graph, op_id: int, ctx: Context) -> str:
     # Pick the best-known top-k kernel at runtime via the dispatcher in
-    # ``vortex_torch/kernels/topk/dispatcher.py``. We don't know which
-    # specialised kernel will be selected at codegen time (it depends on
-    # ``ctx.max_topk_val``, available only per call), so emit a tiny
-    # per-module memo so the hot path collapses to a dict lookup.
-    # ``max_topk_val=None`` falls through to the CUB-sort baseline,
-    # matching the previous ``topk_output`` behavior.
+    # ``vortex_torch/kernels/topk/dispatcher.py``. The dispatch key is
+    # ``(max_topk_val, vortex_attention_backend)`` — neither is known at
+    # codegen time, so we emit a tiny per-module memo and look up on the
+    # hot path.
+    #
+    # In trtllm mode the 4th / 5th tensor arguments and the last int
+    # argument carry different semantics: ``dense_block_tables`` and
+    # ``sparse_block_tables`` (2D, [eff_bs, max_blocks_per_seq]) instead
+    # of CSR ``dense_kv_indices`` / ``sparse_kv_indices``, and the row
+    # stride ``max_blocks_per_seq`` instead of ``max_num_pages``. The
+    # selector below picks the right ctx attribute names accordingly.
     ctx.compilation_header_lines.extend([
         "from vortex_torch.kernels.topk.dispatcher import dispatch as _vortex_topk_dispatch",
         "_vortex_topk_kernel_cache = {}",
-        "def _vortex_topk_kernel_for(max_topk):",
-        "    fn = _vortex_topk_kernel_cache.get(max_topk)",
+        "def _vortex_topk_kernel_for(max_topk, attn_backend):",
+        "    key = (max_topk, attn_backend)",
+        "    fn = _vortex_topk_kernel_cache.get(key)",
         "    if fn is None:",
-        "        fn = _vortex_topk_kernel_cache[max_topk] = _vortex_topk_dispatch(max_topk)",
+        "        fn = _vortex_topk_kernel_cache[key] = _vortex_topk_dispatch("
+        "max_topk, attention_backend=attn_backend)",
         "    return fn",
     ])
     input_tensor_id, output_tensor_id = _check_topk_io(graph, op_id)
 
+    # Topk already reads from dense_block_tables in trtllm mode, so it does
+    # not depend on dense_kv_indices. The other indexer ops (notably the
+    # GeMV / score-gather path) still read CSR ``dense_kv_indices`` in both
+    # modes; the trtllm planner therefore writes that buffer too.
+    # TODO(opt-b): migrate the score-gather codegen to read
+    # ``ctx.dense_block_tables`` in trtllm mode and drop the duplicate CSR
+    # write from the planner (see vortex_torch/indexer/planner_sglang.py
+    # and utils_sglang.get_decode_planner_trtllm for the matching TODOs).
+    backend = (getattr(ctx, "vortex_attention_backend", None) or "flashinfer").lower()
+    if backend == "trtllm":
+        dense_src = "ctx.dense_block_tables"
+        last_arg = "ctx.dense_block_tables.shape[1]"  # row stride
+    else:
+        dense_src = "ctx.dense_kv_indices"
+        last_arg = "ctx.max_num_blocks_per_request"
+
     impl_lines = [
-        f"_vortex_topk_kernel_for(getattr(ctx, 'max_topk_val', None))(",
+        f"_vortex_topk_kernel_for(getattr(ctx, 'max_topk_val', None), "
+        f"getattr(ctx, 'vortex_attention_backend', 'flashinfer'))(",
         f"{INDENT * 2}tensor_{input_tensor_id},",
         f"{INDENT * 2}ctx.dense_kv_indptr,",
         f"{INDENT * 2}ctx.sparse_kv_indptr,",
-        f"{INDENT * 2}ctx.dense_kv_indices,",
+        f"{INDENT * 2}{dense_src},",
         f"{INDENT * 2}tensor_{output_tensor_id},",
         f"{INDENT * 2}ctx.batch_size * ctx.num_kv_heads,",
         f"{INDENT * 2}ctx.block_reserved_bos,",
         f"{INDENT * 2}ctx.block_reserved_eos,",
-        f"{INDENT * 2}ctx.max_num_blocks_per_request,",
+        f"{INDENT * 2}{last_arg},",
         f")",
     ]
     return "\n".join(impl_lines)
@@ -79,17 +103,25 @@ def generate_approx_topk_impl(graph: Graph, op_id: int, ctx: Context) -> str:
         f").topk",
     ])
 
+    backend = (getattr(ctx, "vortex_attention_backend", None) or "flashinfer").lower()
+    if backend == "trtllm":
+        dense_src = "ctx.dense_block_tables"
+        last_arg = "ctx.dense_block_tables.shape[1]"
+    else:
+        dense_src = "ctx.dense_kv_indices"
+        last_arg = "ctx.max_num_blocks_per_request"
+
     impl_lines = [
         f"{callable_name}(",
         f"{INDENT * 2}tensor_{input_tensor_id},",
         f"{INDENT * 2}ctx.dense_kv_indptr,",
         f"{INDENT * 2}ctx.sparse_kv_indptr,",
-        f"{INDENT * 2}ctx.dense_kv_indices,",
+        f"{INDENT * 2}{dense_src},",
         f"{INDENT * 2}tensor_{output_tensor_id},",
         f"{INDENT * 2}ctx.batch_size * ctx.num_kv_heads,",
         f"{INDENT * 2}ctx.block_reserved_bos,",
         f"{INDENT * 2}ctx.block_reserved_eos,",
-        f"{INDENT * 2}ctx.max_num_blocks_per_request,",
+        f"{INDENT * 2}{last_arg},",
         f")",
     ]
     return "\n".join(impl_lines)

@@ -17,6 +17,15 @@ class Context(ContextBase):
         # backend opts in, e.g. VortexTRTLLMBackend wires its seq_lens_decode
         # buffers in _compile).
         "dense_seqlens", "sparse_seqlens",
+        # 2D trtllm-style block tables [eff_bs, max_blocks_per_seq] (None unless
+        # a backend opts in). The decode planner writes the dense path fully
+        # and the sparse path's BOS/EOS slots; topk fills the middle.
+        "dense_block_tables", "sparse_block_tables",
+        # Active attention backend: "flashinfer" (CSR indices, default) or
+        # "trtllm" (2D block_tables). Set by Context.create() from
+        # server_args.vortex_attention_backend; consumed by codegen
+        # (e.g. topk dispatch) to pick the right kernel + tensor layout.
+        "vortex_attention_backend",
         # winfo
         "winfo_q_indices", "winfo_is_first_workload_per_batch", "winfo_kv_offsets", "winfo_kv_lens", "winfo_num_workloads", "winfo_chunk_size", "max_num_workloads",
         # chunk limits
@@ -51,6 +60,9 @@ class Context(ContextBase):
     max_bs: int                      #: Maximum batch size (allocation budget).
     dense_seqlens: torch.Tensor      #: Per-(req, kv-head) seq_lens for the dense decode path (None by default).
     sparse_seqlens: torch.Tensor     #: Per-(req, kv-head) seq_lens for the sparse decode path (None by default).
+    dense_block_tables: torch.Tensor   #: [eff_bs, max_blocks_per_seq] trtllm block_tables, dense path (None by default).
+    sparse_block_tables: torch.Tensor  #: [eff_bs, max_blocks_per_seq] trtllm block_tables, sparse path (None by default).
+    vortex_attention_backend: str      #: "flashinfer" (CSR) or "trtllm" (2D block_tables).
 
     # --- workload info (winfo) ---
     winfo_q_indices: torch.Tensor    #: Query indices used in workload scheduling.
@@ -118,7 +130,8 @@ class Context(ContextBase):
                 object.__setattr__(self, name, 0)
             elif name == "mode":
                 object.__setattr__(self, name, Mode.profile)
-            elif name in ("dense_seqlens", "sparse_seqlens"):
+            elif name in ("dense_seqlens", "sparse_seqlens",
+                          "dense_block_tables", "sparse_block_tables"):
                 object.__setattr__(self, name, None)
             else:
                 object.__setattr__(self, name, UNSET)
@@ -206,6 +219,9 @@ class Context(ContextBase):
         self.compilation_cache_dir = sa.vortex_compilation_cache_dir
         self.sparse_attention_name = parent.sparse_attention.__class__.__name__.lower() + f"_{uuid.uuid4().hex[:8]}"  # unique name for this attention instance 
         self.impl_backend = "triton"  # default to triton; can be overridden by user
+        self.vortex_attention_backend = getattr(
+            sa, "vortex_attention_backend", "flashinfer"
+        ) or "flashinfer"
         self._created = True
         return self
 

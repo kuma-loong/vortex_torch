@@ -48,6 +48,71 @@ def get_decode_planner(policy: str = None):
     return plan_decode
 
 
+def get_decode_planner_trtllm(policy: str = None):
+    """Decode planner variant that emits trtllm-ready outputs directly.
+
+    Outputs filled by the underlying CUDA kernel:
+      * ``ctx.dense_block_tables``  — every selected page for the dense path
+      * ``ctx.sparse_block_tables`` — only the BOS+EOS slots; the middle is
+        filled by the topk kernel later
+      * ``ctx.dense_seqlens`` / ``ctx.sparse_seqlens`` — int32 token counts
+      * ``ctx.dense_kv_indptr`` / ``ctx.sparse_kv_indptr`` — still needed by
+        the workload scheduler and by topk
+      * ``ctx.dense_kv_indices`` — written in addition to
+        ``dense_block_tables`` because the indexer's score-gather codegen
+        still consults the CSR form (see TODO below)
+      * ``ctx.kv_last_page_len`` — same semantics as before
+
+    TODO(opt-b): teach the score-gather codegen (and any other indexer op
+    that still reads ``ctx.dense_kv_indices`` in trtllm mode) to consume
+    ``ctx.dense_block_tables`` instead. Once that's done, drop the
+    ``dense_kv_indices`` write from the CUDA kernel and the argument from
+    this Python wrapper — saves one int32-per-block store per plan call.
+    """
+    module = get_sglang_plan_decode_v2_module(
+        policy_body=policy,
+        verbose=True,
+        fallback_to_default=True,
+    )
+
+    def plan_decode_trtllm(
+        cached_seq_lens: torch.Tensor,
+        req_to_token: torch.Tensor,
+        req_indices: torch.Tensor,
+        ctx: Context,
+    ):
+        module.sglang_plan_decode_v2_trtllm(
+            cached_seq_lens,
+            ctx.dense_kv_indptr,
+            ctx.sparse_kv_indptr,
+            ctx.dense_kv_indices,  # TODO(opt-b): drop with codegen migration.
+            ctx.kv_last_page_len,
+            ctx.dense_block_tables,
+            ctx.sparse_block_tables,
+            ctx.dense_seqlens,
+            ctx.sparse_seqlens,
+            req_to_token,
+            req_indices,
+            ctx.winfo_q_indices,
+            ctx.winfo_is_first_workload_per_batch,
+            ctx.winfo_kv_offsets,
+            ctx.winfo_kv_lens,
+            ctx.winfo_num_workloads,
+            ctx.winfo_chunk_size,
+            ctx.page_size,
+            ctx.block_size,
+            ctx.num_kv_heads,
+            ctx.topk_val,
+            ctx.topk_ratio,
+            ctx.block_reserved_bos,
+            ctx.block_reserved_eos,
+            ctx.workload_chunk_size,
+        )
+        ctx.set_batch_size(cached_seq_lens.shape[0])
+
+    return plan_decode_trtllm
+
+
 def get_prefill_planner():
     """Mirror of :func:`get_decode_planner` for the prefill path.
 

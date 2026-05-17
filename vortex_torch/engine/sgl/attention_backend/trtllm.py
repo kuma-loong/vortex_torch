@@ -9,9 +9,7 @@ Each backend supports two operators: extend (i.e. prefill with cached prefix) an
 
 import os
 from dataclasses import dataclass
-from enum import Enum, auto
-from typing import TYPE_CHECKING, Callable, List, Optional, Union, Dict, Tuple
-from functools import partial
+from typing import TYPE_CHECKING, List, Optional, Union, Dict
 import torch
 from vortex_torch import is_hopper
 from vortex_torch.abs import as_vtensor, FORMAT
@@ -20,7 +18,7 @@ from vortex_torch.indexer.compiler.compile import compile as compile_indexer
 from vortex_torch.indexer.utils_sglang import (
     get_chunkwise_hn2nh_transpose,
     get_chunkwise_nh2hn_transpose,
-    get_decode_planner,
+    get_decode_planner_trtllm,
     get_prefill_planner,
 )
 if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
@@ -28,9 +26,6 @@ if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
 
     torch._logging.set_logs(dynamo=logging.ERROR)
     torch._dynamo.config.suppress_errors = True
-
-import triton
-import triton.language as tl
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -46,72 +41,7 @@ if is_flashinfer_available():
         BatchPrefillWithRaggedKVCacheWrapper,
     )
     from flashinfer.cascade import merge_state
-    from flashinfer.decode import (
-        _get_range_buf,
-        get_seq_lens,
-        trtllm_batch_decode_with_kv_cache,
-    )
-
-
-# ---------------------------------------------------------------------------
-# CSR (kv_indptr + kv_indices + last_page_len) -> trtllm (block_tables + seq_lens)
-# ---------------------------------------------------------------------------
-@triton.jit
-def _csr_to_block_tables_kernel(
-    kv_indptr_ptr,          # int32 [B+1]
-    kv_indices_ptr,         # int32 [total_blocks]
-    last_page_len_ptr,      # int32 [B]
-    block_tables_ptr,       # int32 [B, MAX_BLOCKS_PER_SEQ]
-    seq_lens_ptr,           # int32 [B]
-    block_tables_stride,
-    BLOCK_SIZE: tl.constexpr,
-    MAX_BLOCKS_PER_SEQ: tl.constexpr,
-    TILE: tl.constexpr,
-):
-    b = tl.program_id(0)
-    start = tl.load(kv_indptr_ptr + b)
-    end = tl.load(kv_indptr_ptr + b + 1)
-    num_blocks = end - start
-    last_len = tl.load(last_page_len_ptr + b)
-
-    seq_len = (num_blocks - 1) * BLOCK_SIZE + last_len
-    tl.store(seq_lens_ptr + b, seq_len)
-
-    row = block_tables_ptr + b * block_tables_stride
-    for tile_start in range(0, MAX_BLOCKS_PER_SEQ, TILE):
-        offs = tile_start + tl.arange(0, TILE)
-        valid = offs < num_blocks
-        in_range = offs < MAX_BLOCKS_PER_SEQ
-        v = tl.load(kv_indices_ptr + start + offs, mask=valid, other=0)
-        tl.store(row + offs, v, mask=in_range)
-
-
-def csr_to_block_tables(
-    kv_indptr: torch.Tensor,
-    kv_indices: torch.Tensor,
-    last_page_len: torch.Tensor,
-    block_tables: torch.Tensor,
-    seq_lens: torch.Tensor,
-    block_size: int,
-) -> None:
-    """Fill ``block_tables`` / ``seq_lens`` in place from the CSR-style page table."""
-    B = kv_indptr.shape[0] - 1
-    if B == 0:
-        return
-    max_blocks_per_seq = block_tables.shape[1]
-    tile = max(triton.next_power_of_2(max_blocks_per_seq), 16)
-    tile = min(tile, 1024)
-    _csr_to_block_tables_kernel[(B,)](
-        kv_indptr,
-        kv_indices,
-        last_page_len,
-        block_tables,
-        seq_lens,
-        block_tables.stride(0),
-        BLOCK_SIZE=block_size,
-        MAX_BLOCKS_PER_SEQ=max_blocks_per_seq,
-        TILE=tile,
-    )
+    from flashinfer.decode import trtllm_batch_decode_with_kv_cache
 
 
 @dataclass
@@ -157,16 +87,6 @@ class VortexTRTLLMBackend(AttentionBackend):
         assert not self.is_multimodal
         assert kv_indptr_buf is None
         assert kv_last_page_len_buf is None
-        self.num_wrappers = 2
-        self.dispatch_reason = None
-
-        # Qwen2/Qwen3 models require higher flashinfer workspace size
-        # if (
-        #     "Qwen2ForCausalLM" in model_runner.model_config.hf_config.architectures
-        #     or "Qwen3ForCausalLM" in model_runner.model_config.hf_config.architectures
-        #     or "MiMoForCausalLM" in model_runner.model_config.hf_config.architectures
-        # ):
-        #     global_config.flashinfer_workspace_size = 512 * 1024 * 1024
 
         # Allocate buffers
         global global_workspace_buffer
@@ -185,8 +105,8 @@ class VortexTRTLLMBackend(AttentionBackend):
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
-        # trtllm decode only supports Q/O bf16; KV in bf16 or fp8.
-        assert self.q_data_type == torch.bfloat16
+        # Q/O may be bf16 or fp8 (e4m3/e5m2); KV in bf16 or fp8.
+        assert self.q_data_type in [torch.bfloat16, torch.float8_e5m2, torch.float8_e4m3fn]
         assert self.data_type in [torch.bfloat16, torch.float8_e5m2, torch.float8_e4m3fn]
         self.is_fp8 = (self.data_type in [torch.float8_e5m2, torch.float8_e4m3fn])
         
@@ -357,10 +277,14 @@ class VortexTRTLLMBackend(AttentionBackend):
             device=model_runner.device,
         )
 
-        self.plan_decode = get_decode_planner(model_runner.server_args.vortex_schedule_policy)
+        self.plan_decode = get_decode_planner_trtllm(model_runner.server_args.vortex_schedule_policy)
         self.plan_prefill = get_prefill_planner()
         self.chunkwise_nh2hn_transpose = get_chunkwise_nh2hn_transpose()
         self.chunkwise_hn2nh_transpose = get_chunkwise_hn2nh_transpose()
+
+        # Tell the indexer / topk codegen which decode kernel layout to use.
+        # Must be set BEFORE _compile (ctx.create reads it).
+        model_runner.server_args.vortex_attention_backend = "trtllm"
 
         self.sparse_attention = model_runner.sparse_attention
         self.ctx = Context()
@@ -368,20 +292,23 @@ class VortexTRTLLMBackend(AttentionBackend):
         # Other metadata
         self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
         self.decode_cuda_graph_metadata: Dict[int, DecodeMetadata] = {}
-        self.plan_graph: Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.cuda.CUDAGraph]]
-    
+
+
 
     def _compile(self, model_runner: "ModelRunner") -> None:
         """Trace the sparse-attention indexer on zero-sized dummies and compile it."""
         device = model_runner.device
-        dtype = torch.bfloat16
+        dtype = self.q_data_type
         indexer = self.sparse_attention.forward_indexer
 
         self.ctx.create(self, model_runner)
-        # Expose trtllm seq_lens buffers to the indexer context. These are
-        # refreshed by csr_to_block_tables before each decode call.
+        # Expose trtllm seq_lens + block_tables buffers to the indexer context.
+        # The decode planner writes the dense slots and BOS/EOS of the sparse
+        # slots; the topk kernel fills the middle of ctx.sparse_block_tables.
         self.ctx.dense_seqlens = self.seq_lens_decode[0]
         self.ctx.sparse_seqlens = self.seq_lens_decode[1]
+        self.ctx.dense_block_tables = self.block_tables_decode[0]
+        self.ctx.sparse_block_tables = self.block_tables_decode[1]
         self.ctx.assert_created()
         self.ctx.profile()
 
@@ -430,6 +357,10 @@ class VortexTRTLLMBackend(AttentionBackend):
         if forward_batch.forward_mode.is_decode_or_idle():
 
             bs = len(forward_batch.req_pool_indices)
+            # plan_decode is the trtllm planner: it fills block_tables[0],
+            # seq_lens[0], and the BOS+EOS slots of block_tables[1] /
+            # seq_lens[1]. The topk kernel fills the middle of
+            # block_tables[1] later in forward_decode (sparse path).
             self.plan_decode(
                 cached_seq_lens=forward_batch.seq_lens.to(torch.int32),
                 req_to_token=self.req_to_token,
@@ -438,17 +369,6 @@ class VortexTRTLLMBackend(AttentionBackend):
             )
 
             eff_bs = bs * self.num_kv_heads
-            # Only the dense path (index 0) is filled here; the sparse path
-            # (index 1) is rewritten by the indexer + csr_to_block_tables
-            # inside forward_decode for every sparse layer.
-            csr_to_block_tables(
-                self.kv_indptr_decode[0][:eff_bs + 1],
-                self.kv_indices_decode[0],
-                self.kv_last_page_len_decode[:eff_bs],
-                self.block_tables_decode[0][:eff_bs],
-                self.seq_lens_decode[0][:eff_bs],
-                self.block_size,
-            )
 
             self.forward_metadata = DecodeMetadata(
                 block_tables=[
@@ -518,15 +438,6 @@ class VortexTRTLLMBackend(AttentionBackend):
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
         pass
-    
-    
-    def capture_plan_graph(
-        self, 
-        seq_lens: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-        bs: int):
-        
-        pass
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -541,6 +452,9 @@ class VortexTRTLLMBackend(AttentionBackend):
         assert bs == num_tokens
         
         if forward_mode.is_decode_or_idle():
+            # trtllm planner fills block_tables[0] / seq_lens[0] and the
+            # BOS+EOS slots of block_tables[1] / seq_lens[1]; topk fills
+            # the middle of path 1 inside forward_decode.
             self.plan_decode(
                 cached_seq_lens=seq_lens.to(torch.int32),
                 req_to_token=self.req_to_token,
@@ -549,15 +463,6 @@ class VortexTRTLLMBackend(AttentionBackend):
             )
 
             eff_bs = bs * self.num_kv_heads
-            # Path 1 (sparse) is filled lazily inside forward_decode.
-            csr_to_block_tables(
-                self.kv_indptr_decode[0][:eff_bs + 1],
-                self.kv_indices_decode[0],
-                self.kv_last_page_len_decode[:eff_bs],
-                self.block_tables_decode[0][:eff_bs],
-                self.seq_lens_decode[0][:eff_bs],
-                self.block_size,
-            )
 
             metadata = DecodeMetadata(
                 block_tables=[
@@ -589,23 +494,15 @@ class VortexTRTLLMBackend(AttentionBackend):
     ):
         assert forward_mode.is_decode_or_idle()
 
+        # trtllm planner fills block_tables[0] / seq_lens[0] and the BOS+EOS
+        # slots of block_tables[1] / seq_lens[1]; topk fills the middle of
+        # path 1 inside forward_decode.
         self.plan_decode(
                 cached_seq_lens=seq_lens.to(torch.int32),
                 req_to_token=self.req_to_token,
                 req_indices=req_pool_indices,
                 ctx=self.ctx
             )
-
-        eff_bs = bs * self.num_kv_heads
-        # Path 1 (sparse) is filled lazily inside forward_decode.
-        csr_to_block_tables(
-            self.kv_indptr_decode[0][:eff_bs + 1],
-            self.kv_indices_decode[0],
-            self.kv_last_page_len_decode[:eff_bs],
-            self.block_tables_decode[0][:eff_bs],
-            self.seq_lens_decode[0][:eff_bs],
-            self.block_size,
-        )
 
         self.forward_metadata = self.decode_cuda_graph_metadata[bs]
 
@@ -737,26 +634,15 @@ class VortexTRTLLMBackend(AttentionBackend):
             # Prepare Q in grouped shape expected by sparse path
             q = q.contiguous().view(-1, self.group_size, layer.head_dim)
 
-            # Indexer writes the per-(req, kv_head) selected block indices
-            # directly into the path-1 1D indices buffer.
+            # In trtllm mode the topk kernel writes the selected page ids
+            # directly into the 2D block_tables_decode[1]; BOS+EOS slots
+            # and seq_lens[1] were prefilled by plan_decode.
             self.compiled_indexer.forward(
                 q=q,
-                o=self.kv_indices_decode[1],
+                o=self.block_tables_decode[1],
                 cache=cache,
                 ctx=self.ctx,
             )
-
-            # Refresh block_tables[1] (and seq_lens[1]) from the new indices.
-            eff_bs = self.forward_metadata.bs
-            csr_to_block_tables(
-                self.kv_indptr_decode[1][:eff_bs + 1],
-                self.kv_indices_decode[1],
-                self.kv_last_page_len_decode[:eff_bs],
-                self.block_tables_decode[1][:eff_bs],
-                self.seq_lens_decode[1][:eff_bs],
-                self.block_size,
-            )
-
             o = trtllm_batch_decode_with_kv_cache(
                 query=q,
                 kv_cache=(cache_k, cache_v),
@@ -768,7 +654,6 @@ class VortexTRTLLMBackend(AttentionBackend):
                 bmm2_scale=bmm2_scale,
                 kv_layout="NHD",
             )
-
         else:
             # Dense attention path
             o = trtllm_batch_decode_with_kv_cache(

@@ -3,7 +3,7 @@ import sys
 import sglang as sgl
 from transformers import AutoTokenizer
 def main():
-    model_name = "Qwen/Qwen3-4B"
+    model_name = "Qwen/Qwen3-30B-A3B-FP8"
 
     default_policy = r"""
 const int static_kv_budget = topk_val + block_reserved_bos + block_reserved_eos;

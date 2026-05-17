@@ -57,6 +57,16 @@ then we interpret external auguments to the physical address
 
 class VortexCachePool(KVCache):
 
+    # Vortex stores K/V in a block-interleaved layout (see
+    # vortex_torch/cache/triton_kernels/set_kv.py — position is mapped to
+    # ``(token//page) * (page * num_kv_head) + head * page + token%page``).
+    # The fused-set-kv-buffer kernel that ships with sglang assumes the
+    # standard token-major layout and would silently corrupt this pool,
+    # producing 0% accuracy or illegal-memory-access in models that route
+    # KV writes through fused RoPE (e.g. Qwen3-MoE). Opt out so
+    # ``models/utils.py::enable_fused_set_kv_buffer`` returns False here.
+    supports_fused_set_kv_buffer = False
+
     def __init__(
         self,
         size: int,

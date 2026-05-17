@@ -116,7 +116,7 @@ class VortexFlashInferBackend(AttentionBackend):
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.decode_use_tensor_cores = should_use_tensor_core(self.data_type, self.num_qo_heads, self.num_kv_heads)
-        assert self.q_data_type == torch.bfloat16
+        assert self.q_data_type in [torch.bfloat16, torch.float8_e5m2, torch.float8_e4m3fn]
         assert self.data_type in [torch.bfloat16, torch.float8_e5m2, torch.float8_e4m3fn]
         self.is_fp8 = (self.data_type in [torch.float8_e5m2, torch.float8_e4m3fn])
         
@@ -274,7 +274,7 @@ class VortexFlashInferBackend(AttentionBackend):
     def _compile(self, model_runner: "ModelRunner") -> None:
         """Trace the sparse-attention indexer on zero-sized dummies and compile it."""
         device = model_runner.device
-        dtype = torch.bfloat16
+        dtype = self.q_data_type
         indexer = self.sparse_attention.forward_indexer
 
         self.ctx.create(self, model_runner)

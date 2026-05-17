@@ -12,7 +12,9 @@ from lighteval.models.model_output import ModelResponse
 from datasets import load_dataset, Dataset, concatenate_datasets
 import argparse
 import json
+import math
 import os
+from collections import defaultdict
 from datetime import datetime
 def verify_algos(
 trials: int = 2,
@@ -42,6 +44,7 @@ kv_cache_dtype: str = "auto"
                     kv_cache_dtype=kv_cache_dtype,
                     disable_overlap_schedule=True,
                     attention_backend="flashinfer",
+                    vortex_attention_backend="trtllm",
                     enable_vortex_sparsity=sparse_attention,
                     vortex_block_reserved_bos=1,
                     vortex_block_reserved_eos=2,
@@ -100,6 +103,7 @@ kv_cache_dtype: str = "auto"
     e2e_time = 0
     count = 0
     unique_result = {}
+    per_question_scores = defaultdict(list)
 
     for item in results:
         total_accuracy += item['score']
@@ -110,14 +114,34 @@ kv_cache_dtype: str = "auto"
             unique_result[item['query']] = item["score"]
         else:
             unique_result[item['query']] = max(item["score"], unique_result[item['query']])
+        per_question_scores[item['query']].append(item['score'])
 
+    def pass_at_k(n: int, c: int, k: int) -> float:
+        """Unbiased pass@k estimator: 1 - C(n-c, k) / C(n, k)."""
+        if k > n:
+            return float('nan')
+        if n - c < k:
+            return 1.0
+        return 1.0 - math.comb(n - c, k) / math.comb(n, k)
+
+    pass_at_k_summary = {}
+    for k in (4, 8):
+        vals = []
+        for scores in per_question_scores.values():
+            n = len(scores)
+            c = sum(1 for s in scores if s > 0.5)
+            if k <= n:
+                vals.append(pass_at_k(n, c, k))
+        if vals:
+            pass_at_k_summary[f'pass@{k}'] = sum(vals) / len(vals)
 
     global_summary = {
         f'mean@{trials}': total_accuracy / count if count > 0 else 0,
         f'pass@{trials}': sum(unique_result.values()) / len(unique_result),
+        **pass_at_k_summary,
         'total_example': count,
         "e2e_time": e2e_time,
-        "total_tokens": total_tokens, 
+        "total_tokens": total_tokens,
         "throughput": total_tokens / e2e_time,
     }
     

@@ -105,12 +105,25 @@ class WeightsMapper:
 
 
 def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
-    """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache."""
+    """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache.
+
+    The fused-set-kv-buffer kernel (invoked from inside fused RoPE) writes K/V
+    directly into ``token_to_kv_pool.get_{key,value}_buffer(layer_id).view(num_tokens, -1)``
+    using the standard SGLang token-major layout. KV pools that store K/V in a
+    different physical layout (e.g. vortex's block-interleaved layout in
+    ``VortexCachePool``) MUST opt out, or the cache silently corrupts —
+    decode then reads from the wrong addresses and either returns garbage
+    (≈0% accuracy) or trips a CUDA illegal-memory-access. Such pools set
+    ``supports_fused_set_kv_buffer = False`` on themselves.
+    """
     return (
         _is_cuda
         and hasattr(forward_batch.token_to_kv_pool, "dtype")
         and forward_batch.token_to_kv_pool.dtype == torch.bfloat16
         and not isinstance(forward_batch.token_to_kv_pool, SWAKVPool)
+        and getattr(
+            forward_batch.token_to_kv_pool, "supports_fused_set_kv_buffer", True
+        )
     )
 
 

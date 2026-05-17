@@ -32,6 +32,10 @@ def create_flashinfer_backend(runner):
             elif runner.server_args.vortex_attention_backend == "trtllm":
                 from vortex_torch.engine.sgl.attention_backend import VortexTRTLLMBackend
                 return VortexTRTLLMBackend(runner)
+            else:
+                raise ValueError(
+                    f"Unsupported vortex attention backend {runner.server_args.vortex_attention_backend} for sparse attention. Supported backends are: flashinfer, trtllm."
+                )
         else:
             from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 

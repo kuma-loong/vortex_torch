@@ -209,37 +209,65 @@ _K96_WINNER_CONFIG = _HERE / "k_96" / "configs" / "claude_opus_4_7" / "batch_16_
 _K128_WINNER_CONFIG = _HERE / "k_128" / "configs" / "claude_opus_4_7" / "batch_10_id2.json"
 _RADIX_WINNER_CONFIG = _HERE / "k_256" / "configs" / "claude_opus_4_7" / "batch_24_id1.json"
 _SORT_BASELINE_CONFIG = _HERE / "configs" / "sort_default.json"
+
+# trtllm variants (2D block_tables instead of CSR indices). Only the radix
+# winner and the CUB-sort baseline have trtllm builds — k_96 / k_128 fall
+# back to the radix winner in trtllm mode.
+_RADIX_WINNER_CONFIG_TRTLLM = _HERE / "k_256" / "configs" / "claude_opus_4_7" / "batch_24_id1_trtllm.json"
+_SORT_BASELINE_CONFIG_TRTLLM = _HERE / "configs" / "sort_default_trtllm.json"
+
 _K96_WINNER_MAX_TOPK = 96
 _K128_WINNER_MAX_TOPK = 128
 _RADIX_WINNER_MAX_TOPK = 256
 
 
-def dispatch(max_topk: Optional[int] = None, *, verbose: bool = True):
-    """Pick the best-known top-k kernel for ``max_topk`` and return its callable.
+def dispatch(
+    max_topk: Optional[int] = None,
+    *,
+    attention_backend: str = "flashinfer",
+    verbose: bool = True,
+):
+    """Pick the best-known top-k kernel for ``(max_topk, attention_backend)``
+    and return its callable.
 
-      - ``max_topk <= 96`` → ``k_96/configs/claude_opus_4_7/batch_16_id3.json``
-        (radix winner: T=512, smem=4KB, x³ transform, adaptive_approx_skip
-        with TOLERATE=10). Geomean 1.6227x vs CUB baseline with
-        non-clustered R@96 ≥ 0.97.
-      - ``96 < max_topk <= 128`` → ``k_128/configs/claude_opus_4_7/batch_10_id2.json``
-        (radix winner: T=512, smem=3KB, signed x⁴ transform,
-        adaptive_approx_skip with TOLERATE=14, MAX_ITERS=3). Geomean
-        1.6468x vs CUB baseline with non-clustered R@128 ≥ 0.97.
-      - ``128 < max_topk <= 256`` → ``k_256/configs/claude_opus_4_7/batch_24_id1.json``
-        (radix winner: T=512, smem=8KB, x*|x| transform).
-      - ``max_topk > 256`` or ``max_topk is None`` → ``configs/sort_default.json``
-        (CUB ``BlockRadixSort`` baseline; supports any k).
+    ``attention_backend == "flashinfer"`` (default; CSR ``kv_indices``):
+      - ``max_topk <= 96`` → k_96 winner.
+      - ``96 < max_topk <= 128`` → k_128 winner.
+      - ``128 < max_topk <= 256`` → k_256 radix winner.
+      - else / ``None`` → CUB sort baseline.
 
-    The returned callable has the entry-point signature documented at
-    the top of this module. Modules are JIT-compiled on first hit and
-    cached, so repeated ``dispatch`` calls are free of recompile overhead.
+    ``attention_backend == "trtllm"`` (2D ``block_tables``):
+      - ``max_topk <= 256`` → k_256 radix winner *trtllm* build.
+      - else / ``None`` → CUB sort baseline *trtllm* build.
+
+    The returned callable's C signature is identical across backends — the
+    4th / 5th tensor arguments and the last int argument carry different
+    semantics in trtllm mode (``dense_block_tables`` / ``sparse_block_tables``
+    / row stride ``max_blocks_per_seq``). The caller (the indexer codegen)
+    is responsible for passing the right tensors.
+
+    Modules are JIT-compiled on first hit and cached.
     """
-    if max_topk is not None and max_topk <= _K96_WINNER_MAX_TOPK:
-        cfg = _K96_WINNER_CONFIG
-    elif max_topk is not None and max_topk <= _K128_WINNER_MAX_TOPK:
-        cfg = _K128_WINNER_CONFIG
-    elif max_topk is not None and max_topk <= _RADIX_WINNER_MAX_TOPK:
-        cfg = _RADIX_WINNER_CONFIG
+    backend = (attention_backend or "flashinfer").lower()
+
+    if backend == "trtllm":
+        if max_topk is not None and max_topk <= _RADIX_WINNER_MAX_TOPK:
+            cfg = _RADIX_WINNER_CONFIG_TRTLLM
+        else:
+            cfg = _SORT_BASELINE_CONFIG_TRTLLM
+    elif backend == "flashinfer":
+        if max_topk is not None and max_topk <= _K96_WINNER_MAX_TOPK:
+            cfg = _K96_WINNER_CONFIG
+        elif max_topk is not None and max_topk <= _K128_WINNER_MAX_TOPK:
+            cfg = _K128_WINNER_CONFIG
+        elif max_topk is not None and max_topk <= _RADIX_WINNER_MAX_TOPK:
+            cfg = _RADIX_WINNER_CONFIG
+        else:
+            cfg = _SORT_BASELINE_CONFIG
     else:
-        cfg = _SORT_BASELINE_CONFIG
+        raise ValueError(
+            f"topk dispatch: unknown attention_backend {attention_backend!r}; "
+            f"expected 'flashinfer' or 'trtllm'"
+        )
+
     return load_submission(cfg, verbose=verbose).topk
