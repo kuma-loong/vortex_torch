@@ -1484,6 +1484,124 @@ checks:
 
 Raises `EngineConfigError` with a focused message on first failure.
 
+### 15.3 `_flow_algorithms_test` — standard end-to-end RULER suite
+
+The two tools above (`verify_flow_compilable`, `check_engine_config`)
+only prove that the compiler accepts a flow. They do **not** prove the
+emitted kernel produces correct decode output. Whenever you touch any
+of the following, run the standard suite below:
+
+  * the indexer / cache compiler (`indexer/compiler/`,
+    `cache/compiler/`) — codegen, graph construction, scheduling, the
+    `Schedule.W` / `Schedule.S` split,
+  * the planner (`planner_sglang.py`) or any `winfo_*` field,
+  * the sglang integration (`engine/sgl/attention_backend/*`),
+  * any op's `output_shape` / `output_format` / `profile()` logic,
+  * any backend-conditional snippet in `indexer/compiler/backend.py`
+    (the `IndexerBackend` traits used by both `flashinfer` and
+    `trtllm`).
+
+The suite covers **eight reference flows** under
+`submissions/_flow_algorithms_test/`, one per `@register` class in
+`vortex_torch/flow/algorithms.py`:
+
+| Algorithm | Notable surface it exercises |
+|---|---|
+| `block_sparse_attention`          | Baseline `topK` flow; minimum compile path. |
+| `gqa_block_sparse_attention`      | GQA aggregation (head-group mean). |
+| `gqa_quest_sparse_attention`      | GQA + quest-style max/min pages, multi-tensor PAGED loads. |
+| `lserve_sparse_attention`         | Static + dynamic budget interaction. |
+| `masked_quest_sparse_attention`   | `MaskSlice` on top of quest scoring. |
+| `centered_block_sparse_attention` | Per-(batch, kv_head) cross-row `Reduce(dim=0)` — the **only** `Schedule.S` reduce in the suite, hits `custom_impl/reduce_dim0.py`. |
+| `running_avg_block_sparse`        | `Save`+`Load` round-trip — forces `disable_radix_cache: true`. |
+| `venergy_gated_centroid`          | Centroid-style flow with elementwise gating. |
+
+Why each flow lives in its own file (not just one
+`@register(...)` per class in `flow/algorithms.py`):
+`engine/sgl._check_disable_radix_cache` does a **text scan** of
+`vortex_module_path`. If all eight pointed at
+`vortex_torch/flow/algorithms.py` (which contains the `Save(...)` site
+inside `RunningAvgBlockSparse`), the scan would force
+`disable_radix_cache: true` on every algorithm — incorrect for the
+seven that don't use Save/Load, and a measurable throughput hit. Each
+algorithm therefore lives in its own file under
+`submissions/_flow_algorithms_test/<algo>.py` with a `_sub`-suffixed
+`@register` name (sglang auto-imports `flow.algorithms` at startup, so
+re-registering the same name would collide).
+
+#### How to run
+
+```bash
+# 1. Cheap CPU pre-flight first (catches schema + compile errors).
+for cfg in submissions/_flow_algorithms_test/*.json; do
+  python -c "from vortex_torch.engine.sgl import check_engine_config; \
+             check_engine_config('$cfg')"
+done
+
+# 2. RULER on examples/validation.jsonl. Wave size ≤ 4 — 5+ sglang
+#    engines booting on the same host hit startup contention that
+#    inflates the per-run e2e and skews throughput. A 5 s stagger
+#    between launches inside a wave further reduces the spike.
+FREE_GPUS=( $(algorithm_scientist/free_gpus.sh) )
+PARALLEL=${#FREE_GPUS[@]}
+[ "$PARALLEL" -gt 4 ] && PARALLEL=4
+CFGS=( submissions/_flow_algorithms_test/*.json )
+for start in $(seq 0 $PARALLEL $((${#CFGS[@]} - 1))); do
+  end=$((start + PARALLEL)); [ "$end" -gt "${#CFGS[@]}" ] && end=${#CFGS[@]}
+  for i in $(seq $start $((end - 1))); do
+    cfg="${CFGS[$i]}"
+    gpu="${FREE_GPUS[$((i - start))]}"
+    CUDA_VISIBLE_DEVICES=$gpu \
+      python algorithm_scientist/run_ruler.py --config "$cfg" &
+    sleep 5
+  done
+  wait
+done
+```
+
+Each run writes `summary_ruler_submissions/_flow_algorithms_test/<algo>/latest.json`.
+
+#### Pass criteria
+
+The reference numbers live in
+[`vortex_torch/flow/ALGORITHMS_RESULTS.md`](../../vortex_torch/flow/ALGORITHMS_RESULTS.md).
+Treat them as a regression baseline:
+
+| Signal | Pass | Investigate |
+|---|---|---|
+| **Pre-flight (all 8)** | every config compiles | any `EngineConfigError` |
+| **RULER accuracy** | ≥ **0.97** for the 0.98-baseline rows (`block_sparse_attention`, `centered_block_sparse_attention`), ≥ **0.99** for the 1.00-baseline rows | accuracy drop ≥ 0.02 below the noted baseline |
+| **Throughput** | within ±10 % of the recorded number (on this host; see contention note) | drop ≥ 15 % on a config that wasn't in a contended wave |
+| **Backend coverage** | both `flashinfer` and `trtllm` produce the same accuracy bucket; trtllm typically +3-8 % faster on this workload | accuracy diverges between backends, or trtllm regresses below flashinfer |
+
+When investigating an accuracy regression, look at the per-algorithm
+generated module under `~/.vortex_compilation_cache/` (or the temp dir
+printed by `check_engine_config`) and walk through
+[§18 Reading a generated kernel](#18-reading-a-generated-kernel).
+
+#### Why this suite is the right thing to run
+
+The eight flows were chosen so that, between them, they touch every
+moving part of the compiler that a refactor is likely to break:
+
+  * Schedule.W vs Schedule.S dispatch (`indexer/compiler/impl.py`,
+    `triton_impl/register.py`, `cuda_impl/register.py`,
+    `custom_impl/register.py`).
+  * Every `IndexerBackend` field — `indices_src`,
+    `per_row_kernel_param`, `start_and_count_snippet`,
+    `topk_per_row_args`, `topk_trailing_args`,
+    `extra_kernel_constexpr_args`, `extra_launcher_args`.
+  * PAGED single-page **and** multi-page load/store paths.
+  * BATCHED outputs with the `_is_first_workload` gate.
+  * RAGGED → BATCHED `Reduce(dim=0)` (the cross-row form).
+  * `Save` / `Load` of per-request state and the
+    `disable_radix_cache` enforcement.
+  * FP8 `kv_cache_dtype` plumbing (set `kv_cache_dtype: "fp8_e4m3"`
+    in one config when stress-testing the dtype-cast helpers).
+
+A green run on all eight, on both backends, is the closest thing
+this repo has to a "the compiler is healthy" signal.
+
 ---
 
 ## 16. Extending the framework

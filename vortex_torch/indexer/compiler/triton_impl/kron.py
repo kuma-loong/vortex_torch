@@ -84,16 +84,40 @@ def generate_kron_impl(graph: Graph, op_id: int, ctx: Context) -> str:
     Wy = _block_leading_dim(t_y, ctx)
     Wo = _block_leading_dim(t_o, ctx)
 
+    # ``tl.reshape`` axis sizes must be pow2. Loaded blocks already carry
+    # *padded* inner dims (see :mod:`kernel_gen`), so the reshape
+    # targets and the output extent are all computed from
+    # ``padded_shape`` here. The padded extent only matches
+    # ``next_pow2(sx * sy)`` on Kron axes when at most one operand has
+    # a non-pow2 size on that axis (then ``next_pow2(sx) * next_pow2(sy)
+    # == next_pow2(sx * sy)``). Block the both-sides-padded case
+    # explicitly — it would need an inter-block repack we haven't
+    # implemented.
+    for axis in (1, 2):
+        if axis in op.dim:
+            sx_pad = t_x.padded_shape[axis] != t_x.shape[axis]
+            sy_pad = t_y.padded_shape[axis] != t_y.shape[axis]
+            assert not (sx_pad and sy_pad), (
+                f"Kron on axis {axis} with both operands needing padding "
+                f"is not supported (x={t_x.shape!r}, y={t_y.shape!r})."
+            )
+
     # Build per-input reshape targets and the output shape, axis by axis.
     # Each Kron axis contributes a (size_x, 1) pair to ``shape_x`` and a
     # (1, size_y) pair to ``shape_y`` so the broadcast multiply realizes
     # the outer product. Non-Kron axes pass through.
+    #
+    # All inner sizes are read from ``padded_shape``: that's what the
+    # loaded blocks actually carry. Padded lanes are zero (from the
+    # masked load in :mod:`kernel_gen`), and zero * anything = zero, so
+    # the outer-product semantics are preserved — those lanes are then
+    # masked out by the inner-dim store mask on the way back to memory.
     shape_x: List[int] = [Wx]
     shape_y: List[int] = [Wy]
     shape_o: List[int] = [Wo]
 
     for axis in (1, 2):
-        sx, sy = t_x.shape[axis], t_y.shape[axis]
+        sx, sy = t_x.padded_shape[axis], t_y.padded_shape[axis]
         if axis in op.dim:
             shape_x.extend([sx, 1])
             shape_y.extend([1, sy])

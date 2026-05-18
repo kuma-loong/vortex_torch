@@ -1,8 +1,17 @@
+"""Schedule.S topk / approxTopK / block-table TopK / Union codegen.
+
+Backend-agnostic launcher emitters. The underlying kernel is resolved at
+runtime via :func:`vortex_torch.custom_ops.find` — these generators just
+emit the Python call site against the resolved callable. They have no
+dependency on the Schedule.W fused kernel (Triton-emitted or CUDA-emitted),
+so they live under ``custom_impl`` and are dispatched from
+``indexer/compiler/impl.py`` regardless of which backend handles W.
+"""
 from ..graph import Graph
 from ...context import Context
 from ....abs import FORMAT
 from ....utils import INDENT
-from .backend import get_backend
+from ..backend import get_backend
 
 
 def _check_topk_io(graph: Graph, op_id: int) -> tuple[int, int]:
@@ -30,7 +39,7 @@ def generate_topk_impl(graph: Graph, op_id: int, ctx: Context) -> str:
     #                sparse_block_tables, eff_bs, bos, eos,
     #                max_blocks_per_seq, block_size)  ← indptr-free
     # All backend-specific tensor/scalar choices come from
-    # :mod:`triton_impl.backend`. The runtime kernel resolution goes
+    # :mod:`indexer.compiler.backend`. The runtime kernel resolution goes
     # through :func:`vortex_torch.custom_ops.find` — bucket selection
     # picks the right ``k_<N>`` / ``default`` leaf for the JIT-compiled
     # extension.

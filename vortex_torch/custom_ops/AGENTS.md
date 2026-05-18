@@ -140,6 +140,48 @@ Drop:
 Register the op in the compiler's launcher emitter as needed (see
 `vortex_torch/indexer/compiler/triton_impl/`).
 
+## `padded_shape` support
+
+`vTensor` carries both `shape` (real) and `padded_shape` (each inner
+dim rounded up to the next power of two — required by Triton
+`tl.arange` / tile-shape constexprs). Whether a custom op supports
+non-pow2 inner dims depends on whether its kernel splits the two:
+
+| op | backend | supports `padded_shape != shape`? | how |
+|---|---|---|---|
+| `softmax` | flashinfer, trtllm | **yes** | separate `x_D0`/`x_D0_PAD` constexprs + `NEEDS_INNER_MASK` constexpr branch: padded lanes load `-inf`, store is mask-suppressed |
+| `normalize` | flashinfer, trtllm | **yes** | same pattern; padded lanes load `0.0` so they contribute nothing to the L2 sum |
+| `conv_1d` | flashinfer, trtllm | **yes** | same pattern; both the input slab and the `[K, D0, D1]` weight tile carry the inner-dim mask, padded lanes load `0.0` |
+| `reduce_dim0` | flashinfer, trtllm | **yes** | same pattern across all five variants. Padded lanes load the reduction identity: `0.0` (sum/mean/l2norm), `-inf` (max), `+inf` (min). Store also masks the inner lanes so the BATCHED output's padded slots are untouched |
+| `topk_output`, `topk`, `union` | flashinfer, trtllm | n/a | CUDA leaves: no Triton block-shape constexprs, so the pow2 constraint doesn't apply |
+
+**No-mask fast-path.** Triton-side leaves that *do* support padded
+shapes must branch on a `NEEDS_INNER_MASK: tl.constexpr` flag (e.g.
+`(x_D0_PAD != x_D0) or (x_D1_PAD != x_D1)`) and skip the inner-dim
+mask in the `tl.load` / `tl.store` calls when it is False. Triton
+specializes the kernel per constexpr value, so the unpadded path
+incurs zero overhead — only the per-block `p_mask` remains. Pow2-shape
+models therefore pay nothing for padded-shape support.
+
+**Extending a new op (template).** Mirror any of the existing
+Triton leaves:
+
+1. In the kernel, add `x_D0_PAD` / `x_D1_PAD` constexprs alongside
+   the existing `x_D0` / `x_D1`.
+2. Replace every `tl.arange(0, x_D0)` with `tl.arange(0, x_D0_PAD)`
+   and likewise for `tl.zeros` / `tl.full` shape constexprs.
+3. Introduce `NEEDS_INNER_MASK: tl.constexpr = (x_D0_PAD != x_D0) or (x_D1_PAD != x_D1)`
+   and branch the load/store mask on it. Padded lanes must load the
+   reduction *identity* for the op (`0.0` for sum/mean/L2/normalize/
+   conv-input, `-inf` for softmax/max, `+inf` for min) so they don't
+   contaminate the result.
+4. If the op writes to BATCHED storage (real-shape `[eff_bs, D0, D1]`),
+   mask the store too so the padded inner lanes aren't written.
+5. In the launcher emitter under
+   `vortex_torch/indexer/compiler/custom_impl/<op>.py`, pass
+   `t_i.padded_shape[1]` / `[2]` right after the existing real-shape
+   args.
+
 ## Where to look first
 
   * **What does this op do?** → `<op>/SPEC.md`

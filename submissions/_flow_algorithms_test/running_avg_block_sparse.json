@@ -1,5 +1,5 @@
 {
-  "vortex_attention_backend": "flashinfer",
+  "vortex_attention_backend": "trtllm",
   "vortex_block_size": 16,
   "vortex_topk_val": 29,
   "vortex_topk_ratio": 0.0625,

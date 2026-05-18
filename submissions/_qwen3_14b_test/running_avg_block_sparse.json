@@ -9,8 +9,10 @@
   "vortex_layers_skip": [
     0
   ],
-  "vortex_module_path": "submissions/_flow_algorithms_test/gqa_quest_sparse_attention.py",
+  "vortex_module_path": "submissions/_flow_algorithms_test/running_avg_block_sparse.py",
   "kv_cache_dtype": "auto",
   "mem_fraction_static": 0.8,
-  "vortex_module_name": "gqa_quest_sparse_attention_sub"
+  "vortex_module_name": "running_avg_block_sparse_sub",
+  "disable_radix_cache": true,
+  "model_path": "/raid/catalyst/models/Qwen3-14B"
 }

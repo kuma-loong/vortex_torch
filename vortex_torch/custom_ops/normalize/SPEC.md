@@ -19,8 +19,10 @@ launch(
     bos,         # int
     eos,         # int
     topk_val,    # int
-    D0,          # int, x.shape[-2]
-    D1,          # int, x.shape[-1]
+    D0,          # int, x.shape[-2]   (real, used for strides)
+    D1,          # int, x.shape[-1]   (real, used for strides)
+    D0_PAD,      # int, x.padded_shape[-2]   (pow2, tile constexpr)
+    D1_PAD,      # int, x.padded_shape[-1]   (pow2, tile constexpr)
     eff_batch_size,   # int = batch * num_kv_heads  -- grid size
 )
 ```
@@ -32,12 +34,20 @@ launch(
     x, out,
     seqlens,             # [eff_bs] int32, tokens per row
     bos, eos, topk_val,
-    D0, D1,
+    D0, D1, D0_PAD, D1_PAD,
     block_size,
     max_blocks_per_seq,
     eff_batch_size,
 )
 ```
+
+## `padded_shape` support
+
+Same pattern as `softmax`: `D0`/`D1` are the real (stride) sizes;
+`D0_PAD`/`D1_PAD` are the pow2 round-ups used by `tl.arange` and
+tile-shape constexprs. Padded lanes load `0.0` so they contribute zero
+to the squared sum, and the store mask suppresses writes to them. When
+`shape == padded_shape` Triton specialises the unmasked branch.
 
 ## I/O contract
 

@@ -34,12 +34,16 @@ def generate_mask_slice_impl(graph: Graph, op_id: int, ctx: Context) -> str:
     t_i = graph.tensor_list[input_tensor_id]
     y = f"tensor_{output_tensor_id}_block"
 
-    # Workload blocks are 3D: [workload_chunk_size, D_0, D_1].
+    # Workload blocks are 3D: [workload_chunk_size, padded_D_0, padded_D_1].
+    # ``tl.arange`` constexpr must be pow2 → use the padded length. The
+    # mask is purely positional so trailing padded lanes still hold
+    # ``op.beta`` (or whatever the false branch is); store-side codegen
+    # masks them out via the inner-dim padding mask in ``kernel_gen``.
     if op.dim == 1:
-        size = t_i.shape[1]
+        size = t_i.padded_shape[1]
         broadcast = "[None, :, None]"
     else:  # op.dim == 2, enforced in profile
-        size = t_i.shape[2]
+        size = t_i.padded_shape[2]
         broadcast = "[None, None, :]"
 
     idx = f"_mask_idx_{op_id}"

@@ -17,8 +17,10 @@ launch(
     out,         # BATCHED [eff_bs, D0, D1]
     indptr,      # [eff_bs + 1] int32
     bos, eos,
-    D0,          # int, x.shape[-2]
-    D1,          # int, x.shape[-1]
+    D0,          # int, x.shape[-2]   (real, used for strides)
+    D1,          # int, x.shape[-1]   (real, used for strides)
+    D0_PAD,      # int, x.padded_shape[-2]   (pow2, tile constexpr)
+    D1_PAD,      # int, x.padded_shape[-1]   (pow2, tile constexpr)
     eff_batch_size,
 )
 ```
@@ -30,7 +32,7 @@ launch(
     x, out,
     seqlens,             # [eff_bs] int32
     bos, eos,
-    D0, D1,
+    D0, D1, D0_PAD, D1_PAD,
     block_size,
     max_blocks_per_seq,
     eff_batch_size,
@@ -38,6 +40,14 @@ launch(
 ```
 
 Note: no `topk_val` arg (unlike softmax/normalize/conv_1d).
+
+## `padded_shape` support
+
+Same `D0_PAD`/`D1_PAD` split as the other Triton leaves. Padded lanes
+load the reduction *identity*: `0.0` (sum/mean/l2norm), `-inf` (max),
+`+inf` (min). The BATCHED output is stored at real shape, so the store
+also masks the inner lanes to keep the padded slots untouched. The
+unmasked branch is auto-selected when `shape == padded_shape`.
 
 ## I/O contract
 

@@ -23,4 +23,11 @@ def generate_fill_impl(graph: Graph, op_id: int, ctx: Context) -> str:
     a = float(op.alpha)
 
     # Emit an fp32 block of shape (D0, D1) filled with alpha.
-    return f"{z} = tl.full(({t_o.shape[1]}, {t_o.shape[2]}), {a}, dtype=tl.float32)"
+    # ``tl.full`` block-shape constexprs must be pow2 → emit the padded
+    # dims. Padded lanes hold the same value as real lanes; the
+    # surrounding store masks out the trailing padded lanes so they
+    # never land in memory.
+    return (
+        f"{z} = tl.full(({t_o.padded_shape[1]}, {t_o.padded_shape[2]}), "
+        f"{a}, dtype=tl.float32)"
+    )

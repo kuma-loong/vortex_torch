@@ -44,4 +44,15 @@ def generate_reshape_impl(graph: Graph, op_id: int, ctx: Context) -> str:
         f"input format {t_x._format} -> output format {t_o._format}"
     )
 
+    # ``tl.reshape`` block sizes must be pow2 → use the *output*
+    # tensor's padded inner dims. Same-numel is enforced at profile
+    # time, but only against real shapes; reshape under padding is
+    # not yet covered (would need an inter-block repack). Assert
+    # against silent miscompiles in case a flow tries it.
+    assert not (t_x.needs_padding() or t_o.needs_padding()), (
+        f"Reshape under non-pow2 inner dims is not yet supported "
+        f"(input {t_x.shape!r}, output {t_o.shape!r}). Round the "
+        f"reshape target so x2*y2 lands at pow2 inner sizes, or "
+        f"split the op."
+    )
     return f"{y} = tl.reshape({x}, ({Wo}, {op.x2}, {op.y2}))"

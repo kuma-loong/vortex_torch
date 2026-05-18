@@ -73,5 +73,23 @@ shape/dtype-specialised leaves should constrain on:
 | `dtype` | `in` | input dtype (`"bfloat16"`, `"float16"`, `"float32"`) |
 | `block_size` | `eq` | trtllm-only; constexpr block size |
 
+## `padded_shape` support
+
+The launcher passes both real (`shape[1]`, `shape[2]`) and pow2-padded
+(`padded_shape[1]`, `padded_shape[2]`) inner sizes. Inside the kernel:
+
+  * `tl.arange` / accumulator tile shapes use `x_D0_PAD` / `x_D1_PAD`
+    (must be pow2).
+  * Memory strides use the real `x_D0` / `x_D1`.
+  * A `NEEDS_INNER_MASK: tl.constexpr` branch (set when
+    `*_PAD != *`) decides whether the per-block `p_mask` is AND'd
+    with the inner-dim validity mask. **When `shape == padded_shape`,
+    Triton specializes the unmasked branch — no inner-dim mask is
+    computed and `tl.load` / `tl.store` see only `p_mask`.**
+
+All Triton leaves (`softmax`, `normalize`, `conv_1d`, `reduce_dim0`)
+now follow this pattern. See `custom_ops/AGENTS.md § padded_shape
+support` for the support matrix and per-op identity values.
+
 Constraint precedence (most-specific wins; ties by `priority` desc)
 is defined in `custom_ops/_dispatch_match.py`.

@@ -3,7 +3,7 @@
 Triton-codegen op (no standalone `.cu` file). The kernel string is
 emitted at compile time by the codegen function in
 [`vortex_torch/indexer/compiler/triton_impl/normalize.py`](../../../../vortex_torch/indexer/compiler/triton_impl/normalize.py), which calls into
-`compiler.triton_impl.backend.get_backend(ctx)` to pick the
+`compiler.backend.get_backend(ctx)` to pick the
 backend-specific snippet (per-row arg name, base-address arithmetic,
 extra constexpr args).
 

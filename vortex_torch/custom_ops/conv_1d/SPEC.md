@@ -19,8 +19,10 @@ launch(
     indptr,      # [eff_bs + 1] int32
     bos, eos, topk_val,
     K,           # int, weight.shape[0]
-    D0,          # int, x.shape[-2]
-    D1,          # int, x.shape[-1]
+    D0,          # int, x.shape[-2]   (real, used for strides)
+    D1,          # int, x.shape[-1]   (real, used for strides)
+    D0_PAD,      # int, x.padded_shape[-2]   (pow2, tile constexpr)
+    D1_PAD,      # int, x.padded_shape[-1]   (pow2, tile constexpr)
     eff_batch_size,
 )
 ```
@@ -32,7 +34,7 @@ launch(
     x, out, weight,
     seqlens,             # [eff_bs] int32, tokens per row
     bos, eos, topk_val,
-    K, D0, D1,
+    K, D0, D1, D0_PAD, D1_PAD,
     block_size,
     max_blocks_per_seq,
     eff_batch_size,
@@ -44,6 +46,14 @@ launch(
 `weight.dtype` may differ from `x.dtype` — the kernel upcasts both to
 fp32 for the multiply-accumulate, then casts the result back to
 `x.dtype` on store. `K` is constexpr inside the kernel.
+
+## `padded_shape` support
+
+Same `D0_PAD`/`D1_PAD` split as `softmax`/`normalize`. The
+`[K, D0, D1]` weight tensor is stored at real shape, so the kernel
+also masks the weight load (padded lanes → `0.0`) in addition to the
+input slab and output store. The unmasked branch is auto-selected
+when `shape == padded_shape`.
 
 ## Constraints (matcher kwargs)
 

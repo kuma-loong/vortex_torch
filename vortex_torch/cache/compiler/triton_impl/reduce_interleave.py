@@ -33,9 +33,19 @@ def generate_reduce_interleave_impl(graph: Graph, op_id: int, ctx: Context) -> s
     )
 
     t_i = graph.tensor_list[input_tensor_id]
+    t_o = graph.tensor_list[output_tensor_id]
     x = f"tensor_{input_tensor_id}_block"
     y = f"tensor_{output_tensor_id}_block"
 
+    # ``tl.reshape`` axis sizes must be pow2; the loaded block carries
+    # padded inner dims, so the (D0/k, k, D1) split must use the padded
+    # extents. Real-shape divisibility against ``k`` is still the
+    # correctness contract — generic non-pow2-divisible-by-k inputs
+    # require an inter-block repack we haven't implemented.
+    assert not (t_i.needs_padding() or t_o.needs_padding()), (
+        f"ReduceInterleave under non-pow2 inner dims is not yet supported "
+        f"(input {t_i.shape!r}, output {t_o.shape!r})."
+    )
     D0, D1 = t_i.shape[1], t_i.shape[2]
     k = op.k
 

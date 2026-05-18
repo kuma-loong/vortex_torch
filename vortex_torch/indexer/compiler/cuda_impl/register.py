@@ -1,35 +1,16 @@
 """Registry of ``(op_class, Schedule) -> codegen-function`` for CUDA.
 
-Mirrors :mod:`vortex_torch.indexer.compiler.triton_impl.register` — the
-schedule is part of the key so the same op class can have different
-generators for ``Schedule.W`` (fused inline) and ``Schedule.S``
-(standalone kernel).
+Schedule.W only — these generators are inlined into the per-block fused
+kernel emitted by :func:`cuda_impl.kernel_gen.generate_cuda_kernel`.
 
-Schedule.S ops are reused **verbatim** from the Triton backend:
-
-  * Each Schedule.S codegen emits a Python wrapper body that contains
-    a ``@triton.jit`` (or precompiled-kernel-dispatch) kernel launch.
-    The body is plain Python that runs in the generated module — it
-    has no coupling to the fused W kernel.
-  * So the same wrapper works whether the W kernels are Triton or
-    CUDA, and we save a parallel reimplementation of topK / softmax
-    / normalize / conv1d / cross-row reduce.
-
-Schedule.W ops require CUDA-side codegen because they're inlined into
-the per-block fused kernel emitted by
-:func:`cuda_impl.kernel_gen.generate_cuda_kernel`. None are registered
-yet — they'll be added one at a time as the CUDA W-op codegens land.
-
-:func:`cuda_impl.kernel_gen.generate_cuda_impl` injects
-``import triton`` / ``import triton.language as tl`` into the
-generated module's header lines so the reused Triton wrapper bodies
-have the names they reference.
+Schedule.S codegen lives under :mod:`indexer.compiler.custom_impl` and
+is shared with the Triton backend. The dispatch in
+:mod:`indexer.compiler.impl` routes Schedule.S subgraphs there directly,
+so this registry never needs to know about S ops.
 """
 
 from ....utils import Schedule
 
-from ...output_func import topK, approxTopK
-from ...scan import Softmax, Normalize, Conv1d
 from ...reduce import Reduce
 from ...elementwise import Elementwise
 from ...elementwise_binary import Elementwise_Binary
@@ -39,19 +20,6 @@ from ...save_load import Save, Load
 from ...reshape import Reshape
 from ...matmul import GeMM
 from ...kron import Kron
-
-from ..triton_impl.topk import (
-    generate_topk_impl,
-    generate_approx_topk_impl,
-)
-from ..triton_impl.softmax import generate_softmax_impl
-from ..triton_impl.normalize import generate_normalize_impl
-from ..triton_impl.conv1d import generate_conv1d_impl
-# Reduce dispatches by schedule: ``dim in {1, 2}`` is fused (W), and
-# ``dim == 0`` (cross-row, RAGGED → BATCHED) is standalone (S). Only
-# the S form is reused from Triton here; the W form will get its own
-# CUDA codegen.
-from ..triton_impl.reduce import generate_reduce_dim0_impl
 
 from .elementwise import generate_elementwise_impl
 from .elementwise_binary import generate_elementwise_binary_impl
@@ -65,14 +33,6 @@ from .kron import generate_kron_impl
 
 
 IMPL_REGISTRY = {
-    # Schedule.S — standalone kernel launches; reused from Triton.
-    (topK,       Schedule.S): generate_topk_impl,
-    (approxTopK, Schedule.S): generate_approx_topk_impl,
-    (Softmax,    Schedule.S): generate_softmax_impl,
-    (Normalize,  Schedule.S): generate_normalize_impl,
-    (Conv1d,     Schedule.S): generate_conv1d_impl,
-    (Reduce,     Schedule.S): generate_reduce_dim0_impl,
-
     # Schedule.W — fused into the per-block CUDA kernel. Registered
     # against base classes; ``get_impl_func``'s MRO walk catches
     # subclasses (Relu / Sigmoid / Silu / ... for Elementwise;
@@ -91,11 +51,13 @@ IMPL_REGISTRY = {
 
 
 def get_impl_func(op):
-    """Resolve an op instance to its CUDA codegen function.
+    """Resolve an op instance to its CUDA Schedule.W codegen function.
 
     Exact ``(class, schedule)`` match wins; otherwise an MRO walk picks
     the closest registered ancestor at the same schedule. Raises
-    ``NotImplementedError`` when nothing matches.
+    ``NotImplementedError`` when nothing matches — Schedule.S ops never
+    reach this registry (they're routed through
+    :func:`indexer.compiler.custom_impl.get_impl_func`).
     """
     schedule = op.schedule
     cls = op.__class__
@@ -110,6 +72,6 @@ def get_impl_func(op):
             return impl_func
 
     raise NotImplementedError(
-        f"No CUDA indexer codegen for op {cls.__name__} "
+        f"No CUDA Schedule.W indexer codegen for op {cls.__name__} "
         f"with schedule {schedule}"
     )

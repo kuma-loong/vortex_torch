@@ -74,6 +74,26 @@ def _load_cast_expr(tensor_ptr_expr: str, t) -> str:
     return f"tl.load({tensor_ptr_expr}).to(tl.float32)"
 
 
+def _load_cast_expr_masked(tensor_ptr_expr: str, mask_expr: str, t) -> str:
+    """Variant of :func:`_load_cast_expr` that applies ``mask_expr`` and
+    pads out-of-bounds lanes with zero. Used when the tensor's inner
+    dims aren't already a power of two.
+    """
+    if t.dtype == torch.float8_e5m2:
+        return (
+            f"tl.load({tensor_ptr_expr}, mask={mask_expr}, other=0)"
+            f".to(tl.float8e5, bitcast=True).to(tl.float32)"
+        )
+    if t.dtype == torch.float8_e4m3fn:
+        return (
+            f"tl.load({tensor_ptr_expr}, mask={mask_expr}, other=0)"
+            f".to(tl.float8e4nv, bitcast=True).to(tl.float32)"
+        )
+    return (
+        f"tl.load({tensor_ptr_expr}, mask={mask_expr}, other=0.0).to(tl.float32)"
+    )
+
+
 _TORCH_TO_TL = {
     torch.bfloat16: "tl.bfloat16",
     torch.float16:  "tl.float16",
@@ -103,13 +123,37 @@ def _store_cast_expr(block_expr: str, t) -> str:
     return f"{block_expr}.to({tl_name})"
 
 
+def _padded_inner_mask_expr(local_tensor_id: int, t) -> str:
+    """Build ``(dim1_ptr < shape[1]) & (dim2_ptr < shape[2])`` with the
+    2D broadcast suffix the cache load/store sites use; ``""`` when no
+    masking is needed (both inner dims pow2).
+    """
+    if not t.needs_padding():
+        return ""
+    parts: List[str] = []
+    if t.padded_shape[1] != t.shape[1]:
+        parts.append(f"(tensor_{local_tensor_id}_dim1_ptr[:, None] < {t.shape[1]})")
+    if t.padded_shape[2] != t.shape[2]:
+        parts.append(f"(tensor_{local_tensor_id}_dim2_ptr[None, :] < {t.shape[2]})")
+    return " & ".join(parts) if parts else ""
+
+
 def generate_initialization_str(sub_graph: Graph, ctx: Context) -> str:
-    """Per-tensor index pointer setup (used by load/store snippets)."""
+    """Per-tensor index pointer setup (used by load/store snippets).
+
+    Both inner-axis arange constexprs emit ``padded_shape`` so Triton's
+    pow2 requirement holds; the load/store helpers attach a mask
+    against the real ``shape`` whenever the two differ.
+    """
     lines: List[str] = []
     for local_tensor_id in list(sub_graph.input_tensor_ids) + list(sub_graph.output_tensor_ids):
         t = sub_graph.tensor_list[local_tensor_id]
-        lines.append(f"tensor_{local_tensor_id}_dim1_ptr = tl.arange(0, {t.shape[1]})")
-        lines.append(f"tensor_{local_tensor_id}_dim2_ptr = tl.arange(0, {t.shape[2]})")
+        lines.append(
+            f"tensor_{local_tensor_id}_dim1_ptr = tl.arange(0, {t.padded_shape[1]})"
+        )
+        lines.append(
+            f"tensor_{local_tensor_id}_dim2_ptr = tl.arange(0, {t.padded_shape[2]})"
+        )
     return "\n".join(lines) if lines else "# No initialization required"
 
 
@@ -118,6 +162,10 @@ def _block_load_lines(local_tensor_id: int, t, ctx: Context) -> List[str]:
 
     FP8 inputs are bitcast from the uint8-viewed pointer into the matching
     ``tl.float8eX`` dtype before the fp32 cast, matching ``reduce_pp_kernel``.
+
+    When ``t`` needs padding, the load is masked: trailing padded lanes
+    of either inner axis read as zero. Memory strides stay anchored to
+    the real ``shape``.
     """
     lines: List[str] = []
     if t._format == FORMAT.PAGED:
@@ -142,7 +190,13 @@ def _block_load_lines(local_tensor_id: int, t, ctx: Context) -> List[str]:
         f"+ tensor_{local_tensor_id}_dim1_ptr[:, None] * {t.shape[2]} "
         f"+ tensor_{local_tensor_id}_dim2_ptr[None, :]"
     )
-    load_expr = _load_cast_expr(f"tensor_{local_tensor_id}_ptr_2d", t)
+    mask_expr = _padded_inner_mask_expr(local_tensor_id, t)
+    if mask_expr:
+        load_expr = _load_cast_expr_masked(
+            f"tensor_{local_tensor_id}_ptr_2d", mask_expr, t,
+        )
+    else:
+        load_expr = _load_cast_expr(f"tensor_{local_tensor_id}_ptr_2d", t)
     lines.append(f"tensor_{local_tensor_id}_block = {load_expr}")
     return lines
 
@@ -157,7 +211,9 @@ def _block_store_lines(local_tensor_id: int, t, ctx: Context) -> List[str]:
       * ``fp8_e4m3fn``        — ``.to(tl.float8e4nv).to(tl.uint8, bitcast=True)``
 
     FP8 tensors are passed in viewed as ``uint8`` by the wrapper, so the
-    store writes raw FP8 bits into the same backing storage.
+    store writes raw FP8 bits into the same backing storage. Padded
+    inner dims pick up an explicit mask so the synthetic lanes don't
+    bleed into the next slot.
     """
     lines: List[str] = []
     if t._format == FORMAT.PAGED:
@@ -181,7 +237,14 @@ def _block_store_lines(local_tensor_id: int, t, ctx: Context) -> List[str]:
         f"+ tensor_{local_tensor_id}_dim2_ptr[None, :]"
     )
     store_expr = _store_cast_expr(f"tensor_{local_tensor_id}_block", t)
-    lines.append(f"tl.store(tensor_{local_tensor_id}_ptr_2d, {store_expr})")
+    mask_expr = _padded_inner_mask_expr(local_tensor_id, t)
+    if mask_expr:
+        lines.append(
+            f"tl.store(tensor_{local_tensor_id}_ptr_2d, {store_expr}, "
+            f"mask={mask_expr})"
+        )
+    else:
+        lines.append(f"tl.store(tensor_{local_tensor_id}_ptr_2d, {store_expr})")
     return lines
 
 

@@ -9,8 +9,9 @@ to size 1, preserving the leading dim:
                     Output shape ``[leading, D_0, 1]``.
 
 The cross-row form (``dim == 0``, Schedule.S, RAGGED → BATCHED) is
-**not** handled here — it's reused from
-:mod:`triton_impl.reduce.generate_reduce_dim0_impl` via the registry.
+**not** handled here — it's emitted by
+:mod:`indexer.compiler.custom_impl.reduce_dim0` and dispatched from
+:mod:`indexer.compiler.impl`.
 
 Thread mapping is per-output-element: each thread claims one
 ``(chunk_i, c_o, d_o)`` output position and sequentially sweeps the
@@ -105,8 +106,8 @@ def generate_reduce_impl(graph: Graph, op_id: int, ctx: Context) -> str:
     )
     assert op.dim in (1, 2), (
         f"cuda_impl.reduce.generate_reduce_impl: dim must be in {{1, 2}}; "
-        f"got dim={op.dim}. dim=0 is Schedule.S — see the Triton "
-        f"``generate_reduce_dim0_impl`` reused via the registry."
+        f"got dim={op.dim}. dim=0 is Schedule.S — see "
+        f"indexer.compiler.custom_impl.reduce_dim0."
     )
     assert op.schedule == Schedule.W, (
         f"cuda_impl.reduce.generate_reduce_impl: expected Schedule.W, got "

@@ -1,12 +1,13 @@
 """Registry of ``(op_class, Schedule) -> codegen-function`` for Triton.
 
-Keying on the schedule (in addition to the op class) lets the same op
-have different generators depending on how it's scheduled. For example
-a :class:`Reduce` over the workload-fused axes (``dim in (1, 2)``) is
-``Schedule.W`` and inlines into the per-block kernel, while a future
-``Reduce`` over ``dim == 0`` would be ``Schedule.S`` (standalone) and
-needs its own kernel-launching generator. Same op class, two
-generators — only the schedule disambiguates them.
+Schedule.W only — these generators inline into the per-block fused
+kernel emitted by :func:`triton_impl.kernel_gen.generate_triton_impl`.
+
+Schedule.S codegen for the indexer compiler lives under
+:mod:`indexer.compiler.custom_impl` and is shared between the Triton
+and CUDA Schedule.W backends. ``Reduce`` here only registers the
+``dim in {1, 2}`` form; the ``dim == 0`` cross-row form is Schedule.S
+and lives in ``custom_impl``.
 """
 
 from ....utils import Schedule
@@ -15,9 +16,6 @@ from ...matmul import GeMM
 from ...reduce import Reduce
 from ...elementwise_binary import Elementwise_Binary
 from ...elementwise import Elementwise
-from ...output_func import topK, approxTopK, Union
-from ...select import TopK
-from ...scan import Softmax, Normalize, Conv1d
 from ...transpose import Transpose
 from ...save_load import Save, Load
 from ...mask import MaskSlice
@@ -25,19 +23,10 @@ from ...kron import Kron
 from ...reshape import Reshape
 
 from .gemm import generate_gemm_impl
-from .reduce import generate_reduce_impl, generate_reduce_dim0_impl
+from .reduce import generate_reduce_impl
 from .elementwise_binary import generate_elementwise_binary_impl
 from .elementwise import generate_elementwise_impl
-from .topk import (
-    generate_topk_impl,
-    generate_approx_topk_impl,
-    generate_block_table_topk_impl,
-    generate_union_impl,
-)
-from .softmax import generate_softmax_impl
-from .normalize import generate_normalize_impl
 from .transpose import generate_transpose_impl
-from .conv1d import generate_conv1d_impl
 from .save_load import generate_save_impl, generate_load_impl
 from .mask import generate_mask_slice_impl
 from .kron import generate_kron_impl
@@ -55,35 +44,15 @@ IMPL_REGISTRY = {
     (MaskSlice,          Schedule.W): generate_mask_slice_impl,
     (Kron,               Schedule.W): generate_kron_impl,
     (Reshape,            Schedule.W): generate_reshape_impl,
-
-    # Schedule.S — standalone, each op launches its own kernel.
-    (topK,       Schedule.S): generate_topk_impl,
-    (approxTopK, Schedule.S): generate_approx_topk_impl,
-    # TopK (capital T) — trtllm-only, writes block_table + seqlens.
-    (TopK,       Schedule.S): generate_block_table_topk_impl,
-    # Union — trtllm-only output op: merges two (bt, sl) pairs into the
-    # final sparse_block_tables + sparse_seqlens.
-    (Union,      Schedule.S): generate_union_impl,
-    # The Triton kernels themselves live under
-    # ``vortex_torch/custom_ops/<op>/<backend>/default/kernel.py``; these
-    # generate_*_impl functions are launcher-emitters that resolve the
-    # kernel via ``custom_ops.find`` at runtime.
-    (Softmax,   Schedule.S): generate_softmax_impl,
-    (Normalize, Schedule.S): generate_normalize_impl,
-    (Conv1d,    Schedule.S): generate_conv1d_impl,
-    # Reduce dispatches by schedule too: ``dim in {1, 2}`` is fused (W),
-    # ``dim == 0`` (cross-row, RAGGED → BATCHED) is standalone (S).
-    (Reduce,    Schedule.S): generate_reduce_dim0_impl,
 }
 
 
 def get_impl_func(op):
-    """Resolve an op instance to its codegen function.
+    """Resolve an op instance to its Schedule.W codegen function.
 
-    Exact class match wins (so a subclass like ``approxTopK`` gets its
-    own generator instead of inheriting ``topK``'s). Falls back to an
-    MRO walk: the closest registered ancestor at the same schedule
-    provides the generator.
+    Exact class match wins; falls back to an MRO walk for subclasses.
+    Schedule.S ops never reach this registry — they're handled by
+    :func:`indexer.compiler.custom_impl.get_impl_func`.
     """
     schedule = op.schedule
     cls = op.__class__
@@ -100,6 +69,6 @@ def get_impl_func(op):
             return impl_func
 
     raise NotImplementedError(
-        f"No indexer codegen for op {cls.__name__} "
+        f"No Triton Schedule.W indexer codegen for op {cls.__name__} "
         f"with schedule {schedule}"
     )

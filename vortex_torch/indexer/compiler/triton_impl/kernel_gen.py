@@ -1,18 +1,17 @@
-"""Triton kernel generator for fused indexer subgraphs.
+"""Triton kernel generator for Schedule.W indexer subgraphs.
 
-A subgraph is one of:
-  - ``Schedule.W`` (workload-scheduled): emit a ``@triton.jit`` kernel +
-    a Python wrapper that launches it across ``num_sms * 4`` programs.
-    The kernel iterates planner-scheduled workloads ``[start, end)``,
-    each covering ``workload_chunk_size`` ragged slots / pages.
-  - non-W: a single op whose impl function is inlined directly into a
-    plain Python wrapper. The op's ``get_impl_func`` does all codegen.
+Emits a ``@triton.jit`` kernel + a Python wrapper that launches it
+across ``num_sms * 4`` programs. The kernel iterates planner-scheduled
+workloads ``[start, end)``, each covering ``workload_chunk_size`` ragged
+slots / pages. Generated kernels load inputs by ``FORMAT``
+(BATCHED / PAGED / RAGGED), run a chain of op impl strings, then store
+outputs by ``FORMAT``. The store body is also gated for BATCHED outputs
+that may be written by multiple workloads sharing the same
+``(batch, head)`` slot.
 
-The W path is the bulk of this file. Generated kernels load inputs by
-``FORMAT`` (BATCHED / PAGED / RAGGED), run a chain of op impl strings,
-then store outputs by ``FORMAT``. The store body is also gated for
-BATCHED outputs that may be written by multiple workloads sharing the
-same ``(batch, head)`` slot.
+Schedule.S codegen lives in :mod:`indexer.compiler.custom_impl` and is
+dispatched from :mod:`indexer.compiler.impl` — it has no involvement
+with this backend.
 
 Public API: :func:`generate_triton_impl`. The other ``generate_*`` /
 helper symbols below are kept exported for in-tree debugging and tests.
@@ -26,7 +25,7 @@ from ...context import Context
 from ....abs import FORMAT
 from ....utils import Schedule, INDENT
 from .register import get_impl_func
-from .backend import get_backend
+from ..backend import get_backend
 from .dtype_cast import (
     is_fp8 as _is_fp8,
     load_cast_expr as _load_cast_expr,
@@ -83,9 +82,17 @@ def _iter_kernel_tensors(sub_graph) -> Iterable[Tuple[int, str]]:
 def _emit_block_ptr(tensor_id: int, t, offset_var: str, block_dim0_expr) -> str:
     """Emit one ``tl.make_block_ptr(...)`` assignment.
 
-    Used by BATCHED/RAGGED/PAGED loads and the PAGED-single-page store.
-    The strides + shape come from ``t.shape``; only the offset and
-    block-shape leading dim differ across callers.
+    Used by BATCHED/RAGGED/PAGED loads and the PAGED-single-page store
+    **only when ``t`` doesn't require padding** (its inner dims are
+    already powers of two). The strides + shape come from ``t.shape``;
+    only the offset and block-shape leading dim differ across callers.
+
+    For padded tensors (``t.needs_padding()`` is True) the fused-load /
+    fused-store path can't use ``make_block_ptr`` because we'd have to
+    fabricate a global shape consistent with a padded inner row stride,
+    which doesn't match the real memory layout. Padded paths build
+    pointers and masks from raw arange exprs instead — see
+    :func:`_load_*_padded` / :func:`_store_*_padded`.
     """
     return "\n".join([
         f"tensor_{tensor_id}_block_ptr = tl.make_block_ptr(",
@@ -100,49 +107,139 @@ def _emit_block_ptr(tensor_id: int, t, offset_var: str, block_dim0_expr) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Padding-aware helpers
+# --------------------------------------------------------------------------- #
+#
+# Triton block-shape constexprs (``tl.zeros``, ``tl.arange``,
+# ``tl.reshape``, ``tl.make_block_ptr.block_shape``, ...) must each be a
+# power of two. Real models carry non-pow2 inner dims (e.g. Qwen3-14B's
+# group_size = 5). To handle both:
+#
+#   * Tile-side block shapes always emit ``t.padded_shape[i]`` (pow2 by
+#     construction). For pow2-shape tensors this equals ``t.shape[i]`` —
+#     no overhead.
+#   * Memory-addressing strides always emit ``t.shape[i]`` (the real
+#     row stride). ``make_block_ptr.shape`` / ``strides`` likewise.
+#   * When ``t.needs_padding()`` is True the load/store path switches
+#     to a raw arange + explicit mask form (``make_block_ptr`` won't fit
+#     because the padded block_shape would over-read into the next row).
+#   * When ``t.needs_padding()`` is False the fast path (the original
+#     ``make_block_ptr`` + ``boundary_check`` form for loads, the
+#     arange-stride form for stores) is preserved verbatim.
+#
+# The helpers below produce the inner-dim arange + mask snippets so the
+# load/store helpers stay readable.
+
+
+def _inner_dim_arange_names(tid: int) -> Tuple[str, str]:
+    """Local names of the two inner-axis arange pointers for tensor ``tid``."""
+    return f"tensor_{tid}_dim1_ptr", f"tensor_{tid}_dim2_ptr"
+
+
+def _inner_dim_arange_decls(tid: int, t) -> List[str]:
+    """Emit ``tl.arange`` declarations for the two inner axes at padded length.
+
+    These are shared between load and store on the same tensor, so the
+    caller dedupes (the same arange is fine to define once).
+    """
+    d1, d2 = _inner_dim_arange_names(tid)
+    return [
+        f"{d1} = tl.arange(0, {t.padded_shape[1]})",
+        f"{d2} = tl.arange(0, {t.padded_shape[2]})",
+    ]
+
+
+def _inner_dim_mask_expr(tid: int, t, *, d1_broadcast: str, d2_broadcast: str) -> str:
+    """Build the boolean ``(d1 < shape[1]) & (d2 < shape[2])`` expression
+    with the broadcast suffixes the caller needs.
+
+    ``d1_broadcast`` / ``d2_broadcast`` are e.g. ``"[None, :, None]"``
+    matching the surrounding tile rank.
+
+    Returns ``"1"`` (always-true scalar) when ``t`` doesn't need
+    padding — the caller can splice this into a larger ``mask=`` expr
+    without a dedicated guard.
+    """
+    if not t.needs_padding():
+        return "1"
+    d1, d2 = _inner_dim_arange_names(tid)
+    parts: List[str] = []
+    if t.padded_shape[1] != t.shape[1]:
+        parts.append(f"({d1}{d1_broadcast} < {t.shape[1]})")
+    if t.padded_shape[2] != t.shape[2]:
+        parts.append(f"({d2}{d2_broadcast} < {t.shape[2]})")
+    return " & ".join(parts) if parts else "1"
+
+
+# --------------------------------------------------------------------------- #
 # Initialization
 # --------------------------------------------------------------------------- #
 
 def generate_initialization_str(sub_graph: Graph, ctx: Context) -> str:
     """Pre-kernel-loop declarations: zero-init BATCHED input slots and
-    pre-build ``tl.arange`` index pointers for ragged / paged outputs."""
+    pre-build ``tl.arange`` index pointers for ragged / paged outputs.
+
+    Block-shape constexprs (``tl.zeros``, ``tl.arange``) always emit the
+    **padded** length so Triton's pow2-constexpr rule is satisfied; the
+    real ``shape`` only enters memory-addressing math and per-tensor
+    masks emitted by the load/store helpers.
+    """
     lines: List[str] = []
+    arange_emitted: set = set()  # (tid, "d1"|"d2") -> dedupe
+
+    def _emit_arange(tid: int, t) -> None:
+        d1, d2 = _inner_dim_arange_names(tid)
+        if (tid, "d1") not in arange_emitted:
+            lines.append(f"{d1} = tl.arange(0, {t.padded_shape[1]})")
+            arange_emitted.add((tid, "d1"))
+        if (tid, "d2") not in arange_emitted:
+            lines.append(f"{d2} = tl.arange(0, {t.padded_shape[2]})")
+            arange_emitted.add((tid, "d2"))
 
     for tid in sub_graph.input_tensor_ids:
         t = sub_graph.tensor_list[tid]
         if t._format == FORMAT.BATCHED:
             lines.append(f"# Declare variables for tensor_{tid}")
             lines.append(
-                f"tensor_{tid}_block = tl.zeros((1, {t.shape[1]}, {t.shape[2]}), "
-                f"dtype=tl.float32)"
+                f"tensor_{tid}_block = tl.zeros((1, {t.padded_shape[1]}, "
+                f"{t.padded_shape[2]}), dtype=tl.float32)"
             )
+        # Padded input tensors (any FORMAT) need the inner-axis arange
+        # pre-built — they reference it in the masked-load body.
+        if t.needs_padding():
+            _emit_arange(tid, t)
 
     for tid in sub_graph.output_tensor_ids:
         t = sub_graph.tensor_list[tid]
         if t._format in (FORMAT.RAGGED, FORMAT.BATCHED):
-            lines.append(f"tensor_{tid}_dim1_ptr = tl.arange(0, {t.shape[1]})")
-            lines.append(f"tensor_{tid}_dim2_ptr = tl.arange(0, {t.shape[2]})")
+            _emit_arange(tid, t)
 
     # Multi-page PAGED scratch index pointers (workload spans >1 page).
     # ``page_idx_i32_ptr`` enumerates pages within a workload;
     # ``block_i32_ptr`` enumerates blocks within a page; ``tensor_X_flat_ptr``
     # is the flattened per-page element index (one page = num_blocks_per_page
-    # blocks of shape[1] x shape[2] elements).
+    # blocks of padded_shape[1] x padded_shape[2] elements — the per-page
+    # tile fed to ``tl.reshape``).
     if ctx.num_pages_per_workload > 1:
         lines.append(f"page_idx_i32_ptr = tl.arange(0, {ctx.num_pages_per_workload})")
         lines.append(f"block_i32_ptr = tl.arange(0, {ctx.num_blocks_per_page})")
         for tid in sub_graph.input_tensor_ids:
             t = sub_graph.tensor_list[tid]
             if t._format == FORMAT.PAGED:
-                lines.append(
-                    f"tensor_{tid}_flat_ptr = tl.arange(0, "
-                    f"{ctx.num_blocks_per_page * t.shape[1] * t.shape[2]})"
-                )
+                if t.needs_padding():
+                    # Padded PAGED load builds a 4D pointer (npw, nbp, d1, d2)
+                    # directly; the flat arange is unused. The inner aranges
+                    # are emitted above (or here as a fallback).
+                    _emit_arange(tid, t)
+                else:
+                    lines.append(
+                        f"tensor_{tid}_flat_ptr = tl.arange(0, "
+                        f"{ctx.num_blocks_per_page * t.shape[1] * t.shape[2]})"
+                    )
         for tid in sub_graph.output_tensor_ids:
             t = sub_graph.tensor_list[tid]
             if t._format == FORMAT.PAGED:
-                lines.append(f"tensor_{tid}_dim1_ptr = tl.arange(0, {t.shape[1]})")
-                lines.append(f"tensor_{tid}_dim2_ptr = tl.arange(0, {t.shape[2]})")
+                _emit_arange(tid, t)
 
     return "\n".join(lines) if lines else "# No initialization required"
 
@@ -152,6 +249,8 @@ def generate_initialization_str(sub_graph: Graph, ctx: Context) -> str:
 # --------------------------------------------------------------------------- #
 
 def _load_batched(tid: int, t) -> List[str]:
+    if t.needs_padding():
+        return _load_batched_padded(tid, t)
     block_ptr = _emit_block_ptr(
         tid, t,
         offset_var=f"tensor_{tid}_ptr_row_start",
@@ -169,7 +268,39 @@ def _load_batched(tid: int, t) -> List[str]:
     ]
 
 
+def _load_batched_padded(tid: int, t) -> List[str]:
+    """Masked BATCHED load: tile (1, padded_shape[1], padded_shape[2]).
+
+    Memory layout: ``[N_rows, shape[1], shape[2]]`` flattened. A
+    ``make_block_ptr`` with padded block_shape would read past the real
+    row boundary into the next row's data — incorrect — so build the
+    pointer from raw aranges and apply an inner-axis mask.
+    """
+    d1, d2 = _inner_dim_arange_names(tid)
+    mask = _inner_dim_mask_expr(
+        tid, t,
+        d1_broadcast="[None, :, None]",
+        d2_broadcast="[None, None, :]",
+    )
+    row_base = f"new_batch_idx_i32 * {t.shape[1] * t.shape[2]}"
+    ptr_expr = (
+        f"tensor_{tid}_block_ptr = (tensor_{tid}_ptr + {row_base} "
+        f"+ {d1}[None, :, None] * {t.shape[2]} "
+        f"+ {d2}[None, None, :])"
+    )
+    load_expr = (
+        f"tl.load(tensor_{tid}_block_ptr, mask={mask}, other=0.0, "
+        f'cache_modifier=".ca")'
+    )
+    return [
+        ptr_expr,
+        f"tensor_{tid}_block = {_load_cast_expr(load_expr, t)}",
+    ]
+
+
 def _load_paged_single_page(tid: int, t, ctx: Context) -> List[str]:
+    if t.needs_padding():
+        return _load_paged_single_page_padded(tid, t, ctx)
     block_ptr = _emit_block_ptr(
         tid, t,
         offset_var=f"tensor_{tid}_ptr_row_start",
@@ -187,7 +318,39 @@ def _load_paged_single_page(tid: int, t, ctx: Context) -> List[str]:
     ]
 
 
+def _load_paged_single_page_padded(tid: int, t, ctx: Context) -> List[str]:
+    """Masked PAGED single-page load.
+
+    Tile shape ``(workload_chunk_size, padded_shape[1], padded_shape[2])``.
+    Memory stride per workload-slot is ``shape[1] * shape[2]``; rows
+    inside a slot are spaced by ``shape[2]``.
+    """
+    d1, d2 = _inner_dim_arange_names(tid)
+    mask = _inner_dim_mask_expr(
+        tid, t,
+        d1_broadcast="[None, :, None]",
+        d2_broadcast="[None, None, :]",
+    )
+    page_base = f"page_idx_i32 * {t.shape[1] * t.shape[2]}"
+    ptr_expr = (
+        f"tensor_{tid}_block_ptr = (tensor_{tid}_ptr + {page_base} "
+        f"+ workload_ptr[:, None, None] * {t.shape[1] * t.shape[2]} "
+        f"+ {d1}[None, :, None] * {t.shape[2]} "
+        f"+ {d2}[None, None, :])"
+    )
+    load_expr = (
+        f"tl.load(tensor_{tid}_block_ptr, mask={mask}, other=0.0, "
+        f'cache_modifier=".cv")'
+    )
+    return [
+        ptr_expr,
+        f"tensor_{tid}_block = {_load_cast_expr(load_expr, t)}",
+    ]
+
+
 def _load_paged_multi_page(tid: int, t, ctx: Context) -> List[str]:
+    if t.needs_padding():
+        return _load_paged_multi_page_padded(tid, t, ctx)
     # ``page_valid`` masks the per-page lanes (length num_pages_per_workload);
     # distinct from ``valid`` which masks the per-block workload lanes.
     reshape = (
@@ -203,7 +366,47 @@ def _load_paged_multi_page(tid: int, t, ctx: Context) -> List[str]:
     ]
 
 
+def _load_paged_multi_page_padded(tid: int, t, ctx: Context) -> List[str]:
+    """Masked PAGED multi-page load.
+
+    Build a 4D pointer ``(npw, nbp, padded_d1, padded_d2)`` and apply
+    both the existing ``page_valid`` page-level mask and the inner
+    real-shape mask. The flat-arange path used by the non-padded form
+    can't represent the inner-dim mask because it collapses the inner
+    axes into a single flat index.
+    """
+    d1, d2 = _inner_dim_arange_names(tid)
+    block_elem = t.shape[1] * t.shape[2]
+    parts = [
+        f"page_valid[:, None, None, None]",
+        f"({d1}[None, None, :, None] < {t.shape[1]})" if t.padded_shape[1] != t.shape[1] else None,
+        f"({d2}[None, None, None, :] < {t.shape[2]})" if t.padded_shape[2] != t.shape[2] else None,
+    ]
+    mask = " & ".join(p for p in parts if p)
+    ptr_expr = (
+        f"tensor_{tid}_block_ptr = (tensor_{tid}_ptr "
+        f"+ page_indices_i32[:, None, None, None] * {block_elem} "
+        f"+ block_i32_ptr[None, :, None, None] * {block_elem} "
+        f"+ {d1}[None, None, :, None] * {t.shape[2]} "
+        f"+ {d2}[None, None, None, :])"
+    )
+    load_expr = (
+        f"tl.load(tensor_{tid}_block_ptr, mask={mask}, other=0.0, "
+        f'cache_modifier=".cv")'
+    )
+    reshape_expr = (
+        f"tl.reshape({load_expr}, "
+        f"({ctx.workload_chunk_size}, {t.padded_shape[1]}, {t.padded_shape[2]}))"
+    )
+    return [
+        ptr_expr,
+        f"tensor_{tid}_block = {_load_cast_expr(reshape_expr, t)}",
+    ]
+
+
 def _load_ragged(tid: int, t, ctx: Context) -> List[str]:
+    if t.needs_padding():
+        return _load_ragged_padded(tid, t, ctx)
     block_ptr = _emit_block_ptr(
         tid, t,
         offset_var=f"tensor_{tid}_ptr_row_start",
@@ -218,6 +421,29 @@ def _load_ragged(tid: int, t, ctx: Context) -> List[str]:
         f"tensor_{tid}_ptr_row_start = ragged_idx_i32 * {t.shape[1]}",
         block_ptr,
         f"tensor_{tid}_block = {_load_cast_expr(reshape, t)}",
+    ]
+
+
+def _load_ragged_padded(tid: int, t, ctx: Context) -> List[str]:
+    """Masked RAGGED load: tile (workload_chunk_size, padded_d1, padded_d2)."""
+    d1, d2 = _inner_dim_arange_names(tid)
+    mask = _inner_dim_mask_expr(
+        tid, t,
+        d1_broadcast="[None, :, None]",
+        d2_broadcast="[None, None, :]",
+    )
+    block_elem = t.shape[1] * t.shape[2]
+    ptr_expr = (
+        f"tensor_{tid}_block_ptr = (tensor_{tid}_ptr "
+        f"+ ragged_idx_i32 * {block_elem} "
+        f"+ workload_ptr[:, None, None] * {block_elem} "
+        f"+ {d1}[None, :, None] * {t.shape[2]} "
+        f"+ {d2}[None, None, :])"
+    )
+    load_expr = f"tl.load(tensor_{tid}_block_ptr, mask={mask}, other=0.0)"
+    return [
+        ptr_expr,
+        f"tensor_{tid}_block = {_load_cast_expr(load_expr, t)}",
     ]
 
 
@@ -280,7 +506,30 @@ def generate_load_tensor_str(sub_graph: Graph, ctx: Context) -> str:
 # Store (per FORMAT)
 # --------------------------------------------------------------------------- #
 
+def _and_inner_mask(tid: int, t, *, base_mask: str,
+                    d1_broadcast: str, d2_broadcast: str) -> str:
+    """Combine ``base_mask`` with the inner-dim masks when ``t`` is padded.
+
+    The base mask carries the format-specific gating (RAGGED's ``valid``
+    over the workload axis, PAGED multi-page's ``page_valid``) and is
+    always present; the inner-dim conjuncts only fire when at least one
+    inner dim was rounded up.
+    """
+    if not t.needs_padding():
+        return base_mask
+    extra = _inner_dim_mask_expr(
+        tid, t,
+        d1_broadcast=d1_broadcast,
+        d2_broadcast=d2_broadcast,
+    )
+    if extra == "1":
+        return base_mask
+    return f"{base_mask} & {extra}"
+
+
 def _store_paged_single_page(tid: int, t, ctx: Context) -> List[str]:
+    if t.needs_padding():
+        return _store_paged_single_page_padded(tid, t, ctx)
     block_ptr = _emit_block_ptr(
         tid, t,
         offset_var=f"tensor_{tid}_ptr_row_start",
@@ -294,6 +543,34 @@ def _store_paged_single_page(tid: int, t, ctx: Context) -> List[str]:
         f"tensor_{tid}_ptr_row_start = page_idx_i32 * {t.shape[1]}",
         block_ptr,
         f"tl.store(tensor_{tid}_block_ptr, {_store_cast_expr(reshape, t.dtype)})",
+    ]
+
+
+def _store_paged_single_page_padded(tid: int, t, ctx: Context) -> List[str]:
+    """Masked PAGED single-page store.
+
+    ``tensor_<id>_block`` already has padded inner dims (from the
+    upstream load / compute). Build a per-element pointer + mask the
+    inner padded lanes out of the store.
+    """
+    d1, d2 = _inner_dim_arange_names(tid)
+    block_elem = t.shape[1] * t.shape[2]
+    ptr_expr = (
+        f"tensor_{tid}_block_ptr = (tensor_{tid}_ptr "
+        f"+ page_idx_i32 * {block_elem} "
+        f"+ workload_ptr[:, None, None] * {block_elem} "
+        f"+ {d1}[None, :, None] * {t.shape[2]} "
+        f"+ {d2}[None, None, :])"
+    )
+    mask = _inner_dim_mask_expr(
+        tid, t,
+        d1_broadcast="[None, :, None]",
+        d2_broadcast="[None, None, :]",
+    )
+    return [
+        ptr_expr,
+        f"tl.store(tensor_{tid}_block_ptr, "
+        f"{_store_cast_expr(f'tensor_{tid}_block', t.dtype)}, mask={mask})",
     ]
 
 
@@ -311,13 +588,19 @@ def _store_paged_multi_page(tid: int, t, ctx: Context) -> List[str]:
     reshape = (
         f"tl.reshape(tensor_{tid}_block, "
         f"({ctx.num_pages_per_workload}, {ctx.num_blocks_per_page}, "
-        f"{t.shape[1]}, {t.shape[2]}))"
+        f"{t.padded_shape[1]}, {t.padded_shape[2]}))"
+    )
+    mask = _and_inner_mask(
+        tid, t,
+        base_mask="page_valid[:, None, None, None]",
+        d1_broadcast="[None, None, :, None]",
+        d2_broadcast="[None, None, None, :]",
     )
     return [
         ptr_expr,
         f"tl.store(tensor_{tid}_block_ptr, "
         f"{_store_cast_expr(reshape, t.dtype)}, "
-        f"mask=page_valid[:, None, None, None])",
+        f"mask={mask})",
     ]
 
 
@@ -329,11 +612,17 @@ def _store_ragged(tid: int, t) -> List[str]:
         f"+ tensor_{tid}_dim1_ptr[None,:,None] * {t.shape[2]} "
         f"+ tensor_{tid}_dim2_ptr[None,None,:]"
     )
+    mask = _and_inner_mask(
+        tid, t,
+        base_mask="valid[:, None, None]",
+        d1_broadcast="[None, :, None]",
+        d2_broadcast="[None, None, :]",
+    )
     return [
         ptr_expr,
         f"tl.store(tensor_{tid}_block_ptr, "
         f"{_store_cast_expr(f'tensor_{tid}_block', t.dtype)}, "
-        f"mask=valid[:, None, None])",
+        f"mask={mask})",
     ]
 
 
@@ -344,18 +633,37 @@ def _store_batched(tid: int, t) -> List[str]:
     ``winfo_is_first_workload_per_batch[i]`` (computed by the planner).
     The gate load is hoisted by :func:`generate_store_tensor_str` so it
     happens once per workload regardless of how many BATCHED outputs the
-    subgraph has."""
+    subgraph has.
+
+    When ``t`` needs padding, the per-element store also picks up the
+    inner-dim mask so the trailing pow2-padded lanes don't overwrite
+    the next batch slot's data.
+    """
     ptr_expr = (
         f"tensor_{tid}_block_ptr = tensor_{tid}_ptr "
         f"+ new_batch_idx_i32 * {t.shape[1] * t.shape[2]} "
         f"+ tensor_{tid}_dim1_ptr[None, :, None] * {t.shape[2]} "
         f"+ tensor_{tid}_dim2_ptr[None, None, :]"
     )
+    if t.needs_padding():
+        mask = _inner_dim_mask_expr(
+            tid, t,
+            d1_broadcast="[None, :, None]",
+            d2_broadcast="[None, None, :]",
+        )
+        store_call = (
+            f"    tl.store(tensor_{tid}_block_ptr, "
+            f"{_store_cast_expr(f'tensor_{tid}_block', t.dtype)}, mask={mask})"
+        )
+    else:
+        store_call = (
+            f"    tl.store(tensor_{tid}_block_ptr, "
+            f"{_store_cast_expr(f'tensor_{tid}_block', t.dtype)})"
+        )
     return [
         ptr_expr,
         "if _is_first_workload != 0:",
-        f"    tl.store(tensor_{tid}_block_ptr, "
-        f"{_store_cast_expr(f'tensor_{tid}_block', t.dtype)})",
+        store_call,
     ]
 
 
@@ -528,7 +836,7 @@ def _build_launcher_args(sub_graph, ctx: Context) -> Tuple[List[str], List[str],
     # and ``ragged_idx_i32 * shape[1]`` for RAGGED store/load addresses.
     # Every backend-specific consumer-side detail (which tensor ``indices``
     # binds to, plus the matching ``winfo_kv_offsets`` encoding emitted by
-    # the planner) is captured in :mod:`triton_impl.backend`.
+    # the planner) is captured in :mod:`indexer.compiler.backend`.
     kernel_inputs: List[str] = [
         get_backend(ctx).indices_src,
         "ctx.metadata.winfo_q_indices",
@@ -580,46 +888,24 @@ def {ctx.sparse_attention_name}_subgraph_{sub_graph_id}_impl(
     return impl_str.strip()
 
 
-def _generate_non_w_impl(sub_graph: Graph, sub_graph_id: int, ctx: Context) -> str:
-    """Direct op-impl wrapper for non-workload-scheduled subgraphs.
-
-    The single op carries all the codegen; this layer just stitches the
-    function signature and indents the op-impl body.
-    """
-    assert len(sub_graph.op_list) == 1, (
-        "Expected exactly one operation in non-workload-scheduled "
-        "sub-graph for direct implementation."
-    )
-
-    arg_list = [f"tensor_{tid}" for tid in sub_graph.input_tensor_ids]
-    arg_list += [f"tensor_{tid}" for tid in sub_graph.output_tensor_ids]
-    arg_list.append("ctx")
-    args_def = ",\n".join(f"{INDENT}{arg}" for arg in arg_list)
-
-    op_impl_str = indent_block(
-        get_impl_func(sub_graph.op_list[0])(sub_graph, 0, ctx), 1,
-    )
-
-    impl_str = f"""
-def {ctx.sparse_attention_name}_subgraph_{sub_graph_id}_impl(
-{args_def}
-):
-{op_impl_str}
-"""
-    return impl_str.strip()
-
-
 def generate_triton_impl(
     sub_graph: Graph,
     sub_graph_id: int,
     ctx: Context,
 ) -> str:
-    """Generate a Triton kernel and its Python wrapper implementation."""
+    """Generate the Triton Schedule.W kernel and its Python wrapper.
+
+    Schedule.S subgraphs are routed through
+    :mod:`indexer.compiler.custom_impl` by
+    :mod:`indexer.compiler.impl` and never reach this function.
+    """
+    assert sub_graph.schedule == Schedule.W, (
+        f"generate_triton_impl only handles Schedule.W; got {sub_graph.schedule}. "
+        f"Schedule.S subgraphs are dispatched via indexer.compiler.impl."
+    )
     ctx.compilation_header_lines.extend([
         "import torch",
         "import triton",
         "import triton.language as tl",
     ])
-    if sub_graph.schedule == Schedule.W:
-        return _generate_w_impl(sub_graph, sub_graph_id, ctx)
-    return _generate_non_w_impl(sub_graph, sub_graph_id, ctx)
+    return _generate_w_impl(sub_graph, sub_graph_id, ctx)

@@ -1,4 +1,4 @@
-"""Backend-specific dispatch traits for the Triton indexer compiler.
+"""Backend-specific dispatch traits for the indexer compiler.
 
 The indexer compiler emits the same op graph for both attention backends,
 but the per-row addressing and the launcher bindings differ in well-defined
@@ -6,6 +6,15 @@ ways. Rather than scatter ``if backend == "trtllm":`` branches across every
 codegen, we collect every backend-specific snippet into a single
 :class:`IndexerBackend` traits object selected once at the top of each
 codegen call via :func:`get_backend`.
+
+This module sits at the compiler root because both the Schedule.W backends
+(``triton_impl``, ``cuda_impl``) and the Schedule.S backend-agnostic
+codegen (``custom_impl``) need to consult it:
+
+  * Schedule.W's fused kernel binds the ``indices`` parameter to
+    ``indices_src``.
+  * Schedule.S launcher emitters consume the per-row addressing fields
+    and topk dispatch fields.
 
 Two backends live here today:
 
@@ -33,14 +42,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Tuple
 
-from ....utils import INDENT
-from ...context import Context
+from ...utils import INDENT
+from ..context import Context
 
 
 @dataclass(frozen=True)
 class IndexerBackend:
     """Snippet bundle that fully describes the consumer-side
-    backend-specific surface of the Triton indexer compiler.
+    backend-specific surface of the indexer compiler.
 
     All ``*_snippet`` / ``*_arg`` / ``*_value`` fields are raw strings
     splice-substituted into generated source — no Python objects leak into

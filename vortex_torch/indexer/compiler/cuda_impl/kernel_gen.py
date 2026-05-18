@@ -1,24 +1,14 @@
-"""CUDA kernel generator for fused indexer subgraphs.
+"""CUDA kernel generator for Schedule.W indexer subgraphs.
 
-Mirrors the Triton backend layout: a subgraph is one of:
+Emits a CUDA ``__global__`` kernel and a host-side C++ launcher;
+embeds both as a Python raw string that
+``torch.utils.cpp_extension.load_inline`` JIT-compiles at
+module-import time; wraps the compiled launcher in a Python function
+that forwards tensor args + scalars pulled from ``ctx``.
 
-  - ``Schedule.W`` (workload-scheduled): emit a CUDA ``__global__``
-    kernel and a host-side C++ launcher; embed both as a Python raw
-    string that ``torch.utils.cpp_extension.load_inline`` JIT-compiles
-    at module-import time; wrap the compiled launcher in a Python
-    function that forwards tensor args + scalars pulled from ``ctx``.
-  - non-W: a single op whose impl function is inlined directly into a
-    plain Python wrapper (no kernel launch needed). The op's
-    ``get_impl_func`` does all codegen.
-
-Step-by-step scaffold. Only the top-level dispatch
-(:func:`generate_cuda_impl`), the W-scheduled wrapper
-(:func:`_generate_w_impl`), and the non-W wrapper
-(:func:`_generate_non_w_impl`) are filled in. The kernel-body codegen
-helpers (initialization, load, store, computation, kernel/launcher
-source) are stubbed with ``pass`` and will be added in follow-up
-commits — calling :func:`_generate_w_impl` before they are implemented
-will raise ``TypeError`` from the still-empty helpers.
+Schedule.S codegen lives in :mod:`indexer.compiler.custom_impl` and is
+dispatched from :mod:`indexer.compiler.impl` — it has no involvement
+with this backend.
 
 Public API: :func:`generate_cuda_impl`. The other ``generate_*`` /
 helper symbols are exported for in-tree debugging and tests.
@@ -1109,64 +1099,23 @@ def {impl_name}(
     return impl_str.strip()
 
 
-def _generate_non_w_impl(sub_graph: Graph, sub_graph_id: int, ctx: Context) -> str:
-    """Direct op-impl wrapper for non-workload-scheduled subgraphs.
-
-    Mirrors the Triton backend: the single op carries all of its own
-    codegen via :func:`get_impl_func`; this layer just stitches the
-    function signature and indents the op-impl body.
-    """
-    assert len(sub_graph.op_list) == 1, (
-        "Expected exactly one operation in non-workload-scheduled "
-        "sub-graph for direct implementation."
-    )
-
-    arg_list = [f"tensor_{tid}" for tid in sub_graph.input_tensor_ids]
-    arg_list += [f"tensor_{tid}" for tid in sub_graph.output_tensor_ids]
-    arg_list.append("ctx")
-    args_def = ",\n".join(f"{INDENT}{arg}" for arg in arg_list)
-
-    op_impl_str = indent_block(
-        get_impl_func(sub_graph.op_list[0])(sub_graph, 0, ctx), 1,
-    )
-
-    impl_str = f"""
-def {ctx.sparse_attention_name}_subgraph_{sub_graph_id}_impl(
-{args_def}
-):
-{op_impl_str}
-"""
-    return impl_str.strip()
-
-
 def generate_cuda_impl(
     sub_graph: Graph,
     sub_graph_id: int,
     ctx: Context,
 ) -> str:
-    """Generate a CUDA kernel and its Python wrapper implementation.
+    """Generate the CUDA Schedule.W kernel and its Python wrapper.
 
-    Dispatches on :attr:`Graph.schedule`:
-
-      - ``Schedule.W`` → :func:`_generate_w_impl` (CUDA kernel + host
-        launcher embedded as a JIT-compiled extension).
-      - anything else → :func:`_generate_non_w_impl` (single-op direct
-        Python wrapper).
-
-    Also registers the headers needed by the generated module —
-    ``interface.py`` dedups them, so re-extending across subgraphs is
-    safe.
+    Schedule.S subgraphs are routed through
+    :mod:`indexer.compiler.custom_impl` by
+    :mod:`indexer.compiler.impl` and never reach this function.
     """
+    assert sub_graph.schedule == Schedule.W, (
+        f"generate_cuda_impl only handles Schedule.W; got {sub_graph.schedule}. "
+        f"Schedule.S subgraphs are dispatched via indexer.compiler.impl."
+    )
     ctx.compilation_header_lines.extend([
         "import torch",
         "from torch.utils.cpp_extension import load_inline",
-        # Needed by the Schedule.S codegens reused from triton_impl
-        # (see :mod:`cuda_impl.register`). Harmless on pure-W flows —
-        # ``interface.py`` dedups headers, and unused imports cost
-        # nothing at runtime.
-        "import triton",
-        "import triton.language as tl",
     ])
-    if sub_graph.schedule == Schedule.W:
-        return _generate_w_impl(sub_graph, sub_graph_id, ctx)
-    return _generate_non_w_impl(sub_graph, sub_graph_id, ctx)
+    return _generate_w_impl(sub_graph, sub_graph_id, ctx)

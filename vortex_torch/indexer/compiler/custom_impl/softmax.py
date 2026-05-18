@@ -1,4 +1,4 @@
-"""softmax — launcher emitter.
+"""softmax — launcher emitter (Schedule.S, backend-agnostic).
 
 The kernel body lives in ``vortex_torch.custom_ops.softmax.<backend>.default.kernel``
 (real ``@triton.jit`` functions, one per backend). The leaf's
@@ -13,7 +13,7 @@ from ...context import Context
 from ....utils import INDENT
 from ....abs import FORMAT
 from ...scan import Softmax
-from .backend import get_backend
+from ..backend import get_backend
 
 
 def generate_softmax_impl(graph: Graph, op_id: int, ctx: Context) -> str:
@@ -46,6 +46,10 @@ def generate_softmax_impl(graph: Graph, op_id: int, ctx: Context) -> str:
         per_row_launch = "ctx.metadata.dense_kv_indptr"
         extra_launch_block = ""
 
+    # Pass both real inner sizes (for memory strides) and their pow2
+    # round-ups (for ``tl.arange`` block-shape constexprs). When the
+    # real shape is already pow2 the two are identical and the kernel
+    # emits no inner-dim mask.
     impl_lines = [
         f"{INDENT}eff_batch_size = ctx.metadata.batch_size * ctx.num_kv_heads",
         f"",
@@ -57,8 +61,10 @@ def generate_softmax_impl(graph: Graph, op_id: int, ctx: Context) -> str:
         f"{INDENT*2}ctx.block_reserved_bos,",
         f"{INDENT*2}ctx.block_reserved_eos,",
         f"{INDENT*2}ctx.topk_val,",
-        f"{INDENT*2}tensor_{input_tensor_id}.shape[-2],",
-        f"{INDENT*2}tensor_{input_tensor_id}.shape[-1],",
+        f"{INDENT*2}{t_i.shape[1]},",
+        f"{INDENT*2}{t_i.shape[2]},",
+        f"{INDENT*2}{t_i.padded_shape[1]},",
+        f"{INDENT*2}{t_i.padded_shape[2]},",
         f"{extra_launch_block}{INDENT*2}eff_batch_size,",
         f"{INDENT})",
     ]
