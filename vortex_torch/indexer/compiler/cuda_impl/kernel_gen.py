@@ -15,6 +15,7 @@ helper symbols are exported for in-tree debugging and tests.
 """
 from __future__ import annotations
 
+import re
 from typing import Iterable, List, Tuple
 
 import torch
@@ -56,6 +57,30 @@ _TORCH_TO_CPP_TYPES = {
     torch.float8_e5m2:   ("uint8_t",       "uint8_t"),
     torch.float8_e4m3fn: ("uint8_t",       "uint8_t"),
 }
+
+
+# Byte size of each supported dtype — used to compute dynamic shared-memory
+# offsets in :func:`generate_initialization_str`.
+_TORCH_DTYPE_BYTES = {
+    torch.float32:       4,
+    torch.float16:       2,
+    torch.bfloat16:      2,
+    torch.int32:         4,
+    torch.int64:         8,
+    torch.uint8:         1,
+    torch.int8:          1,
+    torch.float8_e5m2:   1,
+    torch.float8_e4m3fn: 1,
+}
+
+
+def _dtype_bytes(dtype) -> int:
+    try:
+        return _TORCH_DTYPE_BYTES[dtype]
+    except KeyError:
+        raise NotImplementedError(
+            f"cuda_impl.kernel_gen: unsupported tensor dtype {dtype!r}"
+        )
 
 
 def _is_fp8(t) -> bool:
@@ -119,14 +144,140 @@ def _cpp_data_ptr_expr(name: str, dtype) -> str:
 #   * ``<cuda_fp16.h>`` / ``<cuda_bf16.h>`` — ``__half`` / ``__nv_bfloat16``
 #     names used in the kernel signature and the launcher's
 #     ``reinterpret_cast``s.
+#   * ``<cuda_pipeline.h>``           — ``__pipeline_memcpy_async`` /
+#     ``__pipeline_commit`` / ``__pipeline_wait_prior`` for the
+#     async-copy load path. Available on sm_80+ (Ampere) and is the
+#     standard headers-only wrapper for ``cp.async.cg`` PTX.
 #   * ``<cstdint>``                   — ``int32_t``, ``int64_t``, ``uint8_t``.
 _CUDA_KERNEL_PREAMBLE = (
     "#include <torch/extension.h>\n"
     "#include <ATen/cuda/CUDAContext.h>\n"
     "#include <cuda_fp16.h>\n"
     "#include <cuda_bf16.h>\n"
+    "#include <cuda_pipeline.h>\n"
     "#include <cstdint>"
 )
+
+
+def _pick_vec_bytes(
+    n_elems: int, elem_bytes: int, stride_bytes: int,
+) -> int:
+    """Largest power-of-two vector size in {16, 8, 4, elem_bytes} that
+    satisfies the **two** alignment constraints for an unrolled-vector
+    copy:
+
+      * ``(n_elems * elem_bytes) % vec_bytes == 0`` — the span length
+        fits the vector lane count.
+      * ``stride_bytes % vec_bytes == 0`` — the per-row / per-page
+        starting offset baked into the caller's pointer expression
+        (e.g. ``tensor_X_ptr + idx * block_elems`` becomes
+        ``stride_bytes = block_elems * elem_bytes``) is also
+        ``vec_bytes``-aligned. Without this check, a small ``block_elems``
+        (e.g. ``1`` for ``[chunk, 1, 1]`` output tiles) lets a non-trivial
+        ``idx`` start the load on an unaligned address — ``int4``
+        reinterpret_cast triggers ``cudaErrorMisalignedAddress`` at
+        runtime even when the span size itself is a clean multiple of 16.
+
+    Smem tiles are 16-byte aligned by
+    :func:`generate_initialization_str` and torch's cudaMalloc
+    allocations are ≥ 256-byte aligned, so the implicit ``tensor_X_ptr``
+    / ``__vortex_dyn_smem`` bases never break the constraint — only the
+    runtime-variable index step does, which is what ``stride_bytes``
+    encodes. Falls back to a single-element copy
+    (``vec_bytes == elem_bytes``) when no wider option fits.
+    """
+    total_bytes = n_elems * elem_bytes
+    for vb in (16, 8, 4):
+        if vb <= elem_bytes:
+            continue
+        if total_bytes % vb == 0 and stride_bytes % vb == 0:
+            return vb
+    return elem_bytes
+
+
+_VEC_BYTES_TO_CTYPE = {
+    16: "int4",
+    8:  "int2",
+    4:  "int",
+}
+
+
+def _emit_vector_copy_loop(
+    dst_ptr_expr: str, src_ptr_expr: str, n_elems: int,
+    elem_bytes: int, indent_level: int, stride_bytes: int,
+    async_load: bool = False,
+) -> str:
+    """Block-cooperative ``n_elems`` element copy from ``src_ptr_expr``
+    to ``dst_ptr_expr``, vectorised when the span size *and* the per-row
+    stride in bytes both line up with the vector lane count.
+
+    Both pointer expressions are evaluated *inside* the emitted scope so
+    each thread sees the same per-iteration offset. ``stride_bytes`` is
+    the byte distance between consecutive starting addresses of this
+    copy as the surrounding index changes — pass
+    ``block_elems * elem_bytes`` for the contig load/store path
+    (``tensor_X_ptr + idx * block_elems``) and
+    ``page_elems * elem_bytes`` for the multi-page paths
+    (``dst + p * page_elems`` / ``src + p * page_elems``). The
+    vectorisation choice is the largest power-of-two width that divides
+    both ``n_elems * elem_bytes`` and ``stride_bytes``; see
+    :func:`_pick_vec_bytes`.
+
+    ``async_load=True`` rewrites the vectorised copy to use
+    ``__pipeline_memcpy_async`` (cp.async.cg.shared.global PTX). The
+    issuing thread doesn't stall on the load; the caller is responsible
+    for emitting one ``__pipeline_commit()`` per load section and one
+    ``__pipeline_wait_prior(0)`` before the first consumer of the
+    loaded data. cp.async only accepts 4 / 8 / 16-byte payloads, so the
+    scalar fallback (``vec_bytes <= elem_bytes``, i.e. < 4 bytes) stays
+    on the regular synchronous path even when ``async_load`` is set.
+
+    Scalar fallback uses ``elem_bytes``-wide loads (a single ``dst[j] =
+    src[j]`` per thread per stride). The vectorised path reinterprets
+    both pointers as ``int4`` (16 B), ``int2`` (8 B) or ``int`` (4 B)
+    and shrinks the stride loop count proportionally.
+    """
+    pre = INDENT * indent_level
+    vec_bytes = _pick_vec_bytes(n_elems, elem_bytes, stride_bytes)
+    # Parenthesise the pointer expressions so callers can pass arbitrary
+    # ``ptr + offset`` arithmetic without it binding looser than the
+    # trailing ``[j]`` subscript — e.g. ``src + p * 1[j]`` parses as
+    # ``src + p * (1[j])`` and chokes nvcc.
+    dst_p = f"({dst_ptr_expr})"
+    src_p = f"({src_ptr_expr})"
+    if vec_bytes <= elem_bytes:
+        # Scalar fallback — synchronous regardless of ``async_load``.
+        return (
+            f"{pre}for (int j = tid; j < {n_elems}; j += blockDim.x) {{\n"
+            f"{pre}{INDENT}{dst_p}[j] = {src_p}[j];\n"
+            f"{pre}}}"
+        )
+    vec_ty = _VEC_BYTES_TO_CTYPE[vec_bytes]
+    lane = vec_bytes // elem_bytes
+    n_vec = n_elems // lane
+    if async_load:
+        # cp.async.cg.shared.global — non-blocking from the issuing
+        # thread, bound to the current pipeline group. The caller's
+        # ``__pipeline_commit()`` + ``__pipeline_wait_prior(0)`` book-
+        # ending is what makes the loaded data visible.
+        return (
+            f"{pre}{{\n"
+            f"{pre}{INDENT}{vec_ty}* __dst_v = reinterpret_cast<{vec_ty}*>{dst_p};\n"
+            f"{pre}{INDENT}const {vec_ty}* __src_v = reinterpret_cast<const {vec_ty}*>{src_p};\n"
+            f"{pre}{INDENT}for (int j = tid; j < {n_vec}; j += blockDim.x) {{\n"
+            f"{pre}{INDENT}{INDENT}__pipeline_memcpy_async(__dst_v + j, __src_v + j, {vec_bytes});\n"
+            f"{pre}{INDENT}}}\n"
+            f"{pre}}}"
+        )
+    return (
+        f"{pre}{{\n"
+        f"{pre}{INDENT}{vec_ty}* __dst_v = reinterpret_cast<{vec_ty}*>{dst_p};\n"
+        f"{pre}{INDENT}const {vec_ty}* __src_v = reinterpret_cast<const {vec_ty}*>{src_p};\n"
+        f"{pre}{INDENT}for (int j = tid; j < {n_vec}; j += blockDim.x) {{\n"
+        f"{pre}{INDENT}{INDENT}__dst_v[j] = __src_v[j];\n"
+        f"{pre}{INDENT}}}\n"
+        f"{pre}}}"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -179,70 +330,219 @@ def _iter_kernel_tensors(sub_graph) -> Iterable[Tuple[int, str]]:
 # Initialization / Load / Store / Computation codegen (CUDA C++)
 # --------------------------------------------------------------------------- #
 
+def _tensor_smem_bytes(t, chunk: int) -> int:
+    """16-byte-aligned smem byte cost of a single tile of tensor ``t``.
+
+    BATCHED tiles collapse the leading dim to 1 — one slot per
+    ``(batch, head)`` is all the BATCHED codegens ever touch.
+    """
+    leading = 1 if t._format == FORMAT.BATCHED else chunk
+    elem_bytes = _dtype_bytes(t.dtype)
+    size = leading * t.shape[1] * t.shape[2] * elem_bytes
+    return (size + 15) & ~15
+
+
+def _compute_tensor_lifetimes(sub_graph: Graph):
+    """Per-tensor ``(first_phase, last_phase)`` over the iteration body.
+
+    Phases ordered as:
+
+      * ``-1`` — ``LOAD_PHASE``. All inputs reach smem here in a single
+        scope; multiple inputs cannot overlap with each other in smem
+        because they're all written at this phase.
+      * ``0 .. len(op_list) - 1`` — compute phases, one per op. A tile
+        is read at the start of its consumer's phase and (for the
+        producer's output) written at the end of the producer's phase.
+        We conservatively bind both ends to the same op id; the
+        ``last_phase >= first_phase`` overlap test means an op's
+        inputs and outputs are treated as simultaneously live, so a
+        single-op in-place reuse stays out of reach. That keeps us
+        safe for reductions / broadcasts where multiple threads need
+        to see the input slot intact while writing the output slot.
+      * ``len(op_list)`` — ``STORE_PHASE``. All outputs drain here in
+        a single scope; outputs cannot overlap with each other.
+
+    A Load+Save tensor (sits in both input and output sets) gets
+    ``(-1, n_ops)`` — alive across the entire iteration body.
+    """
+    n_ops = len(sub_graph.op_list)
+    LOAD_PHASE = -1
+    STORE_PHASE = n_ops
+    input_set = set(sub_graph.input_tensor_ids)
+    output_set = set(sub_graph.output_tensor_ids)
+    lifetimes = {}
+    for tid in range(len(sub_graph.tensor_list)):
+        is_input = tid in input_set
+        is_output = tid in output_set
+        read_ops = [
+            op_id for op_id, inputs in enumerate(sub_graph.op_to_input_tensor_list)
+            if tid in inputs
+        ]
+        write_ops = [
+            op_id for op_id, outputs in enumerate(sub_graph.op_to_output_tensor_list)
+            if tid in outputs
+        ]
+        if is_input:
+            first = LOAD_PHASE
+        elif write_ops:
+            first = min(write_ops)
+        else:
+            # No producer and not a subgraph input — should not normally
+            # happen, but stay safe by pinning to LOAD_PHASE so the
+            # tile sticks around until something consumes it.
+            first = LOAD_PHASE
+        if is_output:
+            last = STORE_PHASE
+        elif read_ops:
+            last = max(read_ops)
+        elif write_ops:
+            # Written but never read and not an output. Dead immediately
+            # after its writing op; keep birth == death.
+            last = max(write_ops)
+        else:
+            last = first
+        lifetimes[tid] = (first, last)
+    return lifetimes
+
+
+def _allocate_smem_offsets(sub_graph: Graph, ctx: Context):
+    """Greedy lifetime-aware smem allocator.
+
+    Returns ``(offsets, sizes, lifetimes, total_bytes)``. Tensors whose
+    lifetimes don't overlap can share the same byte range, dropping
+    per-kernel smem from the trivial sum-of-tiles bound. On the
+    elementwise-heavy flows in this repo (``masked_quest``,
+    ``gqa_quest``, ``lserve``) this typically halves or thirds the
+    footprint, unlocking 2-3× the concurrent blocks per SM that the
+    previous static layout could host.
+
+    Algorithm: linear-scan in birth order. For each tensor, take the
+    lowest 16-byte-aligned offset whose ``[offset, offset+size)``
+    doesn't overlap any still-live previously-placed tile. Lifetimes
+    use ``>=`` for the overlap test (see :func:`_compute_tensor_lifetimes`)
+    so an op's inputs and outputs never overlap — that keeps reduce /
+    broadcast op semantics intact even though their codegen does
+    technically read-then-write within a single phase.
+    """
+    chunk = ctx.workload_chunk_size
+    n = len(sub_graph.tensor_list)
+
+    sizes = {
+        tid: _tensor_smem_bytes(t, chunk)
+        for tid, t in enumerate(sub_graph.tensor_list)
+    }
+    lifetimes = _compute_tensor_lifetimes(sub_graph)
+
+    # Sort by birth ascending; tie-break by size descending so the
+    # tallest tile in a birth cohort gets first pick of the floor.
+    order = sorted(
+        range(n),
+        key=lambda t: (lifetimes[t][0], -sizes[t]),
+    )
+
+    offsets = {}
+    for tid in order:
+        first, _ = lifetimes[tid]
+        size = sizes[tid]
+
+        # Live conflicts = previously-placed tiles whose death is at
+        # or after this tile's birth.
+        conflicts = []
+        for placed_tid, off in offsets.items():
+            _, placed_last = lifetimes[placed_tid]
+            if placed_last >= first:
+                conflicts.append((off, off + sizes[placed_tid]))
+        conflicts.sort()
+
+        # Merge overlapping intervals so the gap-finding loop has
+        # disjoint slots to compare against.
+        merged = []
+        for s, e in conflicts:
+            if merged and s <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+            else:
+                merged.append((s, e))
+
+        candidate = 0
+        for s, e in merged:
+            candidate = (candidate + 15) & ~15
+            if candidate + size <= s:
+                break
+            candidate = max(candidate, e)
+        candidate = (candidate + 15) & ~15
+        offsets[tid] = candidate
+
+    total = max((offsets[t] + sizes[t] for t in offsets), default=0)
+    return offsets, sizes, lifetimes, total
+
+
 def generate_initialization_str(sub_graph: Graph, ctx: Context) -> str:
-    """Declare a static ``__shared__`` tile for **every** tensor in the
-    subgraph — inputs, outputs, AND intermediates.
+    """Declare typed-pointer smem aliases for every tensor in the subgraph.
 
-    Iterates :attr:`Graph.tensor_list` directly (one entry per unique
-    local tensor id, populated by
-    :func:`graph._build_local_graph` from the union of every op's
-    input + output tensors). That covers:
-
-      * Subgraph inputs — populated by :func:`generate_load_tensor_str`.
-      * Subgraph outputs — drained by :func:`generate_store_tensor_str`.
-      * Intermediates — written by one op and consumed by a later op
-        within the same subgraph. They never touch global memory; the
-        smem tile is their only storage.
-
-    Load+Save tensors (in both input and output sets) appear as a
-    single entry in ``tensor_list`` and therefore get exactly one tile,
-    just like every other tensor.
+    Every tensor's tile lives inside one ``extern __shared__`` blob
+    (``__vortex_dyn_smem``). Per-tensor offsets are picked by
+    :func:`_allocate_smem_offsets` from a liveness analysis of the
+    subgraph: tiles whose ``(first_phase, last_phase)`` windows don't
+    overlap can share the same byte range. The pointer-alias
+    declarations preserve the source-level access pattern of every
+    op codegen (``tensor_<id>_smem[i][j][k]`` /
+    ``&tensor_<id>_smem[0][0][0]``) — only the offset arithmetic baked
+    into each ``reinterpret_cast`` changes between layout strategies.
 
     Each tile is sized by the tensor's format:
 
       * RAGGED / PAGED:
-            __shared__ <cuda_t> tensor_<id>_smem
-                [workload_chunk_size][t.shape[1]][t.shape[2]];
+            ``[workload_chunk_size][t.shape[1]][t.shape[2]]``
         Matches Triton's per-workload tile shape — one chunk of
-        ragged blocks / paged blocks per iteration. (Intermediates
+        ragged blocks / paged blocks per iteration. Intermediates
         from Elementwise / Elementwise_Binary follow this layout when
-        they inherit RAGGED format.)
+        they inherit RAGGED format.
       * BATCHED:
-            __shared__ <cuda_t> tensor_<id>_smem
-                [1][t.shape[1]][t.shape[2]];
-        BATCHED tensors are one slot per ``(batch, head)`` and the
-        body only ever touches index ``0`` of the leading dim, so
-        collapsing it to ``1`` saves the otherwise-wasted
-        ``(workload_chunk_size - 1) * shape[1] * shape[2]`` slots of
-        shared memory. Load / compute / store codegens index BATCHED
-        tiles via ``tensor_<id>_smem[0][...]`` explicitly.
+            ``[1][t.shape[1]][t.shape[2]]``
+        BATCHED tensors are one slot per ``(batch, head)``; the body
+        only ever touches index ``0`` of the leading dim. Collapsing
+        to ``1`` saves the otherwise-wasted
+        ``(workload_chunk_size - 1) * shape[1] * shape[2]`` slots.
 
     The element type is the tensor's **storage** dtype (``__half`` /
     ``__nv_bfloat16`` / ``float`` / ``uint8_t`` / ``int32_t`` /
-    ``int8_t``). Storing in the narrow dtype halves the smem footprint
-    vs fp32 and matches typical attention-kernel patterns; body codegen
-    is responsible for promoting to fp32 in registers during arithmetic
-    (see :mod:`cuda_impl.dtype_cast`) and
-    for any cooperative zero-initialization a BATCHED accumulator
-    might need before the workload loop (followed by a
-    ``__syncthreads()`` before the first read).
-    """
-    lines: List[str] = []
-    chunk = ctx.workload_chunk_size
+    ``int8_t``). Body codegen is responsible for promoting to fp32 in
+    registers during arithmetic (see :mod:`cuda_impl.dtype_cast`).
 
+    The launcher pairs this with
+    ``cudaFuncSetAttribute(MaxDynamicSharedMemorySize, …)`` when the
+    total exceeds 48 KB — see :func:`generate_cuda_launcher`.
+    """
+    if not sub_graph.tensor_list:
+        return "// No initialization required"
+
+    offsets, sizes, lifetimes, total = _allocate_smem_offsets(sub_graph, ctx)
+
+    # Stash the total on the subgraph so the launcher can read it.
+    sub_graph._smem_bytes = total  # type: ignore[attr-defined]
+    # Stash the lifetimes + offsets so downstream codegens (e.g. a
+    # future async-copy pass) can ask "is tile X still live during op
+    # Y" without re-running the analysis.
+    sub_graph._smem_offsets = offsets    # type: ignore[attr-defined]
+    sub_graph._smem_sizes = sizes        # type: ignore[attr-defined]
+    sub_graph._tensor_lifetimes = lifetimes  # type: ignore[attr-defined]
+
+    lines: List[str] = ["extern __shared__ unsigned char __vortex_dyn_smem[];"]
     for tid, t in enumerate(sub_graph.tensor_list):
         cuda_t = _cpp_kernel_value_type(t.dtype)
-        leading = 1 if t._format == FORMAT.BATCHED else chunk
+        first, last = lifetimes[tid]
         lines.append(
-            f"__shared__ {cuda_t} tensor_{tid}_smem"
-            f"[{leading}][{t.shape[1]}][{t.shape[2]}];"
+            f"{cuda_t} (*tensor_{tid}_smem)[{t.shape[1]}][{t.shape[2]}] = "
+            f"reinterpret_cast<{cuda_t} (*)[{t.shape[1]}][{t.shape[2]}]>"
+            f"(__vortex_dyn_smem + {offsets[tid]});"
+            f"  // life=[{first},{last}] sz={sizes[tid]}"
         )
-
-    return "\n".join(lines) if lines else "// No initialization required"
+    return "\n".join(lines)
 
 
 def _emit_contig_load(
     tid: int, cuda_t: str, src_offset_expr: str, n_elems: int,
+    elem_bytes: int, block_elems: int,
 ) -> str:
     """Strided block-cooperative copy of ``n_elems`` contiguous elements
     from ``tensor_<tid>_ptr + src_offset_expr`` into
@@ -250,26 +550,41 @@ def _emit_contig_load(
 
     Used for BATCHED, RAGGED, and PAGED single-page loads — all three
     map to a contiguous span in global memory and differ only in
-    ``src_offset_expr``. The strided pattern
-    ``for (j = tid; j < N; j += blockDim.x)`` makes ``N`` (and the
-    block_size baked in by nvcc) the only thing that varies with
-    ``workload_chunk_size`` — chunk in [16, 32, 64, 128] just scales
-    the iteration count per thread.
+    ``src_offset_expr``. The strided pattern is delegated to
+    :func:`_emit_vector_copy_loop`, which picks the widest ``int4`` /
+    ``int2`` / ``int`` bulk-copy width compatible with both the span
+    length and the per-index stride.
+
+    ``block_elems`` is the per-index element step — the surrounding
+    workload index multiplies it to form ``src_offset_expr``. The byte
+    form ``block_elems * elem_bytes`` is what bounds the alignment
+    available across all index values: for a tile shaped
+    ``[chunk, 1, 1]`` the stride is just ``elem_bytes`` and the
+    fallback is scalar, even though ``n_elems = chunk`` looks large
+    enough to vectorise — without this check, an unaligned
+    ``ragged_idx`` triggers ``cudaErrorMisalignedAddress``.
     """
+    body = _emit_vector_copy_loop(
+        dst_ptr_expr="dst",
+        src_ptr_expr="src",
+        n_elems=n_elems,
+        elem_bytes=elem_bytes,
+        indent_level=1,
+        stride_bytes=block_elems * elem_bytes,
+        async_load=True,
+    )
     return (
         f"{{\n"
         f"{INDENT}auto* dst = &tensor_{tid}_smem[0][0][0];\n"
         f"{INDENT}const {cuda_t}* src = tensor_{tid}_ptr + {src_offset_expr};\n"
-        f"{INDENT}for (int j = tid; j < {n_elems}; j += blockDim.x) {{\n"
-        f"{INDENT}{INDENT}dst[j] = src[j];\n"
-        f"{INDENT}}}\n"
+        f"{body}\n"
         f"}}"
     )
 
 
 def _emit_multipage_load(
     tid: int, cuda_t: str, npw: int, nbp: int, block_elems: int,
-    zero_expr: str,
+    elem_bytes: int, zero_expr: str,
 ) -> str:
     """Page-by-page gather for PAGED inputs spanning multiple pages.
 
@@ -290,9 +605,28 @@ def _emit_multipage_load(
 
     Pages are written contiguously in smem (page p → slots
     ``[p*nbp, (p+1)*nbp)`` of the chunk axis), so compute and store
-    index by ``chunk_idx`` and don't need to know the page layout.
+    index by ``chunk_idx`` and don't need to know the page layout. The
+    per-page copy goes through :func:`_emit_vector_copy_loop` so the
+    valid-page branch picks up the same ``int4`` / ``int2`` widening
+    as the contig path. The zero-fill branch stays scalar — the
+    ``zero_expr`` is a per-element value of the storage dtype, not a
+    vector, and the cost of the cold-page write is dominated by the
+    valid-page reads anyway.
     """
     page_elems = nbp * block_elems
+    # Both dst (smem at p*page_elems) and src (global at block_idx*block_elems)
+    # advance by ``block_elems * elem_bytes`` per index step (p / block_idx).
+    # The src stride is the tighter of the two since smem is already 16-aligned
+    # and ``page_elems = nbp * block_elems`` is a multiple of ``block_elems``.
+    valid_copy = _emit_vector_copy_loop(
+        dst_ptr_expr=f"dst + p * {page_elems}",
+        src_ptr_expr="src",
+        n_elems=page_elems,
+        elem_bytes=elem_bytes,
+        indent_level=3,
+        stride_bytes=block_elems * elem_bytes,
+        async_load=True,
+    )
     return (
         f"{{\n"
         f"{INDENT}auto* dst = &tensor_{tid}_smem[0][0][0];\n"
@@ -302,10 +636,7 @@ def _emit_multipage_load(
         f"indices[ragged_idx_i32 + p * {nbp}];\n"
         f"{INDENT}{INDENT}{INDENT}const {cuda_t}* src = "
         f"tensor_{tid}_ptr + block_idx * {block_elems};\n"
-        f"{INDENT}{INDENT}{INDENT}for (int j = tid; j < {page_elems}; "
-        f"j += blockDim.x) {{\n"
-        f"{INDENT}{INDENT}{INDENT}{INDENT}dst[p * {page_elems} + j] = src[j];\n"
-        f"{INDENT}{INDENT}{INDENT}}}\n"
+        f"{valid_copy}\n"
         f"{INDENT}{INDENT}}} else {{\n"
         f"{INDENT}{INDENT}{INDENT}for (int j = tid; j < {page_elems}; "
         f"j += blockDim.x) {{\n"
@@ -406,6 +737,8 @@ def generate_load_tensor_str(sub_graph: Graph, ctx: Context) -> str:
             tid, _cpp_kernel_value_type(t.dtype),
             src_offset_expr=f"new_batch_idx_i32 * {block_elems}",
             n_elems=block_elems,
+            elem_bytes=_dtype_bytes(t.dtype),
+            block_elems=block_elems,
         ))
 
     for tid, t in ragged:
@@ -414,6 +747,8 @@ def generate_load_tensor_str(sub_graph: Graph, ctx: Context) -> str:
             tid, _cpp_kernel_value_type(t.dtype),
             src_offset_expr=f"ragged_idx_i32 * {block_elems}",
             n_elems=chunk * block_elems,
+            elem_bytes=_dtype_bytes(t.dtype),
+            block_elems=block_elems,
         ))
 
     for tid, t in paged:
@@ -424,20 +759,31 @@ def generate_load_tensor_str(sub_graph: Graph, ctx: Context) -> str:
                 tid, cuda_t,
                 src_offset_expr=f"page_idx_i32 * {block_elems}",
                 n_elems=chunk * block_elems,
+                elem_bytes=_dtype_bytes(t.dtype),
+                block_elems=block_elems,
             ))
         else:
             sections.append(_emit_multipage_load(
                 tid, cuda_t, npw=npw, nbp=nbp, block_elems=block_elems,
+                elem_bytes=_dtype_bytes(t.dtype),
                 zero_expr=cast_float_to_smem("0.0f", t.dtype),
             ))
 
-    # No trailing ``__syncthreads()`` — see docstring; consumers of
-    # this load's smem (compute or store) emit their own start-sync.
+    # Trailing ``__pipeline_commit()`` commits every cp.async issued
+    # in the per-tensor blocks above into a single pipeline group.
+    # The first compute op pairs this with a ``__pipeline_wait_prior(0)``
+    # — see :func:`generate_computation_str`. Sync-load tiles that
+    # bypass cp.async (scalar fallback paths or zero-fill in the
+    # multi-page invalid branch) sit in the same group; the commit
+    # treats them as a no-op for the async pipeline, and their writes
+    # are flushed by the same downstream ``__syncthreads()``.
+    sections.append("__pipeline_commit();")
     return "\n\n".join(sections)
 
 
 def _emit_contig_store(
     tid: int, cuda_t: str, dst_offset_expr: str, n_elems_expr: str,
+    elem_bytes: int, n_elems_const: int = 0, block_elems: int = 0,
 ) -> str:
     """Strided block-cooperative copy of ``n_elems_expr`` contiguous
     elements from ``tensor_<tid>_smem`` (flattened) to
@@ -450,13 +796,74 @@ def _emit_contig_store(
     trailing invalid blocks; BATCHED uses ``block_elems`` because each
     batch slot is exactly one row; PAGED single-page uses
     ``chunk * block_elems`` since the page is always fully populated).
+
+    Vectorisation policy:
+
+      * BATCHED / PAGED single-page — ``n_elems_const > 0`` is supplied
+        and the loop iterates a compile-time-known number of elements;
+        delegate to :func:`_emit_vector_copy_loop`, which folds the
+        constant into the ``int4`` / ``int2`` widening decision.
+      * RAGGED — ``n_elems_expr`` is ``_len * block_elems``, a runtime
+        value. We still vectorise across the chunks (``block_elems``
+        boundary is the same per-row constant from the load side, so
+        the same alignment guarantees hold), and the loop iterates
+        ``_len * (block_elems / lane)`` vector slots.
+
+    ``block_elems`` is required for the RAGGED path so the runtime
+    ``_len`` factor can be combined with the compile-time per-row
+    vector lane count.
     """
+    if n_elems_const > 0:
+        # Constant span (BATCHED / PAGED single-page). The dst stride
+        # per workload index is ``block_elems * elem_bytes`` — the same
+        # per-row stride the load side uses. For the BATCHED case
+        # callers pass ``block_elems == n_elems_const`` (block_elems is
+        # exactly one row); for PAGED single-page they pass
+        # ``block_elems`` itself. Default to the span length when the
+        # caller didn't supply a per-index stride (already aligned).
+        stride_bytes = (block_elems if block_elems > 0 else n_elems_const) * elem_bytes
+        body = _emit_vector_copy_loop(
+            dst_ptr_expr="dst",
+            src_ptr_expr="src",
+            n_elems=n_elems_const,
+            elem_bytes=elem_bytes,
+            indent_level=1,
+            stride_bytes=stride_bytes,
+        )
+        return (
+            f"{{\n"
+            f"{INDENT}{cuda_t}* dst = tensor_{tid}_ptr + {dst_offset_expr};\n"
+            f"{INDENT}const auto* src = &tensor_{tid}_smem[0][0][0];\n"
+            f"{body}\n"
+            f"}}"
+        )
+
+    # RAGGED — vectorise inside the constant ``block_elems`` factor and
+    # leave ``_len`` as the runtime loop bound on the vector count.
+    assert block_elems > 0, "RAGGED store requires block_elems for vec lane math"
+    vec_bytes = _pick_vec_bytes(block_elems, elem_bytes, block_elems * elem_bytes)
+    if vec_bytes <= elem_bytes:
+        return (
+            f"{{\n"
+            f"{INDENT}{cuda_t}* dst = tensor_{tid}_ptr + {dst_offset_expr};\n"
+            f"{INDENT}const auto* src = &tensor_{tid}_smem[0][0][0];\n"
+            f"{INDENT}for (int j = tid; j < {n_elems_expr}; j += blockDim.x) {{\n"
+            f"{INDENT}{INDENT}dst[j] = src[j];\n"
+            f"{INDENT}}}\n"
+            f"}}"
+        )
+    vec_ty = _VEC_BYTES_TO_CTYPE[vec_bytes]
+    lane = vec_bytes // elem_bytes
+    per_row_vec = block_elems // lane
     return (
         f"{{\n"
         f"{INDENT}{cuda_t}* dst = tensor_{tid}_ptr + {dst_offset_expr};\n"
         f"{INDENT}const auto* src = &tensor_{tid}_smem[0][0][0];\n"
-        f"{INDENT}for (int j = tid; j < {n_elems_expr}; j += blockDim.x) {{\n"
-        f"{INDENT}{INDENT}dst[j] = src[j];\n"
+        f"{INDENT}{vec_ty}* __dst_v = reinterpret_cast<{vec_ty}*>(dst);\n"
+        f"{INDENT}const {vec_ty}* __src_v = reinterpret_cast<const {vec_ty}*>(src);\n"
+        f"{INDENT}const int __n_vec = _len * {per_row_vec};\n"
+        f"{INDENT}for (int j = tid; j < __n_vec; j += blockDim.x) {{\n"
+        f"{INDENT}{INDENT}__dst_v[j] = __src_v[j];\n"
         f"{INDENT}}}\n"
         f"}}"
     )
@@ -464,6 +871,7 @@ def _emit_contig_store(
 
 def _emit_multipage_store(
     tid: int, cuda_t: str, npw: int, nbp: int, block_elems: int,
+    elem_bytes: int,
 ) -> str:
     """Page-by-page scatter for PAGED outputs spanning multiple pages.
 
@@ -480,6 +888,17 @@ def _emit_multipage_store(
     is owned by the page allocator and won't be read at this index.
     """
     page_elems = nbp * block_elems
+    # Both dst (global at block_idx*block_elems) and src (smem at p*page_elems)
+    # advance by ``block_elems * elem_bytes`` per index step. The global side
+    # is the tighter constraint since smem is already 16-byte aligned.
+    page_copy = _emit_vector_copy_loop(
+        dst_ptr_expr="dst",
+        src_ptr_expr=f"src + p * {page_elems}",
+        n_elems=page_elems,
+        elem_bytes=elem_bytes,
+        indent_level=3,
+        stride_bytes=block_elems * elem_bytes,
+    )
     return (
         f"{{\n"
         f"{INDENT}const auto* src = &tensor_{tid}_smem[0][0][0];\n"
@@ -489,10 +908,7 @@ def _emit_multipage_store(
         f"indices[ragged_idx_i32 + p * {nbp}];\n"
         f"{INDENT}{INDENT}{INDENT}{cuda_t}* dst = "
         f"tensor_{tid}_ptr + block_idx * {block_elems};\n"
-        f"{INDENT}{INDENT}{INDENT}for (int j = tid; j < {page_elems}; "
-        f"j += blockDim.x) {{\n"
-        f"{INDENT}{INDENT}{INDENT}{INDENT}dst[j] = src[p * {page_elems} + j];\n"
-        f"{INDENT}{INDENT}{INDENT}}}\n"
+        f"{page_copy}\n"
         f"{INDENT}{INDENT}}}\n"
         f"{INDENT}}}\n"
         f"}}"
@@ -591,6 +1007,9 @@ def generate_store_tensor_str(sub_graph: Graph, ctx: Context) -> str:
                 tid, _cpp_kernel_value_type(t.dtype),
                 dst_offset_expr=f"new_batch_idx_i32 * {block_elems}",
                 n_elems_expr=str(block_elems),
+                elem_bytes=_dtype_bytes(t.dtype),
+                n_elems_const=block_elems,
+                block_elems=block_elems,
             ))
         sections.append(
             "if (_is_first_workload) {\n"
@@ -605,6 +1024,8 @@ def generate_store_tensor_str(sub_graph: Graph, ctx: Context) -> str:
             tid, _cpp_kernel_value_type(t.dtype),
             dst_offset_expr=f"ragged_idx_i32 * {block_elems}",
             n_elems_expr=f"_len * {block_elems}",
+            elem_bytes=_dtype_bytes(t.dtype),
+            block_elems=block_elems,
         ))
 
     # ---- 4. PAGED stores --------------------------------------------
@@ -616,10 +1037,14 @@ def generate_store_tensor_str(sub_graph: Graph, ctx: Context) -> str:
                 tid, cuda_t,
                 dst_offset_expr=f"page_idx_i32 * {block_elems}",
                 n_elems_expr=str(chunk * block_elems),
+                elem_bytes=_dtype_bytes(t.dtype),
+                n_elems_const=chunk * block_elems,
+                block_elems=block_elems,
             ))
         else:
             sections.append(_emit_multipage_store(
                 tid, cuda_t, npw=npw, nbp=nbp, block_elems=block_elems,
+                elem_bytes=_dtype_bytes(t.dtype),
             ))
 
     body = "\n\n".join(sections)
@@ -633,38 +1058,136 @@ def generate_store_tensor_str(sub_graph: Graph, ctx: Context) -> str:
     )
 
 
+_LEADING_SYNC_RE = re.compile(r"^\s*__syncthreads\s*\(\s*\)\s*;\s*\n")
+
+
 def generate_computation_str(sub_graph: Graph, ctx: Context) -> str:
-    """Emit per-op computation source by dispatching each op in
-    :attr:`Graph.op_list` (already in topological order) through the
-    CUDA codegen registry at :func:`register.get_impl_func`.
+    """Emit per-op computation source, with data-dependency-driven
+    ``__syncthreads()`` placement.
 
-    The return value is the concatenation of each op's CUDA C++ source,
-    separated by blank lines. Each op codegen is expected to:
+    Each op codegen emits its own leading ``__syncthreads();\\n`` at the
+    top of its body — kept that way so single-op codegens remain
+    correct in isolation (for tests / standalone use). Here we strip
+    those leading syncs and *re-insert* them only between op pairs
+    whose data flow actually requires a barrier.
 
-      * Read inputs from ``tensor_<id>_smem`` tiles populated by
-        :func:`generate_load_tensor_str`.
-      * Write outputs into ``tensor_<id>_smem`` tiles that
-        :func:`generate_store_tensor_str` will flush back to global.
-      * Promote storage dtypes to fp32 in registers for arithmetic
-        and demote on the way back to smem (matches the
-        narrow-storage / wide-compute pattern of the load/store
-        codegens).
-      * Emit ``__syncthreads()`` itself when its computation needs
-        cross-thread smem visibility — the surrounding load/store
-        syncs only bracket the section, not individual op
-        boundaries.
+    Sync placement rule. Maintain ``dirty`` = the set of tensor ids
+    written since the last barrier. Before each op, if its inputs
+    intersect ``dirty``, emit a sync and clear ``dirty``. Add the op's
+    output(s) to ``dirty`` afterwards.
 
-    Until CUDA op codegens land in
-    :mod:`cuda_impl.register.IMPL_REGISTRY`, this function will raise
-    ``NotImplementedError`` from ``get_impl_func`` for any subgraph
-    that actually contains ops. Empty subgraphs return the no-op
-    fallback comment.
+    Initial state. The load section writes inputs across threads
+    (different threads fill different elements of each tile), so all
+    subgraph inputs start out in ``dirty``. The first compute op that
+    reads any input therefore picks up its own leading sync — same as
+    the previous always-emit policy. The store section keeps its own
+    leading/trailing syncs (see :func:`generate_store_tensor_str`), so
+    we don't have to flush ``dirty`` here.
+
+    The optimisation matters on flows like ``masked_quest`` where
+    consecutive ``Multiply`` ops share inputs but don't read each
+    other's outputs — e.g. ``q*max`` and ``q*min`` are independent and
+    only ``Maximum`` later reads both. The old codegen synced before
+    every op (8 syncs for masked_quest's 8 W-ops); the new one syncs
+    only when needed, typically 4-5.
     """
-    lines = [
+    if not sub_graph.op_list:
+        return "// No computation required"
+
+    op_sources = [
         get_impl_func(op)(sub_graph, op_id, ctx)
         for op_id, op in enumerate(sub_graph.op_list)
     ]
-    return "\n\n".join(lines) if lines else "// No computation required"
+    # Each per-op codegen emits a leading ``__syncthreads();\n`` (kept
+    # for standalone correctness). Strip it so we control sync emission
+    # centrally below.
+    op_bodies = [_LEADING_SYNC_RE.sub("", src, count=1) for src in op_sources]
+
+    # Post-load barrier — unconditional. ``__pipeline_wait_prior(0)``
+    # only drains *this* thread's cp.async copies. With smem reuse
+    # (see :func:`_allocate_smem_offsets`) a later intermediate may
+    # share its byte range with a dead input that another thread is
+    # still cp.async-filling — the ``__syncthreads()`` here makes
+    # those cross-thread cp.async writes globally visible before any
+    # op touches a reused slot.
+    out_pieces: List[str] = [
+        "__pipeline_wait_prior(0);",
+        "__syncthreads();",
+    ]
+    syncs_kept = 1  # the unconditional post-load sync
+    syncs_dropped = 0
+
+    # Pull smem offsets/sizes that the allocator stashed on the
+    # subgraph. They let us decide overlap by byte range instead of
+    # tensor id — required for correctness under smem reuse where two
+    # different tensor ids point at the same offset.
+    offsets = sub_graph._smem_offsets  # type: ignore[attr-defined]
+    sizes = sub_graph._smem_sizes      # type: ignore[attr-defined]
+
+    def _byte_range(tid: int):
+        return (offsets[tid], offsets[tid] + sizes[tid])
+
+    def _ranges_overlap(a, b) -> bool:
+        return a[0] < b[1] and b[0] < a[1]
+
+    # ``written_since_sync`` — tids whose smem range was written since
+    # the last barrier. Reads of an overlapping range need a sync to
+    # see the writes.
+    # ``touched_since_sync`` — tids whose smem range was either read
+    # or written. Writes to an overlapping range need a sync to avoid
+    # races with the in-flight reads/writes from prior ops (this is
+    # the case smem reuse makes possible — see the rationale above).
+    written_since_sync: set = set()
+    touched_since_sync: set = set()
+
+    for op_id, body in enumerate(op_bodies):
+        inputs = set(sub_graph.op_to_input_tensor_list[op_id])
+        outputs = set(sub_graph.op_to_output_tensor_list[op_id])
+
+        need_sync = False
+        # 1. Read-after-write: this op's inputs overlap a tile written
+        #    since the last sync.
+        for tin in inputs:
+            r_in = _byte_range(tin)
+            for tdw in written_since_sync:
+                if _ranges_overlap(r_in, _byte_range(tdw)):
+                    need_sync = True
+                    break
+            if need_sync:
+                break
+        # 2. Write-after-anything: this op's outputs overlap a tile
+        #    touched (read or written) since the last sync. Catches
+        #    the smem-reuse race where a new intermediate shares a
+        #    dead input's slot but other threads are still reading
+        #    that input.
+        if not need_sync:
+            for tout in outputs:
+                r_out = _byte_range(tout)
+                for tt in touched_since_sync:
+                    if _ranges_overlap(r_out, _byte_range(tt)):
+                        need_sync = True
+                        break
+                if need_sync:
+                    break
+
+        if need_sync:
+            out_pieces.append("__syncthreads();")
+            written_since_sync.clear()
+            touched_since_sync.clear()
+            syncs_kept += 1
+        else:
+            syncs_dropped += 1
+
+        out_pieces.append(body)
+        written_since_sync |= outputs
+        touched_since_sync |= inputs
+        touched_since_sync |= outputs
+
+    # Stash counts so reviewers inspecting the generated TU can see
+    # how aggressive the sync placement ended up being.
+    sub_graph._syncs_kept = syncs_kept       # type: ignore[attr-defined]
+    sub_graph._syncs_dropped = syncs_dropped # type: ignore[attr-defined]
+    return "\n\n".join(out_pieces)
 
 
 # --------------------------------------------------------------------------- #
@@ -711,7 +1234,11 @@ def _build_kernel_signature(sub_graph) -> List[str]:
         cuda_t = _cpp_kernel_value_type(t.dtype)
         const_q = "const " if role == "input" else ""
         args.append(f"{const_q}{cuda_t}* __restrict__ tensor_{tid}_ptr")
-        args.append(f"int64_t tensor_{tid}_dim0")
+        # ``tensor_<id>_dim0`` used to land here as an ``int64_t`` mirror
+        # of the wrapper's ``tensor.shape[0]``, intended for bounds
+        # checks. No op codegen ever read it, so it was just consuming
+        # a kernel-arg slot (constant memory + an extra register on the
+        # cudaLaunchKernel marshalling path). Dropped.
     return args
 
 
@@ -810,11 +1337,30 @@ def generate_cuda_kernel(
     computation_str      = indent_block(generate_computation_str(sub_graph, ctx),    2)
     store_tensor_str     = indent_block(generate_store_tensor_str(sub_graph, ctx),   2)
 
+    # ``__launch_bounds__(maxThreadsPerBlock, minBlocksPerSM)`` tells
+    # nvcc the actual block_size we launch with so it can pick a
+    # register budget tuned for that occupancy target instead of the
+    # default "assume 1024 threads/block" pessimistic budget. Block
+    # size is fixed at 256 in :func:`generate_cuda_launcher`. The
+    # minBlocksPerSM hint biases nvcc towards higher occupancy when
+    # the smem budget allows (typical case post-Iter-1) and is a
+    # no-op when smem alone already throttles occupancy.
+    #
+    # An Iter-8 attempt to drop minBlocksPerSM (let nvcc decide
+    # per-kernel) measured mixed results — wins and losses cancelled
+    # to roughly zero across the set, with one clear regression on
+    # ``venergy_gated_centroid__trtllm`` (-10 %). Reverted; (256, 2)
+    # stays as the verified setting that delivered Pass 2's +17.8 %
+    # geomean.
+    LAUNCH_BLOCK_SIZE = 256
+    MIN_BLOCKS_PER_SM = 2
     return (
         f"{_CUDA_KERNEL_PREAMBLE}\n"
         f"\n"
         f"\n"
-        f"__global__ void {kernel_fn}(\n"
+        f"__global__ "
+        f"__launch_bounds__({LAUNCH_BLOCK_SIZE}, {MIN_BLOCKS_PER_SM}) "
+        f"void {kernel_fn}(\n"
         f"{kernel_args}\n"
         f") {{\n"
         f"{INDENT}// ------------------------------------------------------------\n"
@@ -869,7 +1415,8 @@ def _build_cuda_launcher_params(sub_graph) -> List[str]:
     ]
     for tid, _role in _iter_kernel_tensors(sub_graph):
         params.append(f"torch::Tensor tensor_{tid}")
-        params.append(f"int64_t tensor_{tid}_dim0")
+        # ``int64_t tensor_<id>_dim0`` dropped in lockstep with
+        # ``_build_kernel_signature`` — no consumer reads it.
     return params
 
 
@@ -930,7 +1477,7 @@ def generate_cuda_launcher(
     for tid, _role in _iter_kernel_tensors(sub_graph):
         t = sub_graph.tensor_list[tid]
         kcall.append(_cpp_data_ptr_expr(f"tensor_{tid}", t.dtype))
-        kcall.append(f"tensor_{tid}_dim0")
+        # ``tensor_<id>_dim0`` dropped — see :func:`_build_kernel_signature`.
 
     # Grid + block: bake as ``constexpr int`` literals at codegen time so
     # the compiled SASS specializes on the host's SM count. The kernel
@@ -938,8 +1485,38 @@ def generate_cuda_launcher(
     num_progs  = ctx.num_sms * 4
     block_size = 256  # 8 warps * 32 threads — matches Triton ``num_warps=8``
 
+    # Total dynamic shared-memory bytes required by the kernel — set by
+    # :func:`generate_initialization_str` when it laid out tiles into
+    # ``extern __shared__``. Default to 0 for kernels with no tiles.
+    smem_bytes = int(getattr(sub_graph, "_smem_bytes", 0))
+
     params_str = ",\n".join(f"{INDENT}{p}" for p in params)
     kcall_str  = ",\n".join(f"{INDENT * 2}{a}" for a in kcall)
+
+    # Static __shared__ is capped at 48 KB. For dynamic shared memory we
+    # must opt in via ``cudaFuncAttributeMaxDynamicSharedMemorySize`` when
+    # the request exceeds that bound — on H100/B200 the per-block ceiling
+    # is much higher (~228 KB) but is gated by this attribute.
+    #
+    # The attribute is a kernel-function property, not a per-launch flag,
+    # so it's safe to set it exactly once per process. Wrap the call in
+    # a static-init lambda — the first launch pays the host-side
+    # ``cudaFuncSetAttribute`` (~1 µs + a CPU/GPU sync barrier) and
+    # every subsequent launch reads a single bool. For long decode
+    # loops this elides hundreds of redundant runtime calls.
+    if smem_bytes > 48 * 1024:
+        smem_setattr = (
+            f"{INDENT}static const bool _attr_inited = [] {{\n"
+            f"{INDENT}{INDENT}cudaFuncSetAttribute(\n"
+            f"{INDENT}{INDENT}{INDENT}(const void*)&{kernel_fn},\n"
+            f"{INDENT}{INDENT}{INDENT}cudaFuncAttributeMaxDynamicSharedMemorySize,\n"
+            f"{INDENT}{INDENT}{INDENT}{smem_bytes});\n"
+            f"{INDENT}{INDENT}return true;\n"
+            f"{INDENT}}}();\n"
+            f"{INDENT}(void)_attr_inited;\n"
+        )
+    else:
+        smem_setattr = ""
 
     return (
         f"void {launcher_fn}(\n"
@@ -948,7 +1525,9 @@ def generate_cuda_launcher(
         f"{INDENT}const auto stream = at::cuda::getCurrentCUDAStream();\n"
         f"{INDENT}constexpr int num_progs = {num_progs};\n"
         f"{INDENT}constexpr int block_size = {block_size};\n"
-        f"{INDENT}{kernel_fn}<<<num_progs, block_size, 0, stream>>>(\n"
+        f"{INDENT}constexpr int smem_bytes = {smem_bytes};\n"
+        f"{smem_setattr}"
+        f"{INDENT}{kernel_fn}<<<num_progs, block_size, smem_bytes, stream>>>(\n"
         f"{kcall_str}\n"
         f"{INDENT});\n"
         f"}}"
@@ -959,42 +1538,34 @@ def generate_cuda_launcher(
 # Python launcher / impl wrapper
 # --------------------------------------------------------------------------- #
 
-def _build_launcher_args(sub_graph) -> Tuple[List[str], List[str], List[str]]:
+def _build_launcher_args(sub_graph, ctx: Context) -> Tuple[List[str], List[str], List[str]]:
     """Return ``(wrapper_args, launcher_call_args, fp8_rebind_lines)``.
 
-    ``wrapper_args``        — Python signature lines of the impl wrapper
-                              (one ``tensor_<id>`` per kernel-arg
-                              tensor, then ``ctx``).
-    ``launcher_call_args``  — expressions passed into the C++ launcher,
-                              in 1:1 order with the parameter list
-                              emitted by :func:`generate_cuda_launcher`:
-                              ``ctx.dense_kv_indices``,
-                              ``ctx.winfo_q_indices``,
-                              (``ctx.winfo_is_first_workload_per_batch``
-                              iff BATCHED outputs),
-                              ``ctx.winfo_kv_offsets``,
-                              ``ctx.winfo_kv_lens``,
-                              ``ctx.winfo_num_workloads``,
-                              then for each kernel tensor
-                              ``tensor_<id>, tensor_<id>.shape[0]``.
-    ``fp8_rebind_lines``    — for any FP8 tensor, ``.view(torch.uint8)``
-                              re-bind lines emitted before the launcher
-                              call. The launcher's C++ signature for an
-                              fp8 tensor declares ``uint8_t*`` (see
-                              ``_TORCH_TO_CPP_TYPES``), so the rebind is
-                              what makes the dtypes line up.
+    Mirrors :func:`triton_impl.kernel_gen._build_launcher_args` for the
+    ``ctx``-side bindings — both go through
+    :func:`indexer.compiler.backend.get_backend` so the indices source
+    follows the active attention backend (flashinfer CSR vs. trtllm
+    block-tables) and every dynamic buffer is read off ``ctx.metadata``.
+    The per-tensor (``tensor_<id>``, ``tensor_<id>.shape[0]``) suffix is
+    identical to the triton path.
+
+    ``fp8_rebind_lines`` — any FP8 tensor is bitcast to ``uint8`` before
+    being forwarded so the launcher's ``uint8_t*`` C++ signature lines up
+    with the storage dtype (see ``_TORCH_TO_CPP_TYPES``).
     """
+    from ..backend import get_backend
+
     wrapper_args: List[str] = []
     launcher_call_args: List[str] = [
-        "ctx.dense_kv_indices",
-        "ctx.winfo_q_indices",
+        get_backend(ctx).indices_src,
+        "ctx.metadata.winfo_q_indices",
     ]
     if _has_batched_output(sub_graph):
-        launcher_call_args.append("ctx.winfo_is_first_workload_per_batch")
+        launcher_call_args.append("ctx.metadata.winfo_is_first_workload_per_batch")
     launcher_call_args += [
-        "ctx.winfo_kv_offsets",
-        "ctx.winfo_kv_lens",
-        "ctx.winfo_num_workloads",
+        "ctx.metadata.winfo_kv_offsets",
+        "ctx.metadata.winfo_kv_lens",
+        "ctx.metadata.winfo_num_workloads",
     ]
     fp8_rebind: List[str] = []
 
@@ -1002,7 +1573,11 @@ def _build_launcher_args(sub_graph) -> Tuple[List[str], List[str], List[str]]:
         name = f"tensor_{tid}"
         t = sub_graph.tensor_list[tid]
         wrapper_args.append(name)
-        launcher_call_args.extend([name, f"{name}.shape[0]"])
+        # ``tensor_<id>_dim0`` is no longer in the kernel signature
+        # (see ``_build_kernel_signature``) — it was dead weight that
+        # cost a kernel-arg slot per tensor. The launcher's C++ params
+        # and kernel call drop the int64 in lock-step.
+        launcher_call_args.append(name)
         if _is_fp8(t):
             fp8_rebind.append(f"{name} = {name}.view(torch.uint8)")
 
@@ -1036,7 +1611,7 @@ def _generate_w_impl(sub_graph: Graph, sub_graph_id: int, ctx: Context) -> str:
     """
     kernel_src = generate_cuda_kernel(sub_graph, sub_graph_id, ctx)
     launcher_src = generate_cuda_launcher(sub_graph, sub_graph_id, ctx)
-    wrapper_args, launcher_call_args, fp8_rebind = _build_launcher_args(sub_graph)
+    wrapper_args, launcher_call_args, fp8_rebind = _build_launcher_args(sub_graph, ctx)
 
     sa_name = ctx.sparse_attention_name
     impl_name   = f"{sa_name}_subgraph_{sub_graph_id}_impl"

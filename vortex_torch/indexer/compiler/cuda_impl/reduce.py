@@ -13,13 +13,28 @@ The cross-row form (``dim == 0``, Schedule.S, RAGGED → BATCHED) is
 :mod:`indexer.compiler.custom_impl.reduce_dim0` and dispatched from
 :mod:`indexer.compiler.impl`.
 
-Thread mapping is per-output-element: each thread claims one
-``(chunk_i, c_o, d_o)`` output position and sequentially sweeps the
-reduction axis in fp32 registers. No cross-thread coordination — the
-output positions are independent. This keeps the codegen simple at
-the cost of underutilization when the output is smaller than the
-block size (e.g. ``dim == 2`` with small ``D_0``); warp-level shuffle
-reductions are a future optimization.
+Thread mapping (two specialisations chosen at codegen time):
+
+  * **Warp-per-output** (used when ``reduce_len >= 32``) — each warp
+    owns one ``(chunk_i, c_o, d_o)`` output position. The 32 lanes
+    stride the reduction axis in lock-step, each lane accumulates
+    ``reduce_len / 32`` partial sums in fp32 registers, then a
+    ``__shfl_xor_sync`` butterfly collapses the 32 partials with the
+    same associative+commutative ``update`` used in the serial path
+    (sum / max / min / sum-of-squares). Lane 0 applies the optional
+    ``finalize`` (mean reciprocal, L2 sqrt) and writes the smem slot.
+    Every other lane writes nothing, so the cost of skipped output
+    slots is zero. This binding turns the ``Sum(dim=2) D=128`` step
+    in ``masked_quest`` / ``gqa_quest`` / ``lserve`` (the inner-product
+    reduction over the head dim) into ``128/32 = 4`` fp32 ops + a
+    ``log2(32) = 5``-step shfl tree, vs. 128 serial fp32 ops on a
+    single thread under the old binding.
+
+  * **Thread-per-output** (kept for ``reduce_len < 32``) — each thread
+    claims one ``(chunk_i, c_o, d_o)`` output position and sequentially
+    sweeps the reduction axis in fp32 registers. Right call for the
+    GQA-style ``Max(dim=1) G=2`` step where the reduction span is
+    tiny and the warp-tree overhead would dominate.
 
 Compute precision is fp32 throughout the accumulation (matching
 Triton, which promotes inputs via ``.to(tl.float32)`` before reducing).
@@ -143,6 +158,56 @@ def generate_reduce_impl(graph: Graph, op_id: int, ctx: Context) -> str:
     load_expr  = cast_smem_to_float(in_subscript, t_x.dtype)
     store_expr = cast_float_to_smem("acc", t_o.dtype)
 
+    # ---- Warp-per-output specialisation (reduce_len >= 32) -----------
+    #
+    # Each warp owns one output slot; lanes stride the reduction axis,
+    # then a 5-step ``__shfl_xor_sync`` butterfly collapses the 32
+    # partial accumulators with the same ``update`` expression. Works
+    # for any associative+commutative reducer (Sum / Mean / Max / Min
+    # / L2Norm — Mean / L2Norm only differ by a per-warp finalize).
+    if reduce_len >= 32:
+        # ``update`` is a fp32 expression in ``acc`` / ``val``; the shfl
+        # tree just rewrites ``val`` with the partner lane's accumulator
+        # and reuses the same expression so codegen stays single-source.
+        shfl_steps = "\n".join(
+            f"{INDENT}{INDENT}{INDENT}{{\n"
+            f"{INDENT}{INDENT}{INDENT}{INDENT}const float val = "
+            f"__shfl_xor_sync(0xffffffffu, acc, {offset});\n"
+            f"{INDENT}{INDENT}{INDENT}{INDENT}acc = {update_expr};\n"
+            f"{INDENT}{INDENT}{INDENT}}}"
+            for offset in (16, 8, 4, 2, 1)
+        )
+        finalize_line = (
+            f"{INDENT}{INDENT}{INDENT}{INDENT}acc = {finalize_expr};\n"
+            if finalize_expr else ""
+        )
+        return (
+            f"__syncthreads();\n"
+            f"{{\n"
+            f"{INDENT}const int __wid = tid >> 5;\n"
+            f"{INDENT}const int __lane = tid & 31;\n"
+            f"{INDENT}const int __warps = blockDim.x >> 5;\n"
+            f"{INDENT}for (int j_out = __wid; j_out < {n_out}; "
+            f"j_out += __warps) {{\n"
+            f"{INDENT}{INDENT}const int chunk_i = j_out / {out_C * out_D};\n"
+            f"{INDENT}{INDENT}const int c_o     = (j_out / {out_D}) % {out_C};\n"
+            f"{INDENT}{INDENT}const int d_o     =  j_out % {out_D};\n"
+            f"\n"
+            f"{INDENT}{INDENT}float acc = {init_expr};\n"
+            f"{INDENT}{INDENT}for (int k = __lane; k < {reduce_len}; k += 32) {{\n"
+            f"{INDENT}{INDENT}{INDENT}const float val = {load_expr};\n"
+            f"{INDENT}{INDENT}{INDENT}acc = {update_expr};\n"
+            f"{INDENT}{INDENT}}}\n"
+            f"{shfl_steps}\n"
+            f"{INDENT}{INDENT}if (__lane == 0) {{\n"
+            f"{finalize_line}"
+            f"{INDENT}{INDENT}{INDENT}{out_subscript} = {store_expr};\n"
+            f"{INDENT}{INDENT}}}\n"
+            f"{INDENT}}}\n"
+            f"}}"
+        )
+
+    # ---- Thread-per-output fallback (reduce_len < 32) ---------------
     # Optional post-loop finalize line (mean reciprocal, L2 sqrt, ...).
     finalize_line = (
         f"{INDENT}{INDENT}acc = {finalize_expr};\n" if finalize_expr else ""

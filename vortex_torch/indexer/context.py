@@ -61,6 +61,11 @@ class Context(ContextBase):
         "sparse_attention_name", "impl_backend", "tensor_id_to_tensor_name_map",
         "compilation_header_lines", "auxilary_func_def_lines",
         "compilation_cache_dir",
+        # ---- tensor-core (bf16-compute) codegen toggle ----
+        # When True, the triton W-kernel keeps compute blocks in bf16
+        # (loads cast to bf16, accumulations promote to fp32) and emits
+        # ``tl.dot`` for MMA-friendly GeMMs. Triton-impl only.
+        "use_tensor_core",
     )
 
     # ---- type hints (declarations only) ----
@@ -101,6 +106,7 @@ class Context(ContextBase):
     compilation_header_lines: list
     auxilary_func_def_lines: list
     compilation_cache_dir: str
+    use_tensor_core: bool
 
     def __init__(self) -> None:
         for name in self.__slots__:
@@ -177,6 +183,29 @@ class Context(ContextBase):
         self.max_num_blocks = self.max_num_pages * self.num_blocks_per_page
         self.max_num_blocks_per_request = self.max_num_pages_per_request * self.num_blocks_per_page
         self.num_pages_per_workload = self.workload_chunk_size // self.num_blocks_per_page
+
+        # Round trtllm's dense_block_tables row stride up to a multiple
+        # of 4 int32s (= 128 bits). Each row of ``dense_block_tables`` is
+        # ``max_num_blocks_per_request`` int32s wide, and the trtllm
+        # indexer kernel reads
+        # ``indices[pid * max_blocks_per_seq + p * nbp]`` starting at
+        # ``pid * max_blocks_per_seq`` — making that product 16-byte
+        # aligned for every ``pid`` lets the int32 loads coalesce into
+        # 128-bit LDG.E.128 cache-line-aligned transactions on the per-
+        # row index sweep, and is harmless on flashinfer where the CSR
+        # indices array doesn't carry a per-row stride at all.
+        # ``p < _page`` already gates the kernel's index reads against
+        # the actual sequence length, so the extra padding entries are
+        # never read (the planner just doesn't write to them).
+        # NB: ``self.vortex_attention_backend`` is assigned further down
+        # in this method, so read off ``sa`` directly.
+        _attn_backend = (
+            getattr(sa, "vortex_attention_backend", "flashinfer") or "flashinfer"
+        )
+        if _attn_backend == "trtllm" and self.max_num_blocks_per_request % 4 != 0:
+            self.max_num_blocks_per_request = (
+                (self.max_num_blocks_per_request + 3) // 4 * 4
+            )
         self.topk_val = sa.vortex_topk_val
         self.max_topk_val = sa.vortex_max_topk_val
         self.topk_ratio = sa.vortex_topk_ratio
@@ -202,10 +231,21 @@ class Context(ContextBase):
         self.auxilary_func_def_lines = []
         self.compilation_cache_dir = sa.vortex_compilation_cache_dir
         self.sparse_attention_name = parent.sparse_attention.__class__.__name__.lower() + f"_{uuid.uuid4().hex[:8]}"  # unique name for this attention instance
-        self.impl_backend = "triton"  # default to triton; can be overridden by user
+        self.impl_backend = getattr(sa, "vortex_impl_backend", "triton") or "triton"
         self.vortex_attention_backend = getattr(
             sa, "vortex_attention_backend", "flashinfer"
         ) or "flashinfer"
+        self.use_tensor_core = bool(getattr(sa, "vortex_use_tensor_core", False))
+        # Tensor-core (bf16-compute + tl.dot) codegen is implemented only
+        # in the triton W-kernel backend. The cuda backend has its own
+        # fp32-accumulation path and ignores this flag — reject the
+        # combination explicitly so a misconfigured run fails loudly
+        # instead of silently running fp32.
+        if self.use_tensor_core and self.impl_backend != "triton":
+            raise ValueError(
+                "vortex_use_tensor_core is only supported with "
+                f"vortex_impl_backend='triton'; got '{self.impl_backend}'."
+            )
         self._created = True
         return self
 

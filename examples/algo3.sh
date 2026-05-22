@@ -13,8 +13,6 @@ trials=(
 32
 )
 topk_val=(
-61
-125
 253
 )
 for algo in "${sparse_algos[@]}"; do
@@ -36,6 +34,9 @@ for algo in "${sparse_algos[@]}"; do
             --generation-max-new-tokens 32768 \
             --max-input-length 4096 \
             --tp-size 1 \
+            --vortex-attention-backend trtllm \
+            --vortex-impl-backend triton \
+            --vortex-use-tensor-core \
             --summary-dir summary-Qwen3-4B-sglang-trtllm \
             --skip-already-finished-check
       done

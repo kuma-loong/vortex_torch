@@ -139,6 +139,10 @@ class Context(ContextBase):
         self.sparse_attention_name = (
             parent.__class__.__name__.lower() + f"_cache_{uuid.uuid4().hex[:8]}"
         )
+        # Cache compiler only supports triton for now — the indexer is the
+        # piece that picks up vortex_impl_backend. Hard-code triton here so
+        # passing vortex_impl_backend="cuda" still works end-to-end (only
+        # the indexer kernel switches backends).
         self.impl_backend = "triton"
 
         self._created = True

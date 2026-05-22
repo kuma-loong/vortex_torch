@@ -165,6 +165,8 @@ def _make_indexer_ctx(
     sparse_attention_name: str,
     tensor_device: str = "cpu",
     vortex_attention_backend: str = "flashinfer",
+    vortex_impl_backend: str = "triton",
+    vortex_use_tensor_core: bool = False,
 ) -> IndexerContext:
     """Build an indexer ``Context`` honoring the invariants from ``create()``.
 
@@ -208,6 +210,15 @@ def _make_indexer_ctx(
     ctx.max_num_pages = max_num_pages_per_request * cfg.B * cfg.num_kv_heads
     ctx.max_num_blocks = ctx.max_num_pages * cfg.num_blocks_per_page
     ctx.max_num_blocks_per_request = max_num_pages_per_request * cfg.num_blocks_per_page
+    # Mirror Context.create's trtllm 128-bit alignment for parity with
+    # what the runtime will actually allocate (see the comment in
+    # ``indexer/context.py``). The verify path is CPU-only smoke test
+    # so the only visible effect is a slightly wider ``dense_block_tables``
+    # row, which is harmless.
+    if vortex_attention_backend == "trtllm" and ctx.max_num_blocks_per_request % 4 != 0:
+        ctx.max_num_blocks_per_request = (
+            (ctx.max_num_blocks_per_request + 3) // 4 * 4
+        )
     ctx.max_num_workloads = (
         ctx.max_num_blocks // max(1, cfg.workload_chunk_size)
         + cfg.B * cfg.num_kv_heads
@@ -243,7 +254,8 @@ def _make_indexer_ctx(
     ctx.compilation_header_lines = []
     ctx.auxilary_func_def_lines = []
     ctx.sparse_attention_name = sparse_attention_name
-    ctx.impl_backend = "triton"
+    ctx.impl_backend = vortex_impl_backend
+    ctx.use_tensor_core = vortex_use_tensor_core
     ctx.compilation_cache_dir = cache_dir
 
     # --- lifecycle ---
@@ -397,6 +409,8 @@ def verify_flow_compilable(
     verify_cache: bool = True,
     verbose: bool = False,
     vortex_attention_backend: str = "flashinfer",
+    vortex_impl_backend: str = "triton",
+    vortex_use_tensor_core: bool = False,
 ) -> VerifyReport:
     """Run compile-only verification over a configuration sweep.
 
@@ -495,6 +509,8 @@ def verify_flow_compilable(
                                     max_new_tokens_per_batch=max_new_tokens_per_batch,
                                     vortex_dtype=intermediate_dtype,
                                     vortex_attention_backend=vortex_attention_backend,
+                                    vortex_impl_backend=vortex_impl_backend,
+                                    vortex_use_tensor_core=vortex_use_tensor_core,
                                 )
                             except Exception:
                                 phase_error = Failure(
@@ -541,6 +557,8 @@ def _compile_indexer_once(
     max_new_tokens_per_batch: int,
     vortex_dtype: torch.dtype = torch.bfloat16,
     vortex_attention_backend: str = "flashinfer",
+    vortex_impl_backend: str = "triton",
+    vortex_use_tensor_core: bool = False,
 ) -> None:
     name = f"verify_idx_{uuid.uuid4().hex[:8]}"
     ctx = _make_indexer_ctx(
@@ -550,6 +568,8 @@ def _compile_indexer_once(
         cache_dir=cache_dir,
         sparse_attention_name=name,
         vortex_attention_backend=vortex_attention_backend,
+        vortex_impl_backend=vortex_impl_backend,
+        vortex_use_tensor_core=vortex_use_tensor_core,
     )
     ctx.vortex_dtype = vortex_dtype
     q, o, cache = _seed_indexer_tensors(

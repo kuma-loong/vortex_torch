@@ -31,10 +31,13 @@ sparse_attention: bool = True,
 mem: float = 0.8,
 data_path: str = "examples/amc23.jsonl",
 tp_size: int = 1,
-kv_cache_dtype: str = "auto"
-):  
+kv_cache_dtype: str = "auto",
+vortex_attention_backend: str = "trtllm",
+vortex_impl_backend: str = "cuda",
+vortex_use_tensor_core: bool = False,
+):
 
-    llm = sgl.Engine(model_path=model_name, 
+    llm = sgl.Engine(model_path=model_name,
                     disable_cuda_graph=False,
                     vortex_block_size=block_size,
                     page_size=page_size,
@@ -42,9 +45,11 @@ kv_cache_dtype: str = "auto"
                     vortex_max_topk_val=256,
                     tp_size=tp_size,
                     kv_cache_dtype=kv_cache_dtype,
-                    disable_overlap_schedule=True,
+                    disable_overlap_schedule=False,
                     attention_backend="flashinfer",
-                    vortex_attention_backend="trtllm",
+                    vortex_attention_backend=vortex_attention_backend,
+                    vortex_impl_backend=vortex_impl_backend,
+                    vortex_use_tensor_core=vortex_use_tensor_core,
                     enable_vortex_sparsity=sparse_attention,
                     vortex_block_reserved_bos=1,
                     vortex_block_reserved_eos=2,
@@ -257,6 +262,30 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--vortex-attention-backend",
+        type=str,
+        default="trtllm",
+        choices=["flashinfer", "trtllm"],
+        help="Vortex sparse-attention backend (default: trtllm).",
+    )
+
+    parser.add_argument(
+        "--vortex-impl-backend",
+        type=str,
+        default="cuda",
+        choices=["triton", "cuda"],
+        help="Vortex indexer compilation backend (default: cuda).",
+    )
+
+    parser.add_argument(
+        "--vortex-use-tensor-core",
+        action="store_true",
+        help="Triton indexer: keep compute blocks in bf16 (fp32 "
+             "accumulation) and emit tl.dot for MMA-friendly GeMMs. "
+             "Requires --vortex-impl-backend triton.",
+    )
+
+    parser.add_argument(
         "--summary-dir",
         type=str,
         default="summary_ratio",
@@ -326,7 +355,10 @@ if __name__ == "__main__":
         mem=args.mem,
         data_path=args.data_path,
         tp_size=args.tp_size,
-        kv_cache_dtype=args.kv_cache_dtype
+        kv_cache_dtype=args.kv_cache_dtype,
+        vortex_attention_backend=args.vortex_attention_backend,
+        vortex_impl_backend=args.vortex_impl_backend,
+        vortex_use_tensor_core=args.vortex_use_tensor_core,
     )
     current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     os.makedirs(args.summary_dir, exist_ok=True)
@@ -351,6 +383,9 @@ if __name__ == "__main__":
         "data_path": args.data_path,
         "tp_size": args.tp_size,
         "kv_cache_dtype": args.kv_cache_dtype,
+        "vortex_attention_backend": args.vortex_attention_backend,
+        "vortex_impl_backend": args.vortex_impl_backend,
+        "vortex_use_tensor_core": args.vortex_use_tensor_core,
     }
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=4)

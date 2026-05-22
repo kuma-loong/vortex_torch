@@ -30,6 +30,7 @@ from .dtype_cast import (
     is_fp8 as _is_fp8,
     load_cast_expr as _load_cast_expr,
     store_cast_expr as _store_cast_expr,
+    compute_tl_dtype as _compute_tl_dtype,
 )
 
 
@@ -61,6 +62,25 @@ def _join_sections(sections: Iterable[str], fallback: str) -> str:
     """Join non-empty ``sections`` with ``\\n\\n``; return ``fallback`` if all empty."""
     non_empty = [s for s in sections if s]
     return "\n\n".join(non_empty) if non_empty else fallback
+
+
+def _contig_arange(ctx: Context, n: int) -> str:
+    """``tl.arange(0, n)``, optionally wrapped with contiguity / alignment
+    hints for backends that guarantee consecutive arange lanes map to
+    consecutive (and ``n``-aligned) global addresses.
+
+    Emits ``tl.max_contiguous(tl.multiple_of(tl.arange(0, n), n), n)``
+    when ``get_backend(ctx).wants_index_hints`` is set (trtllm). The
+    ``multiple_of(_, n)`` reads as "this contiguous run starts on an
+    ``n``-aligned boundary"; for a bare ``arange`` the base is ``0`` so
+    it is trivially correct, and ``max_contiguous(_, n)`` states the ``n``
+    lanes are contiguous — both true for an arange. The hints let Triton
+    fold the per-tile pointer math into wide aligned LDG transactions.
+    Plain ``tl.arange(0, n)`` otherwise (e.g. flashinfer CSR).
+    """
+    if get_backend(ctx).wants_index_hints:
+        return f"tl.max_contiguous(tl.multiple_of(tl.arange(0, {n}), {n}), {n})"
+    return f"tl.arange(0, {n})"
 
 
 def _iter_kernel_tensors(sub_graph) -> Iterable[Tuple[int, str]]:
@@ -186,23 +206,27 @@ def generate_initialization_str(sub_graph: Graph, ctx: Context) -> str:
     """
     lines: List[str] = []
     arange_emitted: set = set()  # (tid, "d1"|"d2") -> dedupe
+    compute_dtype = _compute_tl_dtype(ctx)
 
     def _emit_arange(tid: int, t) -> None:
         d1, d2 = _inner_dim_arange_names(tid)
         if (tid, "d1") not in arange_emitted:
-            lines.append(f"{d1} = tl.arange(0, {t.padded_shape[1]})")
+            lines.append(f"{d1} = {_contig_arange(ctx, t.padded_shape[1])}")
             arange_emitted.add((tid, "d1"))
         if (tid, "d2") not in arange_emitted:
-            lines.append(f"{d2} = tl.arange(0, {t.padded_shape[2]})")
+            lines.append(f"{d2} = {_contig_arange(ctx, t.padded_shape[2])}")
             arange_emitted.add((tid, "d2"))
 
     for tid in sub_graph.input_tensor_ids:
         t = sub_graph.tensor_list[tid]
         if t._format == FORMAT.BATCHED:
             lines.append(f"# Declare variables for tensor_{tid}")
+            # Placeholder; the per-workload load reassigns this block in
+            # ``compute_dtype``. Match the dtype so the SSA value type is
+            # stable across the loop's first iteration.
             lines.append(
                 f"tensor_{tid}_block = tl.zeros((1, {t.padded_shape[1]}, "
-                f"{t.padded_shape[2]}), dtype=tl.float32)"
+                f"{t.padded_shape[2]}), dtype={compute_dtype})"
             )
         # Padded input tensors (any FORMAT) need the inner-axis arange
         # pre-built — they reference it in the masked-load body.
@@ -221,8 +245,8 @@ def generate_initialization_str(sub_graph: Graph, ctx: Context) -> str:
     # blocks of padded_shape[1] x padded_shape[2] elements — the per-page
     # tile fed to ``tl.reshape``).
     if ctx.num_pages_per_workload > 1:
-        lines.append(f"page_idx_i32_ptr = tl.arange(0, {ctx.num_pages_per_workload})")
-        lines.append(f"block_i32_ptr = tl.arange(0, {ctx.num_blocks_per_page})")
+        lines.append(f"page_idx_i32_ptr = {_contig_arange(ctx, ctx.num_pages_per_workload)}")
+        lines.append(f"block_i32_ptr = {_contig_arange(ctx, ctx.num_blocks_per_page)}")
         for tid in sub_graph.input_tensor_ids:
             t = sub_graph.tensor_list[tid]
             if t._format == FORMAT.PAGED:
@@ -232,9 +256,12 @@ def generate_initialization_str(sub_graph: Graph, ctx: Context) -> str:
                     # are emitted above (or here as a fallback).
                     _emit_arange(tid, t)
                 else:
+                    # Per-page flat run is fully stride-1 contiguous in the
+                    # cache pool (trtllm guarantees the page's blocks are
+                    # consecutive), so the hint folds it into a wide LDG.
                     lines.append(
-                        f"tensor_{tid}_flat_ptr = tl.arange(0, "
-                        f"{ctx.num_blocks_per_page * t.shape[1] * t.shape[2]})"
+                        f"tensor_{tid}_flat_ptr = "
+                        f"{_contig_arange(ctx, ctx.num_blocks_per_page * t.shape[1] * t.shape[2])}"
                     )
         for tid in sub_graph.output_tensor_ids:
             t = sub_graph.tensor_list[tid]
@@ -248,9 +275,9 @@ def generate_initialization_str(sub_graph: Graph, ctx: Context) -> str:
 # Load (per FORMAT)
 # --------------------------------------------------------------------------- #
 
-def _load_batched(tid: int, t) -> List[str]:
+def _load_batched(tid: int, t, compute_dtype: str = "tl.float32") -> List[str]:
     if t.needs_padding():
-        return _load_batched_padded(tid, t)
+        return _load_batched_padded(tid, t, compute_dtype)
     block_ptr = _emit_block_ptr(
         tid, t,
         offset_var=f"tensor_{tid}_ptr_row_start",
@@ -264,11 +291,11 @@ def _load_batched(tid: int, t) -> List[str]:
     return [
         f"tensor_{tid}_ptr_row_start = new_batch_idx_i32 * {t.shape[1]}",
         block_ptr,
-        f"tensor_{tid}_block = {_load_cast_expr(reshape, t)}",
+        f"tensor_{tid}_block = {_load_cast_expr(reshape, t, compute_dtype)}",
     ]
 
 
-def _load_batched_padded(tid: int, t) -> List[str]:
+def _load_batched_padded(tid: int, t, compute_dtype: str = "tl.float32") -> List[str]:
     """Masked BATCHED load: tile (1, padded_shape[1], padded_shape[2]).
 
     Memory layout: ``[N_rows, shape[1], shape[2]]`` flattened. A
@@ -294,13 +321,14 @@ def _load_batched_padded(tid: int, t) -> List[str]:
     )
     return [
         ptr_expr,
-        f"tensor_{tid}_block = {_load_cast_expr(load_expr, t)}",
+        f"tensor_{tid}_block = {_load_cast_expr(load_expr, t, compute_dtype)}",
     ]
 
 
-def _load_paged_single_page(tid: int, t, ctx: Context) -> List[str]:
+def _load_paged_single_page(tid: int, t, ctx: Context,
+                            compute_dtype: str = "tl.float32") -> List[str]:
     if t.needs_padding():
-        return _load_paged_single_page_padded(tid, t, ctx)
+        return _load_paged_single_page_padded(tid, t, ctx, compute_dtype)
     block_ptr = _emit_block_ptr(
         tid, t,
         offset_var=f"tensor_{tid}_ptr_row_start",
@@ -314,11 +342,12 @@ def _load_paged_single_page(tid: int, t, ctx: Context) -> List[str]:
     return [
         f"tensor_{tid}_ptr_row_start = page_idx_i32 * {t.shape[1]}",
         block_ptr,
-        f"tensor_{tid}_block = {_load_cast_expr(reshape, t)}",
+        f"tensor_{tid}_block = {_load_cast_expr(reshape, t, compute_dtype)}",
     ]
 
 
-def _load_paged_single_page_padded(tid: int, t, ctx: Context) -> List[str]:
+def _load_paged_single_page_padded(tid: int, t, ctx: Context,
+                                   compute_dtype: str = "tl.float32") -> List[str]:
     """Masked PAGED single-page load.
 
     Tile shape ``(workload_chunk_size, padded_shape[1], padded_shape[2])``.
@@ -344,13 +373,14 @@ def _load_paged_single_page_padded(tid: int, t, ctx: Context) -> List[str]:
     )
     return [
         ptr_expr,
-        f"tensor_{tid}_block = {_load_cast_expr(load_expr, t)}",
+        f"tensor_{tid}_block = {_load_cast_expr(load_expr, t, compute_dtype)}",
     ]
 
 
-def _load_paged_multi_page(tid: int, t, ctx: Context) -> List[str]:
+def _load_paged_multi_page(tid: int, t, ctx: Context,
+                           compute_dtype: str = "tl.float32") -> List[str]:
     if t.needs_padding():
-        return _load_paged_multi_page_padded(tid, t, ctx)
+        return _load_paged_multi_page_padded(tid, t, ctx, compute_dtype)
     # ``page_valid`` masks the per-page lanes (length num_pages_per_workload);
     # distinct from ``valid`` which masks the per-block workload lanes.
     reshape = (
@@ -362,11 +392,12 @@ def _load_paged_multi_page(tid: int, t, ctx: Context) -> List[str]:
         f"_tensor_{tid}_block_ptr = page_indices_i32[:,None] * "
         f"{t.shape[1] * t.shape[2]} + tensor_{tid}_flat_ptr[None,:]",
         f"tensor_{tid}_block_ptr = tensor_{tid}_ptr + _tensor_{tid}_block_ptr",
-        f"tensor_{tid}_block = {_load_cast_expr(reshape, t)}",
+        f"tensor_{tid}_block = {_load_cast_expr(reshape, t, compute_dtype)}",
     ]
 
 
-def _load_paged_multi_page_padded(tid: int, t, ctx: Context) -> List[str]:
+def _load_paged_multi_page_padded(tid: int, t, ctx: Context,
+                                  compute_dtype: str = "tl.float32") -> List[str]:
     """Masked PAGED multi-page load.
 
     Build a 4D pointer ``(npw, nbp, padded_d1, padded_d2)`` and apply
@@ -400,13 +431,14 @@ def _load_paged_multi_page_padded(tid: int, t, ctx: Context) -> List[str]:
     )
     return [
         ptr_expr,
-        f"tensor_{tid}_block = {_load_cast_expr(reshape_expr, t)}",
+        f"tensor_{tid}_block = {_load_cast_expr(reshape_expr, t, compute_dtype)}",
     ]
 
 
-def _load_ragged(tid: int, t, ctx: Context) -> List[str]:
+def _load_ragged(tid: int, t, ctx: Context,
+                 compute_dtype: str = "tl.float32") -> List[str]:
     if t.needs_padding():
-        return _load_ragged_padded(tid, t, ctx)
+        return _load_ragged_padded(tid, t, ctx, compute_dtype)
     block_ptr = _emit_block_ptr(
         tid, t,
         offset_var=f"tensor_{tid}_ptr_row_start",
@@ -420,11 +452,12 @@ def _load_ragged(tid: int, t, ctx: Context) -> List[str]:
     return [
         f"tensor_{tid}_ptr_row_start = ragged_idx_i32 * {t.shape[1]}",
         block_ptr,
-        f"tensor_{tid}_block = {_load_cast_expr(reshape, t)}",
+        f"tensor_{tid}_block = {_load_cast_expr(reshape, t, compute_dtype)}",
     ]
 
 
-def _load_ragged_padded(tid: int, t, ctx: Context) -> List[str]:
+def _load_ragged_padded(tid: int, t, ctx: Context,
+                        compute_dtype: str = "tl.float32") -> List[str]:
     """Masked RAGGED load: tile (workload_chunk_size, padded_d1, padded_d2)."""
     d1, d2 = _inner_dim_arange_names(tid)
     mask = _inner_dim_mask_expr(
@@ -443,7 +476,7 @@ def _load_ragged_padded(tid: int, t, ctx: Context) -> List[str]:
     load_expr = f"tl.load(tensor_{tid}_block_ptr, mask={mask}, other=0.0)"
     return [
         ptr_expr,
-        f"tensor_{tid}_block = {_load_cast_expr(load_expr, t)}",
+        f"tensor_{tid}_block = {_load_cast_expr(load_expr, t, compute_dtype)}",
     ]
 
 
@@ -457,17 +490,19 @@ def generate_load_tensor_str(sub_graph: Graph, ctx: Context) -> str:
     paged: List[str] = []
     ragged: List[str] = []
 
+    compute_dtype = _compute_tl_dtype(ctx)
+
     for tid in sub_graph.input_tensor_ids:
         t = sub_graph.tensor_list[tid]
         if t._format == FORMAT.BATCHED:
-            batched.extend(_load_batched(tid, t))
+            batched.extend(_load_batched(tid, t, compute_dtype))
         elif t._format == FORMAT.PAGED:
             if ctx.num_pages_per_workload == 1:
-                paged.extend(_load_paged_single_page(tid, t, ctx))
+                paged.extend(_load_paged_single_page(tid, t, ctx, compute_dtype))
             else:
-                paged.extend(_load_paged_multi_page(tid, t, ctx))
+                paged.extend(_load_paged_multi_page(tid, t, ctx, compute_dtype))
         elif t._format == FORMAT.RAGGED:
-            ragged.extend(_load_ragged(tid, t, ctx))
+            ragged.extend(_load_ragged(tid, t, ctx, compute_dtype))
 
     batched_str = (
         "\n".join([
@@ -805,7 +840,7 @@ def {ctx.sparse_attention_name}_subgraph_{sub_graph_id}_kernel(
     r = n_workloads % num_progs
     start = pid * per + tl.minimum(pid, r)
     end = start + per + (pid < r)
-    workload_ptr = tl.arange(0, {ctx.workload_chunk_size})
+    workload_ptr = {_contig_arange(ctx, ctx.workload_chunk_size)}
 
 {initialization_str}
 

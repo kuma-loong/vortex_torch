@@ -4,7 +4,7 @@ __pycache__/
 *$py.class
 debug/
 debug*
-
+marks/
 # Vendored sglang — track upstream content despite noise rules above and below.
 # Directory rules must be negated before their contents become re-includable.
 !third_party/sglang/**/tests/

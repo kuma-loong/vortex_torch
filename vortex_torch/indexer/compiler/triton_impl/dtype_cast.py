@@ -27,17 +27,33 @@ def is_fp8(t) -> bool:
     return t.dtype in _FP8_DTYPES
 
 
-def load_cast_expr(load_expr: str, t) -> str:
-    """Return the fp32 block expression for a ``tl.load(...)`` call.
+def compute_tl_dtype(ctx) -> str:
+    """Triton dtype string for the in-register *compute* blocks.
+
+    Default is ``tl.float32`` — every loaded tile is upcast to fp32 and
+    all op math runs in fp32. With ``ctx.use_tensor_core`` enabled the
+    compute blocks are kept in ``tl.bfloat16`` instead (smaller register
+    footprint + the dtype ``tl.dot`` wants for tensor cores); ops that
+    *accumulate* (reduce-sum / mean / L2, GeMM) still promote to fp32
+    internally and downcast the result back to bf16 — see
+    :mod:`triton_impl.reduce` / :mod:`triton_impl.gemm`.
+    """
+    return "tl.bfloat16" if getattr(ctx, "use_tensor_core", False) else "tl.float32"
+
+
+def load_cast_expr(load_expr: str, t, compute_dtype: str = "tl.float32") -> str:
+    """Return the compute-dtype block expression for a ``tl.load(...)`` call.
 
     FP8 inputs are bitcast back from ``uint8`` to ``tl.float8eX`` before
-    the fp32 upcast; everything else casts straight to fp32.
+    the upcast; everything else casts straight to ``compute_dtype``.
+    ``compute_dtype`` is ``tl.float32`` by default and ``tl.bfloat16``
+    under ``use_tensor_core`` (see :func:`compute_tl_dtype`).
     """
     if t.dtype == torch.float8_e5m2:
-        return f"{load_expr}.to(tl.float8e5, bitcast=True).to(tl.float32)"
+        return f"{load_expr}.to(tl.float8e5, bitcast=True).to({compute_dtype})"
     if t.dtype == torch.float8_e4m3fn:
-        return f"{load_expr}.to(tl.float8e4nv, bitcast=True).to(tl.float32)"
-    return f"{load_expr}.to(tl.float32)"
+        return f"{load_expr}.to(tl.float8e4nv, bitcast=True).to({compute_dtype})"
+    return f"{load_expr}.to({compute_dtype})"
 
 
 def store_cast_expr(block_expr: str, dtype) -> str:

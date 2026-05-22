@@ -105,6 +105,18 @@ class IndexerBackend:
     # ``block_size``).
     topk_trailing_args: Tuple[str, ...]
 
+    # ----- triton Schedule.W index-vector hints -----
+    # When True, the triton W-kernel wraps its contiguous arange index
+    # vectors (per-page flat run, leading workload-block axis, innermost
+    # dim) in ``tl.max_contiguous(tl.multiple_of(...))``. This is sound
+    # whenever consecutive arange lanes map to consecutive global
+    # addresses — true for the trtllm block-table layout, where the
+    # planner guarantees the ``num_blocks_per_page`` block indices of a
+    # page are consecutive integers (see ``planner_sglang.py``). The
+    # flashinfer CSR path leaves it off (its dense_kv_indices need not be
+    # block-contiguous within a workload). Default ``False``.
+    wants_index_hints: bool = False
+
 
 # Indented helpers ---------------------------------------------------------
 
@@ -168,6 +180,7 @@ _TRTLLM = IndexerBackend(
         "ctx.metadata.dense_block_tables.shape[1]",
         "ctx.block_size",
     ),
+    wants_index_hints=True,
 )
 
 

@@ -580,6 +580,8 @@ class ServerArgs:
     vortex_compilation_cache_dir: str = None
     vortex_schedule_policy: str = None
     vortex_attention_backend: Optional[str] = "flashinfer"
+    vortex_impl_backend: Optional[str] = "triton"
+    vortex_use_tensor_core: bool = False
 
     # Offloading
     cpu_offload_gb: int = 0
@@ -5162,6 +5164,19 @@ class ServerArgs:
             "--vortex-attention-backend",
             type=str,
             default=ServerArgs.vortex_attention_backend,
+        )
+        parser.add_argument(
+            "--vortex-impl-backend",
+            type=str,
+            choices=["triton", "cuda"],
+            default=ServerArgs.vortex_impl_backend,
+        )
+        parser.add_argument(
+            "--vortex-use-tensor-core",
+            action="store_true",
+            default=ServerArgs.vortex_use_tensor_core,
+            help="Triton indexer: keep compute blocks in bf16 (fp32 "
+                 "accumulation) and emit tl.dot for MMA-friendly GeMMs.",
         )
 
     @classmethod

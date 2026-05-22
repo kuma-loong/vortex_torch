@@ -37,6 +37,8 @@ def get_engine(
     vortex_module_name: str = "example_block_sparse_attention_cls",
     vortex_module_path: str = "submissions/example_block_sparse_attention.py",
     vortex_schedule_policy: str | None = None,
+    vortex_impl_backend: str = "triton",
+    vortex_use_tensor_core: bool = False,
     kv_cache_dtype: str = "auto",
     **kwargs,
 ):
@@ -56,6 +58,8 @@ def get_engine(
         vortex_module_name=vortex_module_name,
         vortex_module_path=vortex_module_path,
         vortex_schedule_policy=policy,
+        vortex_impl_backend=vortex_impl_backend,
+        vortex_use_tensor_core=vortex_use_tensor_core,
         vortex_dtype="bfloat16",
         vortex_compilation_cache_dir="~/.vortex_compilation_cache",
         enable_vortex_sparsity=True,
@@ -300,6 +304,17 @@ def _check_compilable(
     vortex_attention_backend = (
         (config or {}).get("vortex_attention_backend") or "flashinfer"
     )
+    vortex_impl_backend = (
+        (config or {}).get("vortex_impl_backend") or "triton"
+    )
+    vortex_use_tensor_core = bool((config or {}).get("vortex_use_tensor_core", False))
+    # Mirror the runtime guard in indexer.Context.create: tensor-core
+    # (bf16-compute + tl.dot) codegen is triton-only.
+    if vortex_use_tensor_core and vortex_impl_backend != "triton":
+        raise EngineConfigError(
+            "vortex_use_tensor_core is only supported with "
+            f"vortex_impl_backend='triton'; got '{vortex_impl_backend}'."
+        )
     with tempfile.TemporaryDirectory(prefix="vortex_check_") as cache_dir:
         report = verify_flow_compilable(
             flow,
@@ -312,6 +327,8 @@ def _check_compilable(
             cache_dir=cache_dir,
             verify_indexer=True, verify_cache=True,
             vortex_attention_backend=vortex_attention_backend,
+            vortex_impl_backend=vortex_impl_backend,
+            vortex_use_tensor_core=vortex_use_tensor_core,
         )
         if not report.ok:
             first = report.failed[0]
