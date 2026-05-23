@@ -3,7 +3,7 @@ import sys
 import sglang as sgl
 from transformers import AutoTokenizer
 def main():
-    model_name = "Qwen/Qwen3-4B"
+    model_name = "MiniMaxAI/MiniMax-M2.7"
 
     default_policy = r"""
 const int static_kv_budget = topk_val + block_reserved_bos + block_reserved_eos;
@@ -12,11 +12,11 @@ return max(static_kv_budget, dynamic_kv_budget);
 """
 
     llm = sgl.Engine(model_path=model_name, 
-                    disable_cuda_graph=True,
+                    disable_cuda_graph=False,
                     page_size=16,
                     vortex_block_size=16,
                     vortex_topk_val=29,
-                    disable_overlap_schedule=True,
+                    disable_overlap_schedule=False,
                     kv_cache_dtype="auto",
                     vortex_dtype="bfloat16",
                     attention_backend="flashinfer",
@@ -26,14 +26,14 @@ return max(static_kv_budget, dynamic_kv_budget);
                     vortex_block_reserved_eos=2,
                     vortex_layers_skip=list(range(1)),
                     vortex_module_name="block_sparse_attention",
-                    vortex_attention_backend="flashinfer",
+                    vortex_attention_backend="trtllm",
                     trust_remote_code=True,
                     #vortex_module_path="submissions/example_block_sparse_attention.py",
                     vortex_max_seq_lens=8192,
-                    mem_fraction_static=0.8,
+                    mem_fraction_static=0.9,
                     vortex_workload_chunk_size=32,
                     vortex_compilation_cache_dir="~/.vortex_compilation_cache",
-                    tp_size=1,
+                    tp_size=2,
                     )
     
     with open("examples/validation.jsonl", "r", encoding="utf-8") as f:

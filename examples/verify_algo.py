@@ -35,7 +35,10 @@ kv_cache_dtype: str = "auto",
 vortex_attention_backend: str = "trtllm",
 vortex_impl_backend: str = "cuda",
 vortex_use_tensor_core: bool = False,
+vortex_layers_skip: list = None,
 ):
+    if vortex_layers_skip is None:
+        vortex_layers_skip = [0]
 
     llm = sgl.Engine(model_path=model_name,
                     disable_cuda_graph=False,
@@ -54,7 +57,7 @@ vortex_use_tensor_core: bool = False,
                     vortex_block_reserved_bos=1,
                     vortex_block_reserved_eos=2,
                     vortex_topk_ratio=topk_ratio,
-                    vortex_layers_skip=list(range(1)),
+                    vortex_layers_skip=vortex_layers_skip,
                     vortex_module_name=vortex_module_name,
                     vortex_max_seq_lens=max_input_length + generation_max_new_tokens,
                     mem_fraction_static=mem,
@@ -286,6 +289,16 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--vortex-layers-skip",
+        type=int,
+        nargs="*",
+        default=[0],
+        help="Decoder layer indices that run dense (non-sparse) "
+             "attention (default: 0). Pass the flag with no values "
+             "(--vortex-layers-skip) to skip none (all layers sparse).",
+    )
+
+    parser.add_argument(
         "--summary-dir",
         type=str,
         default="summary_ratio",
@@ -359,6 +372,7 @@ if __name__ == "__main__":
         vortex_attention_backend=args.vortex_attention_backend,
         vortex_impl_backend=args.vortex_impl_backend,
         vortex_use_tensor_core=args.vortex_use_tensor_core,
+        vortex_layers_skip=args.vortex_layers_skip,
     )
     current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     os.makedirs(args.summary_dir, exist_ok=True)
@@ -386,6 +400,7 @@ if __name__ == "__main__":
         "vortex_attention_backend": args.vortex_attention_backend,
         "vortex_impl_backend": args.vortex_impl_backend,
         "vortex_use_tensor_core": args.vortex_use_tensor_core,
+        "vortex_layers_skip": args.vortex_layers_skip,
     }
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=4)

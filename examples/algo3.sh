@@ -30,13 +30,14 @@ for algo in "${sparse_algos[@]}"; do
             --vortex-module-name "${algo}" \
             --model-name  "${model}" \
             --mem 0.9 \
-            --data-path examples/aime24.jsonl \
+            --data-path examples/aime26.jsonl \
             --generation-max-new-tokens 32768 \
             --max-input-length 4096 \
             --tp-size 1 \
             --vortex-attention-backend trtllm \
             --vortex-impl-backend triton \
             --vortex-use-tensor-core \
+            --vortex-layers-skip 0 \
             --summary-dir summary-Qwen3-4B-sglang-trtllm \
             --skip-already-finished-check
       done

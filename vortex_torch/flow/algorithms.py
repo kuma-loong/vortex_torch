@@ -3,7 +3,7 @@ from typing import Dict
 
 from .flow import vFlow
 from ..indexer import topK, approxTopK, GeMV, Softmax, Max, Sum, GeMM, Maximum, Multiply, Add, L2Norm, Save, Load, Mean, MaskSlice, Kron
-from ..cache import Mean as CMean, Max as CMax, Min as CMin, L2Norm as CL2Norm, Fill as CFill, MaxInterleave as CMaxInterleave, MinInterleave as CMinInterleave
+from ..cache import Mean as CMean, Max as CMax, Min as CMin, L2Norm as CL2Norm, Fill as CFill, MaxInterleave as CMaxInterleave, MinInterleave as CMinInterleave, MeanInterleave as CMeanInterleave
 from ..abs import ContextBase
 from .registry import register
 
@@ -638,6 +638,125 @@ class LServeSparseAttention(vFlow):
         return {
             "max": (block_size // self.LSERVE_BLOCK_SIZE, head_dim),
             "min": (block_size // self.LSERVE_BLOCK_SIZE, head_dim),
+        }
+
+
+@register("lserve_centroid_sparse_attention")
+class LServeCentroidSparseAttention(vFlow):
+    r"""
+    Centroid block-sparse routing at LSERVE sub-block granularity.
+
+    This flow keeps the **centroid** routing of
+    :class:`BlockSparseAttention` — a page is scored by the dot product
+    between a query summary and a *mean* key vector — but borrows the
+    sub-block granularity idea of :class:`LServeSparseAttention`. Rather
+    than collapsing a whole page into a single centroid, the page is
+    split into consecutive sub-blocks of :attr:`SUB_BLOCK_SIZE` tokens
+    and a separate centroid is stored per sub-block. The page score is
+    the **max** over its sub-block centroids, so a page is selected when
+    *any* of its sub-regions matches the query — the same "finest-grained
+    statistic, then max" intuition LSERVE applies to min/max envelopes,
+    here applied to means.
+
+    Shapes
+    ------
+    - Queries ``q``: ``[B, H_q, D]`` (typically bfloat16).
+    - ``cache["centroids"]``: inner shape ``(block_size // SUB_BLOCK_SIZE, head_dim)``
+      → viewed as ``[S, n_sub, D]`` in :meth:`forward_indexer` and
+      ``[B, n_sub, D]`` in :meth:`forward_cache`, where
+      ``n_sub = block_size // SUB_BLOCK_SIZE`` is the number of
+      sub-blocks per page.
+    - ``cache["k"]``: standard key cache, inner shape ``(page_size, head_dim)``.
+
+    Routing intuition
+    -----------------
+    1. Average the query over the grouped-query heads → one summary
+       vector per request.
+    2. Dot the query summary against every sub-block centroid → one
+       score per (page, sub-block).
+    3. Take the max over sub-blocks → a single per-page score.
+    4. Feed per-page scores into :class:`topK` for sparse page indices.
+
+    When ``block_size == SUB_BLOCK_SIZE`` there is exactly one sub-block
+    per page and this reduces identically to
+    :class:`BlockSparseAttention`.
+    """
+    SUB_BLOCK_SIZE = 16
+
+    def __init__(self):
+        super().__init__()
+
+        # Indexer-side ops
+        self.mean = Mean(dim=1)        # average query over grouped-query heads
+        self.gemm = GeMM()             # q_summary · sub-block centroids
+        self.max_sub = Max(dim=1)      # max over sub-block centroids
+        self.output_func = topK()      # produce sparse indices
+
+        # Cache-side op: interleaved per-sub-block mean over keys
+        self.reduction = CMeanInterleave(dim=1, k=self.SUB_BLOCK_SIZE)
+
+    def forward_indexer(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        cache: Dict[str, torch.Tensor],
+        ctx: ContextBase,
+    ):
+        r"""
+        Compute sparse page indices from sub-block centroid scores.
+
+        Pipeline (indexer view)
+        -----------------------
+        - ``q``: ``[B, H_q, D]``
+        - ``cache["centroids"]``: ``[S, n_sub, D]``
+
+        Steps:
+
+        1. ``q_summary = mean(q, dim=H_q)`` → ``[B, 1, D]``
+        2. ``score = GeMM(q_summary, centroids)`` → ``[S, n_sub, 1]``
+           (per sub-block dot product, since ``GeMM(x, y) = y x^t``)
+        3. ``page_score = max(score, dim=n_sub)`` → ``[S, 1, 1]``
+        4. :class:`topK` converts ``page_score`` into sparse page
+           indices ``o`` of shape ``[S_sparse, 1, 1]``.
+        """
+        q_summary = self.mean(q, ctx=ctx)
+        score = self.gemm(q_summary, cache["centroids"], ctx=ctx)
+        page_score = self.max_sub(score, ctx=ctx)
+        self.output_func(page_score, o, ctx=ctx)
+
+    def forward_cache(
+        self,
+        cache: Dict[str, torch.Tensor],
+        loc: torch.Tensor,
+        ctx: ContextBase,
+    ):
+        r"""
+        Update per-sub-block centroids from the key cache.
+
+        Cache-update view
+        -----------------
+        - ``cache["k"]``: ``[B, page_size, D]``
+        - ``cache["centroids"]``: ``[B, n_sub, D]``
+
+        :class:`CMeanInterleave` (``dim=1``, ``k=SUB_BLOCK_SIZE``) takes a
+        grouped mean over consecutive groups of ``SUB_BLOCK_SIZE`` keys,
+        writing one centroid per sub-block.
+        """
+        self.reduction(cache["k"], cache["centroids"], loc=loc, ctx=ctx)
+
+    def create_cache(self, block_size: int, head_dim: int):
+        r"""
+        Declare inner shapes for custom cache tensors.
+
+        Returns
+        -------
+        Dict[str, Tuple[int, int]]
+            - ``"centroids"``: inner shape
+              ``(block_size // SUB_BLOCK_SIZE, head_dim)`` — one centroid
+              per sub-block of the page.
+        """
+        return {
+            "centroids": (block_size // self.SUB_BLOCK_SIZE, head_dim),
         }
 
 
