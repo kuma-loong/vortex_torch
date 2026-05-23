@@ -1,9 +1,15 @@
 import json
+import os
 import sys
 import sglang as sgl
 from transformers import AutoTokenizer
 def main():
     model_name = "MiniMaxAI/MiniMax-M2.7"
+
+    # Baseline toggle: ENABLE_VORTEX_SPARSITY=0 runs dense sglang (no vortex
+    # sparse path) to confirm the reference accuracy; default (1) is sparse.
+    enable_vortex_sparsity = os.environ.get("ENABLE_VORTEX_SPARSITY", "1") == "1"
+    print(f"[run_ruler] enable_vortex_sparsity={enable_vortex_sparsity}", flush=True)
 
     default_policy = r"""
 const int static_kv_budget = topk_val + block_reserved_bos + block_reserved_eos;
@@ -21,7 +27,7 @@ return max(static_kv_budget, dynamic_kv_budget);
                     vortex_dtype="bfloat16",
                     attention_backend="flashinfer",
                     vortex_schedule_policy=default_policy,
-                    enable_vortex_sparsity=True,
+                    enable_vortex_sparsity=enable_vortex_sparsity,
                     vortex_block_reserved_bos=1,
                     vortex_block_reserved_eos=2,
                     vortex_layers_skip=list(range(1)),
@@ -55,7 +61,10 @@ return max(static_kv_budget, dynamic_kv_budget);
         enable_thinking=False
     ) for text in texts
     ]
-    sampling_params = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "max_new_tokens": 64}
+    # MiniMax-M2 is a reasoning model: it emits a chain-of-thought preamble
+    # before stating the answer, so a 64-token cap truncates the answer
+    # (RULER scores by substring match). Give it room to finish.
+    sampling_params = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "max_new_tokens": 1024}
     accuracy = 0
     with open("examples/ruler_output.jsonl", "w", encoding="utf-8") as f:
             o = llm.generate(prompts, sampling_params)

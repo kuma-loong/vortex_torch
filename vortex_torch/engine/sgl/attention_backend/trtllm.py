@@ -556,8 +556,14 @@ class VortexTRTLLMBackend(AttentionBackend):
         assert not layer.logit_cap, "trtllm decode does not support logits soft-cap"
 
         # Fold sm_scale, k_scale, v_scale into bmm1/bmm2 scales for trtllm.
-        k_scale = layer.k_scale if layer.k_scale is not None else 1.0
-        v_scale = layer.v_scale if layer.v_scale is not None else 1.0
+        # Use the *_float scalars (not layer.k_scale / layer.v_scale, which are
+        # GPU tensors): trtllm_batch_decode_with_kv_cache expects python-float
+        # bmm scales, and reading the tensor here would force a device->host
+        # sync that breaks cuda-graph capture. For a bf16 KV cache these are
+        # the 1.0 default (no-op); for an fp8 cache they dequantize the stored
+        # K/V, matching the div() applied on the write side in set_kv_buffer.
+        k_scale = layer.k_scale_float if layer.k_scale_float is not None else 1.0
+        v_scale = layer.v_scale_float if layer.v_scale_float is not None else 1.0
         bmm1_scale = layer.scaling * k_scale
         bmm2_scale = v_scale
 

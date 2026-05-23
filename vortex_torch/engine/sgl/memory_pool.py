@@ -270,12 +270,28 @@ class VortexCachePool(KVCache):
     ):
         
         assert layer_id_override is None
-        assert k_scale is None
-        assert v_scale is None
         assert loc.dtype == torch.int64
-        
+
         layer_id = layer.layer_id
-        
+
+        # KV scales (mirror sglang's MHATokenToKVPool.set_kv_buffer): the
+        # per-tensor k_scale/v_scale only matter when we down-cast the model's
+        # bf16 k/v into a narrower cache dtype (fp8) — divide by the scale
+        # before the fp8 launcher casts, so the stored fp8 values are the
+        # quantized representation. For a bf16 cache (cache_k.dtype == self.dtype)
+        # the scales are a no-op and must be IGNORED rather than asserted away:
+        # fp8-*weight* models such as MiniMax-M2 still attach layer.k_scale /
+        # layer.v_scale (typically the 1.0 default from
+        # quantization/kv_cache.py::process_weights_after_loading) even though
+        # their KV cache stays bf16. The matching dequant on the read side is
+        # applied by the attention backends via layer.k_scale_float /
+        # layer.v_scale_float.
+        if cache_k.dtype != self.dtype:
+            if k_scale is not None:
+                cache_k = cache_k.div(k_scale)
+            if v_scale is not None:
+                cache_v = cache_v.div(v_scale)
+
         self.set_kv_buffer_func(
             self.cache[layer_id - self.start_layer]["k"],
             self.cache[layer_id - self.start_layer]["v"],

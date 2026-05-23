@@ -622,7 +622,16 @@ class VortexFlashInferBackend(AttentionBackend):
         
         cache_k = cache["k"].view(-1, self.block_size, 1, self.head_dim)
         cache_v = cache["v"].view(-1, self.block_size, 1, self.head_dim)
-        
+
+        # Use the *_float scalars (not layer.k_scale / layer.v_scale, which are
+        # GPU tensors): the flashinfer decode wrapper expects python-float
+        # scales, and reading the tensor would force a device->host sync that
+        # breaks cuda-graph capture. For a bf16 KV cache these are the 1.0
+        # default (no-op); for an fp8 cache they dequantize the stored K/V,
+        # matching the div() applied on the write side in set_kv_buffer.
+        k_scale = layer.k_scale_float if layer.k_scale_float is not None else 1.0
+        v_scale = layer.v_scale_float if layer.v_scale_float is not None else 1.0
+
         # Decide whether to use sparsity on this layer
         use_sparsity = (layer.layer_id not in self.layers_skip)
 
@@ -644,8 +653,8 @@ class VortexFlashInferBackend(AttentionBackend):
                 (cache_k, cache_v),
                 sm_scale=layer.scaling,
                 logits_soft_cap=layer.logit_cap,
-                k_scale=layer.k_scale,
-                v_scale=layer.v_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
 
         else:
@@ -655,8 +664,8 @@ class VortexFlashInferBackend(AttentionBackend):
                 (cache_k, cache_v),
                 sm_scale=layer.scaling,
                 logits_soft_cap=layer.logit_cap,
-                k_scale=layer.k_scale,
-                v_scale=layer.v_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
 
         # Restore to merged head dimension
