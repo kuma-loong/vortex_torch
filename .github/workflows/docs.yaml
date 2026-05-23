@@ -2,10 +2,10 @@ name: docs
 
 on:
   push:
-    branches: [ v1 ]        # 或者你用的分支名
+    branches: [ v0.5 ]
     paths:
       - "docs/**"
-      - ".github/workflows/docs.yml"
+      - ".github/workflows/docs.yaml"
 
 jobs:
   build-deploy:
