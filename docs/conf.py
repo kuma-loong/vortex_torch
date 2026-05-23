@@ -38,7 +38,8 @@ autodoc_mock_imports = [
     "numpy",
     "vortex_torch_C",
     "flash-attn",
-    "flashinfer"
+    "flashinfer",
+    "sglang",
 ]
 
 
@@ -46,6 +47,10 @@ autosummary_generate = True
 autosummary_generate_overwrite = False
 autodoc_typehints = "description"
 autodoc_member_order = "bysource"
+# Render type-hint cross-references with their short name but resolve them to
+# the exact (fully-qualified) target — disambiguates same-named classes that
+# legitimately exist in two packages (e.g. cache.Context vs indexer.Context).
+python_use_unqualified_type_names = True
 autodoc_default_options = {
     #"members": True,
     "undoc-members": False,

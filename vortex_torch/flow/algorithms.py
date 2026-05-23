@@ -24,7 +24,7 @@ class BlockSparseAttention(vFlow):
 
     This flow implements a simple **block-sparse routing** strategy
     inspired by the block-top-k routing used in Kinetics
-    :cite:`sadhukhan2025kinetics` (arXiv:2506.05333). It maintains a
+    [sadhukhan2025kinetics]_ (arXiv:2506.05333). It maintains a
     per-request centroid over keys and uses query–centroid similarity to
     select a sparse set of pages.
 
@@ -53,7 +53,7 @@ class BlockSparseAttention(vFlow):
 
          .. math::
 
-             o \in \mathbb{R}^{S} \times 1 \times 1},
+             o \in \mathbb{R}^{S \times 1 \times 1},
 
          Here :math:`S` is the leading page axis. Internally it is a packed
          axis (often denoted :math:`S_{\mathrm{pack}}`), obtained by
@@ -82,7 +82,7 @@ class BlockSparseAttention(vFlow):
       .. math::
 
           \text{cache["centroids"]} \sim
-          \mathbb{R}^{S} \times 1 \times D},
+          \mathbb{R}^{S \times 1 \times D},
 
     - In :meth:`forward_cache` (batch-major view):
 
@@ -251,6 +251,7 @@ class GQABlockSparseAttention(vFlow):
 
       - ``[S, 1, D]`` in :meth:`forward_indexer`,
       - ``[B, 1, D]`` in :meth:`forward_cache`.
+
       Here :math:`S` is the leading page axis. Internally it is a packed
       axis (often denoted :math:`S_{\mathrm{pack}}`), obtained by
       concatenating the pages from all requests. As a user, you can simply
