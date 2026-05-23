@@ -64,6 +64,7 @@ vortex_layers_skip: list = None,
                     vortex_workload_chunk_size=max(page_size // block_size, workload_chunk_size),
                     vortex_compilation_cache_dir="~/.vortex_compilation_cache",
                     context_length=40960,
+                    trust_remote_code=True,
                     )
     
     with open(data_path, "r", encoding="utf-8") as f:

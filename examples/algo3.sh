@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-export CUDA_VISIBLE_DEVICES=7
+export CUDA_VISIBLE_DEVICES=4,7
 export HF_HOME=/raid/catalyst/models/
 set -e
 sparse_algos=(
-full_attention
+block_sparse_attention
 )
 
 models=(
-Qwen/Qwen3-30B-A3B-FP8
+MiniMaxAI/MiniMax-M2.7
 )
 trials=(
 32
 )
 topk_val=(
-253
+125
 )
 for algo in "${sparse_algos[@]}"; do
   for model in "${models[@]}"; do
@@ -30,15 +30,15 @@ for algo in "${sparse_algos[@]}"; do
             --vortex-module-name "${algo}" \
             --model-name  "${model}" \
             --mem 0.9 \
-            --data-path examples/aime26.jsonl \
+            --data-path examples/aime26_minimax.jsonl \
             --generation-max-new-tokens 32768 \
             --max-input-length 4096 \
-            --tp-size 1 \
+            --tp-size 2 \
             --vortex-attention-backend trtllm \
             --vortex-impl-backend triton \
             --vortex-use-tensor-core \
             --vortex-layers-skip 0 \
-            --summary-dir summary-Qwen3-4B-sglang-trtllm \
+            --summary-dir summary-MiniMax-M2.7-sglang-trtllm \
             --skip-already-finished-check
       done
     done

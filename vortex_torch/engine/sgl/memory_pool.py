@@ -208,10 +208,67 @@ class VortexCachePool(KVCache):
         
         raise NotImplementedError
     
-    # for disagg
+    # for disagg (PD disaggregation, Option B)
     def get_contiguous_buf_infos(self):
-        
-        raise NotImplementedError
+        """Per-layer (data_ptr, total_bytes, page_item_bytes) for the K then
+        V buffers, consumed by the disaggregation transfer engine
+        (``disaggregation/{prefill,decode}.py``) for RDMA registration +
+        page-granular copy (``src = base + page_idx * item_len``).
+
+        Vortex stores K/V **page-major** (see
+        ``cache/triton_kernels/set_kv.py``):
+
+            position = (token//page)*(page*num_kv_head) + head*page + token%page
+
+        so one *logical* page — all ``head_num`` KV heads × ``page_size``
+        tokens — is a single contiguous block. The head interleaving lives
+        *inside* the page, so the transfer is page-granular exactly like the
+        stock ``MHATokenToKVPool``: ``item_len`` = bytes of one full logical
+        page (all heads) = ``page_size*head_num*head_dim*elt``.
+
+        Only K/V are exported. The auxiliary per-page tensors (centroids /
+        envelopes / Save fields) are **not** transferred — the decode side
+        rebuilds them from the received K/V via :meth:`rebuild_aux`
+        (disagg Option B; correct because no ``forward_cache`` reads an
+        indexer-``Save``-accumulated field).
+        """
+        layers = range(self.start_layer, self.start_layer + self.layer_num)
+        k_bufs = [self.cache[l - self.start_layer]["k"] for l in layers]
+        v_bufs = [self.cache[l - self.start_layer]["v"] for l in layers]
+        page_item_numel = self.page_size * self.head_num * self.head_dim
+
+        ptrs, data_lens, item_lens = [], [], []
+        for t in list(k_bufs) + list(v_bufs):
+            ptrs.append(t.data_ptr())
+            data_lens.append(t.element_size() * t.numel())
+            item_lens.append(t.element_size() * page_item_numel)
+        return ptrs, data_lens, item_lens
+
+    def rebuild_aux(self, loc: torch.Tensor):
+        """Decode-side (PD disagg): rebuild the per-page auxiliary cache
+        (centroids / min-max envelopes, etc.) and zero the persistent
+        ``Save``/``Load`` fields for the pages whose K/V was just received
+        from the prefill node, by running ``forward_cache`` over ``loc`` in
+        one batched pass.
+
+        This is the same ``compiled_cache.forward`` that
+        :meth:`set_kv_buffer` runs incrementally during normal decode, here
+        applied once over the transferred prompt's KV locations. It is
+        stateless w.r.t. decode accumulation (verified: no flow's
+        ``forward_cache`` reads a ``Save``-accumulated field), so it
+        reproduces the monolithic decode-start state bit-identically. Pages
+        in ``layers_skip`` run dense and keep no aux, mirroring
+        :meth:`set_kv_buffer`.
+        """
+        if loc is None or loc.numel() == 0:
+            return
+        loc = loc.to(torch.int64)
+        for layer_id in range(self.start_layer, self.start_layer + self.layer_num):
+            if layer_id in self.layers_skip:
+                continue
+            self.compiled_cache.forward(
+                self.cache[layer_id - self.start_layer], loc, ctx=self.ctx
+            )
 
     def maybe_get_custom_mem_pool(self):
         return self.custom_mem_pool

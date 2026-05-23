@@ -4,7 +4,7 @@ import sys
 import sglang as sgl
 from transformers import AutoTokenizer
 def main():
-    model_name = "MiniMaxAI/MiniMax-M2.7"
+    model_name = "Qwen/Qwen3-4B"
 
     # Baseline toggle: ENABLE_VORTEX_SPARSITY=0 runs dense sglang (no vortex
     # sparse path) to confirm the reference accuracy; default (1) is sparse.
@@ -31,7 +31,7 @@ return max(static_kv_budget, dynamic_kv_budget);
                     vortex_block_reserved_bos=1,
                     vortex_block_reserved_eos=2,
                     vortex_layers_skip=list(range(1)),
-                    vortex_module_name="block_sparse_attention",
+                    vortex_module_name="gqa_block_sparse_attention",
                     vortex_attention_backend="trtllm",
                     trust_remote_code=True,
                     #vortex_module_path="submissions/example_block_sparse_attention.py",
@@ -39,7 +39,7 @@ return max(static_kv_budget, dynamic_kv_budget);
                     mem_fraction_static=0.9,
                     vortex_workload_chunk_size=32,
                     vortex_compilation_cache_dir="~/.vortex_compilation_cache",
-                    tp_size=2,
+                    tp_size=1,
                     )
     
     with open("examples/validation.jsonl", "r", encoding="utf-8") as f:

@@ -872,6 +872,20 @@ class DecodeTransferQueue:
                             self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                     else:
                         transferred_reqs.append(decode_req.req)
+                        # Vortex PD disaggregation (Option B): the per-page
+                        # auxiliary cache (centroids/envelopes) is NOT
+                        # transferred from prefill — rebuild it on the decode
+                        # side from the just-received K/V before this req's
+                        # first decode step. No-op for non-vortex pools.
+                        _pool = (
+                            self.scheduler.token_to_kv_pool_allocator.get_kvcache()
+                        )
+                        if hasattr(_pool, "rebuild_aux"):
+                            _req = decode_req.req
+                            _loc = self.scheduler.req_to_token_pool.req_to_token[
+                                _req.req_pool_idx, : _req.kv_committed_len
+                            ]
+                            _pool.rebuild_aux(_loc)
             elif poll in [
                 KVPoll.Bootstrapping,
                 KVPoll.WaitingForInput,
