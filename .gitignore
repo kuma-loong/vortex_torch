@@ -282,6 +282,7 @@ Cargo.lock
 !examples/lcbv5.jsonl
 !examples/aime25.jsonl
 !examples/aime26.jsonl
+!examples/aime26_minimax.jsonl
 RLG
 .codex
 .claude/.nfs*
