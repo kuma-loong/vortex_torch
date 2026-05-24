@@ -9,85 +9,27 @@ class Kron(vOp):
     r"""
     Kronecker product over a configurable subset of the inner axes.
 
-    Given two rank-3 inputs
+    The chosen inner axes (``dim``) are Kronecker-expanded; any other inner
+    axis is multiplied elementwise (with broadcasting), and the leading
+    :math:`S` axis is always elementwise.
 
-    .. math::
+    :Math:
+        For :math:`X\in\mathbb{R}^{S\times x_1\times x_2}` and
+        :math:`Y\in\mathbb{R}^{S\times y_1\times y_2}`:
 
-        X \in \mathbb{R}^{S \times x_1 \times x_2}, \qquad
-        Y \in \mathbb{R}^{S \times y_1 \times y_2},
+        .. math::
 
-    this operator takes a Kronecker product along the axes listed in
-    :attr:`dim` (a subset of ``{1, 2}``), and an elementwise (broadcast)
-    product along every other inner axis. The leading axis :math:`S` is
-    always elementwise.
-
-    For axis ``a`` in ``{1, 2}``:
-
-    - if ``a`` is in :attr:`dim`, the output size is ``x.shape[a] * y.shape[a]``;
-    - otherwise, ``x.shape[a]`` must equal ``y.shape[a]`` or one of them
-      must be ``1`` (broadcast), and the output size is
-      ``max(x.shape[a], y.shape[a])``.
-
-    Examples
-    --------
-    All three forms below select different output layouts from the same
-    pair of inputs::
-
-        Kron(dim=(1, 2))   # full Kron:    [B, x1*y1, x2*y2]
-        Kron(dim=1)        # row-Kron:     [B, x1*y1, D]      (x2==y2 or 1)
-        Kron(dim=2)        # col-Kron:     [B, C,     x2*y2]  (x1==y1 or 1)
-
-    With the explicit index formula
-
-    .. math::
-
-        \text{out}[s, \cdot, \cdot]
-        \;=\; \mathrm{kron\_along}_{\text{dim}}\!\bigl(X[s], Y[s]\bigr).
-
-    For ``dim == (1, 2)``:
-
-    .. math::
-
-        \text{out}[s,\, i \cdot y_1 + j,\, k \cdot y_2 + l]
-        = X[s, i, k] \cdot Y[s, j, l].
-
-    For ``dim == (1,)`` (with ``x_2 = y_2 = D`` after broadcast):
-
-    .. math::
-
-        \text{out}[s,\, i \cdot y_1 + j,\, d]
-        = X[s, i, d] \cdot Y[s, j, d].
-
-    For ``dim == (2,)`` (with ``x_1 = y_1 = C`` after broadcast):
-
-    .. math::
-
-        \text{out}[s,\, c,\, k \cdot y_2 + l]
-        = X[s, c, k] \cdot Y[s, c, l].
-
-    Output format rule: ``BATCHED`` iff both inputs are ``BATCHED``
-    (each tile is one ``(batch, head)`` summary, stored once per
-    workload group via the kernel's first-workload gate); otherwise
-    ``RAGGED`` (per-workload tile). ``BATCHED`` inputs broadcast along
-    the workload axis (leading block dim == 1) so they can pair with
-    non-``BATCHED`` partners. Format compatibility is enforced by the
-    compiler's per-workload kernel.
-
-    Parameters
-    ----------
-    dim : int or Iterable[int], optional
-        The inner axis (or axes) along which to take the Kronecker
-        product. Each entry must be ``1`` or ``2``; duplicates are
-        rejected. Default is ``(1, 2)`` (full Kronecker product).
-
-    Attributes
-    ----------
-    dim : Tuple[int, ...]
-        Sorted tuple of axes that get the Kronecker expansion.
-    output_format : Optional[FORMAT]
-        Resolved output format from :meth:`profile`.
-    output_buffer : Optional[vTensor]
-        Pure-metadata vTensor descriptor for the output (graph node).
+            \begin{aligned}
+            \text{dim}=(1,2):\quad & O_{s,\,i\,y_1+j,\,k\,y_2+l} = X_{s,i,k}\,Y_{s,j,l}, \\
+            \text{dim}=(1,):\quad  & O_{s,\,i\,y_1+j,\,d} = X_{s,i,d}\,Y_{s,j,d}, \\
+            \text{dim}=(2,):\quad  & O_{s,\,c,\,k\,y_2+l} = X_{s,c,k}\,Y_{s,c,l}.
+            \end{aligned}
+    :__init__: ``Kron(dim=(1, 2))`` — inner axis/axes to expand, each ``1`` or
+        ``2`` (non-listed axes must be equal or broadcastable).
+    :__call__: ``o = op(x, y, ctx=ctx)`` — ``x`` ``[S, x_1, x_2]``, ``y``
+        ``[S, y_1, y_2]``; an expanded axis has output size
+        ``x.shape[a]*y.shape[a]``, a broadcast axis ``max(x.shape[a],
+        y.shape[a])``. Output is ``BATCHED`` iff both inputs are.
     """
 
     def __init__(self, dim: Union[int, Iterable[int]] = (1, 2)):

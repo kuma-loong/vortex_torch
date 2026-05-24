@@ -7,63 +7,28 @@ from typing import Optional
 
 class Elementwise_Binary(vOp):
     r"""
-    Binary elementwise op (e.g. Maximum / Minimum / AXPBY / Mul).
+    Pointwise binary op over two cache blocks (cache side).
 
-    Operates on rank-3 tensors
+    :Math:
+        For :math:`X, Y \in \mathbb{R}^{B\times N\times D}` and a scalar
+        function :math:`g` fixed by the subclass (max / min / affine / product
+        / comparison mask):
 
-    .. math::
+        .. math::
 
-        X, Y \in \mathbb{R}^{B \times N \times D},
+            Z_{b,n,d} = g(X_{b,n,d},\, Y_{b,n,d};\, \alpha, \beta).
 
-    where:
-
-    - :math:`B` is a leading batch-like axis (typically derived from the
-      runtime context, e.g. ``max_new_tokens_per_batch * head_num``),
-    - :math:`N` is a sequence or position dimension, and
-    - :math:`D` is a feature/channel dimension.
-
-    Broadcasting is supported on the last two dimensions:
-
-    - :math:`N` is broadcastable if ``x.shape[1] == y.shape[1]``,
-      or one of them equals ``1``.
-    - :math:`D` is broadcastable if ``x.shape[2] == y.shape[2]``,
-      or one of them equals ``1``.
-
-    For a given operation type :attr:`op_type`, the op applies a scalar
-    function
-
-    .. math::
-
-        f(x, y; \alpha, \beta, \text{op_type})
-
-    pointwise to produce
-
-    .. math::
-
-        Z[b, n, d]
-        = f\bigl(X[b, n', d'], Y[b, n'', d'']; \alpha, \beta, \text{op_type}\bigr),
-
-    where :math:`(n', d')` and :math:`(n'', d'')` are the broadcasted
-    indices derived from :math:`(n, d)`.
-
-    Output format rule: if a caller-provided ``output`` is supplied with
-    ``PAGED`` format, the output is ``PAGED``; in every other case the
-    output is ``RAGGED``. Format compatibility is enforced by the
-    compiler's per-block kernel.
-
-    Attributes
-    ----------
-    alpha : float
-        Scalar parameter used by certain binary ops.
-    beta : float
-        Scalar parameter used by certain binary ops.
-    op_type : Optional[ElementwiseBinaryOpType]
-        Enum value describing the specific binary operation
-        (e.g. maximum, minimum, AXPBY, multiply).
-    output_format : Optional[FORMAT]
-        The output tensor format as determined in :meth:`profile`.
-    output_buffer : Optional[vTensor]
-        Pure-metadata vTensor descriptor for the output (graph node).
+        ``N`` and ``D`` broadcast when one operand's extent is ``1``.
+    :__init__: ``Elementwise_Binary(alpha=1.0, beta=1.0)`` — scalars consumed
+        only by the ops that need them (e.g. :class:`Add`); abstract, pick a
+        concrete subclass.
+    :__call__: ``z = op(x, y, output, loc=loc, ctx=ctx)`` — ``x`` ``[B, N_x, D_x]``,
+        ``y`` ``[B, N_y, D_y]`` → ``[B, max(N_x,N_y), max(D_x,D_y)]``. ``PAGED``
+        iff a ``PAGED`` ``output`` is supplied, else ``RAGGED``.
+    :Note: subclasses — :class:`Maximum`, :class:`Minimum`, :class:`Add`,
+        :class:`Multiply`, and the comparison masks :class:`WhereEqual`,
+        :class:`WhereNotEqual`, :class:`WhereGreater`, :class:`WhereGreaterEqual`,
+        :class:`WhereLess`, :class:`WhereLessEqual`.
     """
 
     def __init__(self, alpha: float = 1.0, beta: float = 1.0):
@@ -81,53 +46,9 @@ class Elementwise_Binary(vOp):
     def profile(
         self, x: vTensor, y: vTensor, output: Optional[vTensor], loc: torch.Tensor, ctx: Context
     ) -> vTensor:
-        r"""
-        Validate inputs and optionally allocate an internal output buffer.
-
-        The input tensors ``x`` and ``y`` are expected to have logical
-        shape ``[B, N_x, D_x]`` and ``[B, N_y, D_y]`` respectively,
-        with broadcasting allowed on ``N`` and ``D``:
-
-        .. math::
-
-            N_{\text{out}} = \max(N_x, N_y), \quad
-            D_{\text{out}} = \max(D_x, D_y).
-
-        Parameters
-        ----------
-        x : vTensor
-            Left-hand operand with logical shape ``[B, N_x, D_x]``.
-
-        y : vTensor
-            Right-hand operand with logical shape ``[B, N_y, D_y]``.
-
-        output : Optional[vTensor]
-            Optional preallocated output tensor. If ``None``, an internal
-            RAGGED buffer with shape ``[B, N_out, D_out]`` is allocated
-            using ``ctx.max_new_tokens_per_batch * ctx.head_num`` for
-            ``B``. If not ``None``, this tensor must have rank 3,
-            broadcasted shape ``[B_out, N_out, D_out]`` and format in
-            ``{PAGED, RAGGED}``.
-
-        loc : torch.Tensor
-            Auxiliary tensor carrying per-position metadata used by the
-            implementation.
-
-        ctx : Context
-            Execution context that provides the runtime value of ``B`` and
-            is used for auxiliary memory accounting.
-
-        Returns
-        -------
-        vTensor
-            A :class:`vTensor` view representing the resolved output.
-
-        Raises
-        ------
-        AssertionError
-            If types, ranks, broadcast conditions, shapes, or devices are
-            incompatible.
-        """
+        r"""Trace-time: validate ``x``/``y`` ``[B, N, D]`` (broadcasting on
+        ``N``/``D``), resolve the output format, register the op, and return a
+        ``vTensor`` view of the ``[B, max(N_x,N_y), max(D_x,D_y)]`` output."""
         prefix = self._prefix()
 
         # --- type checks ---
@@ -195,39 +116,13 @@ class Elementwise_Binary(vOp):
 
 class Maximum(Elementwise_Binary):
     r"""
-    Elementwise maximum of two tensors.
+    Elementwise maximum (an :class:`Elementwise_Binary`).
 
-    This operator applies, pointwise, the scalar function
+    :Math:
+        .. math::
 
-    .. math::
-
-        f(x, y) = \max(x, y).
-
-    Given two input tensors
-
-    .. math::
-
-        X, Y \in \mathbb{R}^{B \times N \times D},
-
-    with broadcasting allowed on the ``N`` and ``D`` dimensions, the
-    output tensor :math:`Z` is defined by
-
-    .. math::
-
-        Z[b, n, d] = \max\bigl(X[b, n', d'], Y[b, n'', d'']\bigr),
-
-    where :math:`(n', d')` and :math:`(n'', d'')` are the broadcasted
-    indices corresponding to :math:`(n, d)`.
-
-    Parameters
-    ----------
-    alpha : float, optional
-        Unused for this operation. Present only to match the common
-        :class:`Elementwise_Binary` interface. Default is ``1``.
-
-    beta : float, optional
-        Unused for this operation. Present only to match the common
-        :class:`Elementwise_Binary` interface. Default is ``1``.
+            Z_{b,n,d} = \max(X_{b,n,d},\, Y_{b,n,d}).
+    :__init__: ``Maximum(alpha=1.0, beta=1.0)`` — ``alpha`` / ``beta`` unused.
     """
     def __init__(self, alpha: float = 1.0, beta: float = 1.0):
         super().__init__(alpha, beta)
@@ -236,39 +131,13 @@ class Maximum(Elementwise_Binary):
 
 class Minimum(Elementwise_Binary):
     r"""
-    Elementwise minimum of two tensors.
+    Elementwise minimum (an :class:`Elementwise_Binary`).
 
-    This operator applies, pointwise, the scalar function
+    :Math:
+        .. math::
 
-    .. math::
-
-        f(x, y) = \min(x, y).
-
-    Given two input tensors
-
-    .. math::
-
-        X, Y \in \mathbb{R}^{B \times N \times D},
-
-    with broadcasting allowed on the ``N`` and ``D`` dimensions, the
-    output tensor :math:`Z` is defined by
-
-    .. math::
-
-        Z[b, n, d] = \min\bigl(X[b, n', d'], Y[b, n'', d'']\bigr),
-
-    where :math:`(n', d')` and :math:`(n'', d'')` are the broadcasted
-    indices corresponding to :math:`(n, d)`.
-
-    Parameters
-    ----------
-    alpha : float, optional
-        Unused for this operation. Present only to match the common
-        :class:`Elementwise_Binary` interface. Default is ``1``.
-
-    beta : float, optional
-        Unused for this operation. Present only to match the common
-        :class:`Elementwise_Binary` interface. Default is ``1``.
+            Z_{b,n,d} = \min(X_{b,n,d},\, Y_{b,n,d}).
+    :__init__: ``Minimum(alpha=1.0, beta=1.0)`` — ``alpha`` / ``beta`` unused.
     """
     def __init__(self, alpha: float = 1.0, beta: float = 1.0):
         super().__init__(alpha, beta)
@@ -277,40 +146,14 @@ class Minimum(Elementwise_Binary):
 
 class Add(Elementwise_Binary):
     r"""
-    Weighted sum (AXPBY-style) of two tensors.
+    Affine combination :math:`\alpha x + \beta y` (an :class:`Elementwise_Binary`).
 
-    This operator applies, pointwise, the scalar function
+    :Math:
+        .. math::
 
-    .. math::
-
-        f(x, y; \alpha, \beta) = \alpha x + \beta y.
-
-    Given two input tensors
-
-    .. math::
-
-        X, Y \in \mathbb{R}^{B \times N \times D},
-
-    with broadcasting allowed on the ``N`` and ``D`` dimensions, the
-    output tensor :math:`Z` is defined by
-
-    .. math::
-
-        Z[b, n, d]
-        = \alpha \, X[b, n', d'] + \beta \, Y[b, n'', d''],
-
-    where :math:`(n', d')` and :math:`(n'', d'')` are the broadcasted
-    indices corresponding to :math:`(n, d)`.
-
-    Parameters
-    ----------
-    alpha : float, optional
-        Coefficient :math:`\alpha` applied to the first input tensor.
-        Default is ``1``.
-
-    beta : float, optional
-        Coefficient :math:`\beta` applied to the second input tensor.
-        Default is ``1``.
+            Z_{b,n,d} = \alpha\,X_{b,n,d} + \beta\,Y_{b,n,d}.
+    :__init__: ``Add(alpha=1.0, beta=1.0)`` — multipliers for :math:`x` and
+        :math:`y` (defaults give :math:`x+y`).
     """
     def __init__(self, alpha: float = 1.0, beta: float = 1.0):
         super().__init__(alpha, beta)
@@ -319,40 +162,13 @@ class Add(Elementwise_Binary):
 
 class Multiply(Elementwise_Binary):
     r"""
-    Elementwise product of two tensors.
+    Elementwise product (an :class:`Elementwise_Binary`).
 
-    This operator applies, pointwise, the scalar function
+    :Math:
+        .. math::
 
-    .. math::
-
-        f(x, y) = x \cdot y.
-
-    Given two input tensors
-
-    .. math::
-
-        X, Y \in \mathbb{R}^{B \times N \times D},
-
-    with broadcasting allowed on the ``N`` and ``D`` dimensions, the
-    output tensor :math:`Z` is defined by
-
-    .. math::
-
-        Z[b, n, d]
-        = X[b, n', d'] \cdot Y[b, n'', d''],
-
-    where :math:`(n', d')` and :math:`(n'', d'')` are the broadcasted
-    indices corresponding to :math:`(n, d)`.
-
-    Parameters
-    ----------
-    alpha : float, optional
-        Unused for this operation. Present only to match the common
-        :class:`Elementwise_Binary` interface. Default is ``1``.
-
-    beta : float, optional
-        Unused for this operation. Present only to match the common
-        :class:`Elementwise_Binary` interface. Default is ``1``.
+            Z_{b,n,d} = X_{b,n,d}\cdot Y_{b,n,d}.
+    :__init__: ``Multiply(alpha=1.0, beta=1.0)`` — ``alpha`` / ``beta`` unused.
     """
     def __init__(self, alpha: float = 1.0, beta: float = 1.0):
         super().__init__(alpha, beta)
@@ -361,19 +177,14 @@ class Multiply(Elementwise_Binary):
 
 class WhereEqual(Elementwise_Binary):
     r"""
-    Comparison mask encoded as ``0`` or ``-inf``.
+    Comparison mask :math:`x = y` (an :class:`Elementwise_Binary`).
 
-    This operator compares the two inputs elementwise and emits:
+    :Math:
+        .. math::
 
-    .. math::
-
-        f(x, y) =
-        \begin{cases}
-            0, & x = y, \\
-            -\infty, & x \ne y.
-        \end{cases}
-
-    This is primarily useful for building additive masks in score-space.
+            Z_{b,n,d} = \begin{cases} 0, & X_{b,n,d} = Y_{b,n,d}, \\ -\infty, & \text{otherwise}. \end{cases}
+    :__init__: ``WhereEqual()`` — no arguments.
+    :Note: additive mask for score-space gating.
     """
     def __init__(self):
         super().__init__()
@@ -381,35 +192,75 @@ class WhereEqual(Elementwise_Binary):
 
 
 class WhereNotEqual(Elementwise_Binary):
-    r"""Emit ``0`` where ``x != y`` and ``-inf`` otherwise."""
+    r"""
+    Comparison mask :math:`x \ne y` (an :class:`Elementwise_Binary`).
+
+    :Math:
+        .. math::
+
+            Z_{b,n,d} = \begin{cases} 0, & X_{b,n,d} \ne Y_{b,n,d}, \\ -\infty, & \text{otherwise}. \end{cases}
+    :__init__: ``WhereNotEqual()`` — no arguments.
+    """
     def __init__(self):
         super().__init__()
         self.op_type = ElementwiseBinaryOpType.WhereNotEqual
 
 
 class WhereGreater(Elementwise_Binary):
-    r"""Emit ``0`` where ``x > y`` and ``-inf`` otherwise."""
+    r"""
+    Comparison mask :math:`x > y` (an :class:`Elementwise_Binary`).
+
+    :Math:
+        .. math::
+
+            Z_{b,n,d} = \begin{cases} 0, & X_{b,n,d} > Y_{b,n,d}, \\ -\infty, & \text{otherwise}. \end{cases}
+    :__init__: ``WhereGreater()`` — no arguments.
+    """
     def __init__(self):
         super().__init__()
         self.op_type = ElementwiseBinaryOpType.WhereGreater
 
 
 class WhereGreaterEqual(Elementwise_Binary):
-    r"""Emit ``0`` where ``x >= y`` and ``-inf`` otherwise."""
+    r"""
+    Comparison mask :math:`x \ge y` (an :class:`Elementwise_Binary`).
+
+    :Math:
+        .. math::
+
+            Z_{b,n,d} = \begin{cases} 0, & X_{b,n,d} \ge Y_{b,n,d}, \\ -\infty, & \text{otherwise}. \end{cases}
+    :__init__: ``WhereGreaterEqual()`` — no arguments.
+    """
     def __init__(self):
         super().__init__()
         self.op_type = ElementwiseBinaryOpType.WhereGreaterEqual
 
 
 class WhereLess(Elementwise_Binary):
-    r"""Emit ``0`` where ``x < y`` and ``-inf`` otherwise."""
+    r"""
+    Comparison mask :math:`x < y` (an :class:`Elementwise_Binary`).
+
+    :Math:
+        .. math::
+
+            Z_{b,n,d} = \begin{cases} 0, & X_{b,n,d} < Y_{b,n,d}, \\ -\infty, & \text{otherwise}. \end{cases}
+    :__init__: ``WhereLess()`` — no arguments.
+    """
     def __init__(self):
         super().__init__()
         self.op_type = ElementwiseBinaryOpType.WhereLess
 
 
 class WhereLessEqual(Elementwise_Binary):
-    r"""Emit ``0`` where ``x <= y`` and ``-inf`` otherwise."""
+    r"""
+    Comparison mask :math:`x \le y` (an :class:`Elementwise_Binary`).
+
+    :Math:
+        .. math::
+
+            Z_{b,n,d} = \begin{cases} 0, & X_{b,n,d} \le Y_{b,n,d}, \\ -\infty, & \text{otherwise}. \end{cases}
+    :__init__: ``WhereLessEqual()`` — no arguments.
+    """
     def __init__(self):
         super().__init__()
         self.op_type = ElementwiseBinaryOpType.WhereLessEqual

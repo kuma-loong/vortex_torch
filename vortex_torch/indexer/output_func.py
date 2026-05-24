@@ -130,46 +130,31 @@ class approxTopK(topK):
 
 
 class Union(vOp):
-    r"""Merge two ``(block_table, seqlens)`` pairs into the final sparse output.
+    r"""
+    Per-row union of two ``(block_table, seqlens)`` pairs (trtllm output func).
 
-    Output function for the trtllm backend that takes two
-    ``(block_table_i, seqlens_i)`` tuples (typically produced by
-    :class:`vortex_torch.indexer.TopK` calls), computes the per-row
-    deduplicated union of their block ids, and overwrites the final
-    ``sparse_block_tables`` + ``sparse_seqlens`` buffers so the pair can
-    be fed straight to ``trtllm_batch_decode_with_kv_cache``.
+    :Math:
+        For request row :math:`i`, given two selected block-id sets
+        :math:`\mathcal{B}_i^{0}`, :math:`\mathcal{B}_i^{1}` (from two
+        :class:`vortex_torch.indexer.TopK` calls), the final sparse set is the
+        deduplicated union with the dense trailing block :math:`\ell_i` pinned
+        to the tail:
 
-    Per-row behavior, with
-    ``dense_block_len = ceil(dense_seqlens[i] / block_size)`` and
-    ``last_block_len = dense_seqlens[i] mod block_size`` (treated as
-    ``block_size`` when the remainder is zero):
+        .. math::
 
-      * Compute the deduped union of block ids drawn from
-        ``block_table_0[i, :blocks_0]`` and ``block_table_1[i, :blocks_1]``,
-        where ``blocks_j = ceil(seqlens_j[i] / block_size)``. The dense
-        path's true last block id (``dense_block_tables[i, dense_block_len-1]``)
-        is excluded from the dedup walk and re-inserted at the **tail**
-        of the union so trtllm decode reads the partial token count from
-        the right slot.
-      * Write the deduped tail-canonical union into ``o[i, :u+1]`` and
-        set ``sparse_seqlens[i] = u * block_size + last_block_len``
-        (where ``u`` is the dedup count, excluding the appended last
-        block).
+            \mathcal{U}_i = \big(\mathcal{B}_i^{0}\cup\mathcal{B}_i^{1}\setminus\{\ell_i\}\big)
+            \;\Vert\; \{\ell_i\},
 
-    Invocation
-    ----------
-    ::
-
-        self.output_func = Union()
-        ...
-        self.output_func(i_0, i_1, o, ctx=ctx)
-        # i_0 = (block_table_0, seqlens_0)
-        # i_1 = (block_table_1, seqlens_1)
-
-    ``o`` is the framework-provided final block-table output (the trtllm
-    backend wires it to ``ctx.metadata.sparse_block_tables``). The op
-    additionally writes ``ctx.metadata.sparse_seqlens`` as a side effect
-    so the seqlens buffer the trtllm decode call reads is up to date.
+        and :math:`\text{seqlens}_i = u_i\cdot\text{block\_size} + \text{last\_block\_len}_i`,
+        where :math:`u_i = |\mathcal{U}_i| - 1`. Pinning :math:`\ell_i` last
+        lets trtllm read the partial token count from the right slot.
+    :__init__: ``Union()`` — no arguments.
+    :__call__: ``op((bt_0, sl_0), (bt_1, sl_1), o, ctx=ctx)`` — two RAGGED
+        ``(block_table, seqlens)`` tuples → writes the union into ``o``
+        (``ctx.metadata.sparse_block_tables``) and updates
+        ``ctx.metadata.sparse_seqlens`` as a side effect.
+    :Note: **trtllm only** — asserts under flashinfer. Terminal op of a trtllm
+        ``forward_indexer`` (alternative to :func:`topK`).
     """
 
     _supported_formats: FrozenSet[FORMAT] = frozenset({FORMAT.RAGGED})

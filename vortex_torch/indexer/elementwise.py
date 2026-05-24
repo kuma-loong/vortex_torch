@@ -5,29 +5,23 @@ from ..abs import vTensor, FORMAT, vOp
 from ..utils import ElementwiseOpType, Schedule
 
 class Elementwise(vOp):
-    """
-    Unary elementwise op for rank-3 logical tensors ``[S, C, D]``.
+    r"""
+    Unary elementwise op — applies a scalar function pointwise.
 
-    Output format rule: ``BATCHED`` iff the input is ``BATCHED`` (its
-    ``S`` axis is already collapsed to 1), otherwise ``RAGGED``. Format
-    compatibility is enforced by the compiler's per-workload kernel.
+    :Math:
+        .. math::
 
-    Attributes
-    ----------
-    alpha : float
-        Scalar parameter used by some ops. Default is ``1.0``.
+            Y_{s,c,d} = f(X_{s,c,d};\, \alpha, \beta),
 
-    beta : float
-        Scalar parameter used by some ops. Default is ``1.0``.
-
-    op_type : Optional[ElementwiseOpType]
-        The operator type used by the implementation.
-
-    output_format : Optional[FORMAT]
-        The output tensor format as determined in :meth:`profile`.
-
-    output_buffer : Optional[torch.Tensor]
-        Preallocated output tensor buffer.
+        where :math:`f` is fixed by the subclass (ReLU / SiLU / Sigmoid /
+        affine / abs / log / exp).
+    :__init__: ``Elementwise(alpha=1.0, beta=1.0)`` — scalar parameters
+        :math:`\alpha`, :math:`\beta` consumed by :math:`f`.
+    :__call__: ``y = op(x, ctx=ctx)`` — ``x`` is ``[S, C, D]``; returns the same
+        shape. Output is ``BATCHED`` iff the input is, else ``RAGGED``.
+    :Note: use a concrete subclass — :class:`Relu`, :class:`Silu`,
+        :class:`Sigmoid`, :class:`Add_Mul`, :class:`Abs`, :class:`Log`,
+        :class:`Exp`.
     """
 
     def __init__(self, alpha: float = 1.0, beta: float = 1.0):
@@ -40,30 +34,9 @@ class Elementwise(vOp):
         self.schedule = Schedule.W
 
     def profile(self, x: vTensor, ctx: Context) -> vTensor:
-        """
-        Validate input, allocate the output buffer, and return a
-        ``vTensor`` view. The output is ``BATCHED`` iff the input is
-        ``BATCHED``, otherwise ``RAGGED``.
-
-        Parameters
-        ----------
-        x : vTensor
-            Input tensor. Must be rank-3 with shape ``[S, C, D]``.
-
-        ctx : Context
-            Execution context providing runtime ``S`` (``ctx.max_num_pages``)
-            and memory tracking.
-
-        Returns
-        -------
-        vTensor
-            A ``vTensor`` view wrapping the allocated output buffer.
-
-        Raises
-        ------
-        AssertionError
-            If input tensor type or rank is invalid.
-        """
+        r"""Trace-time: validate ``x`` ``[S, C, D]``, register the op, and return
+        a same-shape ``vTensor`` view (``BATCHED`` iff ``x`` is, else
+        ``RAGGED``)."""
         prefix = self._prefix()
 
         # Type & rank checks
@@ -100,26 +73,14 @@ class Elementwise(vOp):
 
 class Relu(Elementwise):
     r"""
-    ReLU-style elementwise operator.
+    ReLU-like activation with threshold/fallback (an :class:`Elementwise`).
 
-    This operator applies a thresholded linear function:
+    :Math:
+        .. math::
 
-    .. math::
-
-        \operatorname{out}(x) =
-        \begin{cases}
-            x, & x \ge \alpha \\
-            \beta, & x < \alpha
-        \end{cases}
-
-    Parameters
-    ----------
-    alpha : float, optional
-        Threshold value for activation. Default is ``0.0``.
-
-    beta : float, optional
-        Value used when :math:`x < \alpha`. Default is ``0.0``.
-
+            f(x;\alpha,\beta) = \begin{cases} x, & x \ge \alpha, \\ \beta, & x < \alpha. \end{cases}
+    :__init__: ``Relu(alpha=0.0, beta=0.0)`` — threshold :math:`\alpha`,
+        fallback value :math:`\beta` (used when :math:`x<\alpha`).
     """
     def __init__(self, alpha: float = 0.0, beta: float = 0.0):
         super().__init__(alpha, beta)
@@ -129,28 +90,14 @@ class Relu(Elementwise):
 
 class Silu(Elementwise):
     r"""
-    SiLU-style elementwise operator with affine pre-transform.
+    SiLU-like activation with affine pre-transform (an :class:`Elementwise`).
 
-    This operator applies:
+    :Math:
+        .. math::
 
-    .. math::
-
-        \operatorname{SiLU}_{\alpha,\beta}(x)
-        = \frac{x}{1 + \exp(\beta x + \alpha)}
-
-    When :math:`\alpha = 0` and :math:`\beta = -1`, this reduces to the
-    common SiLU/Swish-like form :math:`x \, \sigma(x)` (up to the chosen
-    parameterization in the kernel).
-
-    Parameters
-    ----------
-    alpha : float, optional
-        Bias term inside the exponent, used in :math:`\beta x + \alpha`.
-        Default is ``0.0``.
-
-    beta : float, optional
-        Scale term inside the exponent, used in :math:`\beta x + \alpha`.
-        Default is ``0.0``.
+            f(x;\alpha,\beta) = \frac{x}{1 + \exp(\beta x + \alpha)}.
+    :__init__: ``Silu(alpha=0.0, beta=0.0)`` — bias :math:`\alpha`, slope
+        :math:`\beta` inside the exponential.
     """
     def __init__(self, alpha: float = 0.0, beta: float = 0.0):
         super().__init__(alpha, beta)
@@ -159,27 +106,14 @@ class Silu(Elementwise):
 
 class Sigmoid(Elementwise):
     r"""
-    Sigmoid elementwise operator with affine argument.
+    Sigmoid activation with affine argument (an :class:`Elementwise`).
 
-    This operator applies:
+    :Math:
+        .. math::
 
-    .. math::
-
-        \sigma_{\alpha,\beta}(x)
-        = \frac{1}{1 + \exp(\beta x + \alpha)}
-
-    When :math:`\alpha = 0` and :math:`\beta = -1`, this is the standard
-    logistic sigmoid :math:`\sigma(x) = 1 / (1 + e^{-x})`.
-
-    Parameters
-    ----------
-    alpha : float, optional
-        Bias term inside the exponent, used in :math:`\beta x + \alpha`.
-        Default is ``0.0``.
-
-    beta : float, optional
-        Scale term inside the exponent, used in :math:`\beta x + \alpha`.
-        Default is ``0.0``.
+            f(x;\alpha,\beta) = \frac{1}{1 + \exp(\beta x + \alpha)}.
+    :__init__: ``Sigmoid(alpha=0.0, beta=0.0)`` — bias :math:`\alpha`, slope
+        :math:`\beta` inside the exponential.
     """
     def __init__(self, alpha: float = 0.0, beta: float = 0.0):
         super().__init__(alpha, beta)
@@ -188,24 +122,14 @@ class Sigmoid(Elementwise):
 
 class Add_Mul(Elementwise):
     r"""
-    Affine elementwise transform.
+    Affine transform :math:`\beta x + \alpha` (an :class:`Elementwise`).
 
-    This operator applies a simple affine mapping:
+    :Math:
+        .. math::
 
-    .. math::
-
-        \operatorname{out}(x) = \beta x + \alpha
-
-    With the defaults :math:`\alpha = 0` and :math:`\beta = 1`, this is
-    the identity transform :math:`\operatorname{out}(x) = x`.
-
-    Parameters
-    ----------
-    alpha : float, optional
-        Additive bias term :math:`\alpha`. Default is ``0.0``.
-
-    beta : float, optional
-        Multiplicative scale term :math:`\beta`. Default is ``1.0``.
+            f(x;\alpha,\beta) = \beta x + \alpha.
+    :__init__: ``Add_Mul(alpha=0.0, beta=1.0)`` — additive :math:`\alpha`,
+        multiplicative :math:`\beta` (defaults give the identity).
     """
     def __init__(self, alpha: float = 0.0, beta: float = 1.0):
         super().__init__(alpha, beta)
@@ -214,26 +138,14 @@ class Add_Mul(Elementwise):
 
 class Abs(Elementwise):
     r"""
-    Absolute value of an affine transform.
+    Absolute value of an affine transform (an :class:`Elementwise`).
 
-    This operator applies:
+    :Math:
+        .. math::
 
-    .. math::
-
-        \operatorname{out}(x) = \lvert \beta x + \alpha \rvert
-
-    With the defaults :math:`\alpha = 0` and :math:`\beta = 1`, this
-    reduces to the standard absolute value :math:`\lvert x \rvert`.
-
-    Parameters
-    ----------
-    alpha : float, optional
-        Additive bias term inside the absolute value, used in
-        :math:`\beta x + \alpha`. Default is ``0.0``.
-
-    beta : float, optional
-        Multiplicative scale term inside the absolute value, used in
-        :math:`\beta x + \alpha`. Default is ``1.0``.
+            f(x;\alpha,\beta) = \lvert \beta x + \alpha \rvert.
+    :__init__: ``Abs(alpha=0.0, beta=1.0)`` — additive :math:`\alpha`,
+        multiplicative :math:`\beta` inside the absolute value.
     """
     def __init__(self, alpha: float = 0.0, beta: float = 1.0):
         super().__init__(alpha, beta)
@@ -242,26 +154,14 @@ class Abs(Elementwise):
 
 class Log(Elementwise):
     r"""
-    Natural logarithm of an affine transform.
+    Natural logarithm of an affine transform (an :class:`Elementwise`).
 
-    This operator applies:
+    :Math:
+        .. math::
 
-    .. math::
-
-        \operatorname{out}(x) = \log(\beta x + \alpha)
-
-    With the defaults :math:`\alpha = 0` and :math:`\beta = 1`, this
-    reduces to the standard natural logarithm :math:`\log(x)`.
-
-    Parameters
-    ----------
-    alpha : float, optional
-        Additive bias term inside the logarithm, used in
-        :math:`\beta x + \alpha`. Default is ``0.0``.
-
-    beta : float, optional
-        Multiplicative scale term inside the logarithm, used in
-        :math:`\beta x + \alpha`. Default is ``1.0``.
+            f(x;\alpha,\beta) = \log(\beta x + \alpha).
+    :__init__: ``Log(alpha=0.0, beta=1.0)`` — additive :math:`\alpha`,
+        multiplicative :math:`\beta` inside the logarithm.
     """
     def __init__(self, alpha: float = 0.0, beta: float = 1.0):
         super().__init__(alpha, beta)
@@ -270,26 +170,14 @@ class Log(Elementwise):
 
 class Exp(Elementwise):
     r"""
-    Exponential of an affine transform.
+    Exponential of an affine transform (an :class:`Elementwise`).
 
-    This operator applies:
+    :Math:
+        .. math::
 
-    .. math::
-
-        \operatorname{out}(x) = \exp(\beta x + \alpha)
-
-    With the defaults :math:`\alpha = 0` and :math:`\beta = 1`, this
-    reduces to the standard exponential :math:`\exp(x)`.
-
-    Parameters
-    ----------
-    alpha : float, optional
-        Additive bias term inside the exponential, used in
-        :math:`\beta x + \alpha`. Default is ``0.0``.
-
-    beta : float, optional
-        Multiplicative scale term inside the exponential, used in
-        :math:`\beta x + \alpha`. Default is ``1.0``.
+            f(x;\alpha,\beta) = \exp(\beta x + \alpha).
+    :__init__: ``Exp(alpha=0.0, beta=1.0)`` — additive :math:`\alpha`,
+        multiplicative :math:`\beta` inside the exponential.
     """
     def __init__(self, alpha: float = 0.0, beta: float = 1.0):
         super().__init__(alpha, beta)

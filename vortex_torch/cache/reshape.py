@@ -7,53 +7,23 @@ from ..utils import QuantizationType, Schedule
 
 class Reshape(vOp):
     r"""
-    Same-numel reshape of the inner two axes of a rank-3 cache block.
+    Same-numel reshape of a cache block's inner two axes.
 
-    Given a per-block tile
+    :Math:
+        .. math::
 
-    .. math::
+            X\in\mathbb{R}^{1\times x_1\times y_1} \;\longrightarrow\;
+            Y\in\mathbb{R}^{1\times x_2\times y_2},\qquad x_2\,y_2 = x_1\,y_1,
 
-        X \in \mathbb{R}^{1 \times x_1 \times y_1},
-
-    this op produces
-
-    .. math::
-
-        Y \in \mathbb{R}^{1 \times x_2 \times y_2},
-        \qquad \text{with} \qquad x_2 \cdot y_2 \;=\; x_1 \cdot y_1,
-
-    by interpreting the flat ``x_1 * y_1`` elements row-major into the
-    new ``(x_2, y_2)`` layout. The leading (per-block batch) axis is
-    fixed at size 1 on the cache side and must be passed as ``-1`` to
-    the constructor as a placeholder, mirroring ``torch.reshape``'s
-    "infer this dim" convention.
-
-    No data movement happens beyond the existing cache load/store —
-    the loaded ``(D0, D1)`` block is reshaped at the Triton-tile level
-    via :func:`tl.reshape`. The kernel reads with the input's
-    ``(x_1, y_1)`` shape and stores with the output's ``(x_2, y_2)``
-    shape.
-
-    Output format rule: if a caller-provided ``output`` is supplied with
-    ``PAGED`` format, the output is ``PAGED``; in every other case the
-    output is ``RAGGED``. Format compatibility is enforced by the
-    compiler's per-block kernel.
-
-    Constructor
-    -----------
-    ``Reshape(-1, x2, y2)`` — three integers; the leading must be
-    ``-1`` (the per-block batch dim is auto-inferred and always ``1``).
-    The product ``x2 * y2`` is checked against the input's
-    ``x1 * y1`` at :meth:`profile` time.
-
-    Attributes
-    ----------
-    x2, y2 : int
-        Target inner-axis sizes.
-    output_format : Optional[FORMAT]
-        Resolved output format from :meth:`profile`.
-    output_buffer : Optional[vTensor]
-        Pure-metadata vTensor descriptor for the output (graph node).
+        reading the flat :math:`x_1 y_1` elements row-major into the new
+        :math:`(x_2, y_2)` layout (a Triton-tile :func:`tl.reshape`; no data
+        movement beyond the existing load/store).
+    :__init__: ``Reshape(-1, x2, y2)`` — the leading dim must be ``-1`` (the
+        per-block batch axis, always 1); ``x2*y2`` must equal the input's
+        ``x1*y1`` (checked at trace time).
+    :__call__: ``y = op(x, output, loc=loc, ctx=ctx)`` — ``x``
+        ``[1, x_1, y_1]`` → ``[1, x_2, y_2]``. ``PAGED`` iff a ``PAGED``
+        ``output`` is supplied, else ``RAGGED``.
     """
 
     def __init__(self, batch_dim: int, x2: int, y2: int):

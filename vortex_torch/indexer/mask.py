@@ -7,53 +7,22 @@ from ..utils import Schedule
 
 class MaskSlice(vOp):
     r"""
-    Position-dependent slice mask over one inner axis of a rank-3 tensor.
+    Position-dependent slice mask over one inner axis.
 
-    For an input tensor
+    :Math:
+        For target axis ``dim`` (``1`` → :math:`D_0`, ``2`` → :math:`D_1`) and
+        index :math:`i` along it (other axes broadcast unchanged):
 
-    .. math::
+        .. math::
 
-        X \in \mathbb{R}^{S \times D_0 \times D_1}
-
-    and a target axis :attr:`dim` (``1`` for :math:`D_0`, ``2`` for
-    :math:`D_1`), ``MaskSlice`` writes
-
-    .. math::
-
-        Y[\ldots, i, \ldots] =
-        \begin{cases}
-            \alpha, & \text{if } \text{start} \le i < \text{end}, \\
-            \beta,  & \text{otherwise},
-        \end{cases}
-
-    where :math:`i` is the index along the chosen axis. The other axes
-    are broadcast unchanged. The output shape exactly matches
-    :attr:`x.shape`.
-
-    Notes
-    -----
-    - Only ``dim in {1, 2}`` is supported. The packed ``S`` axis is
-      structural (its global index is only known after unpacking
-      workload metadata), so a position-dependent mask along it does
-      not fit cleanly into the inline W-kernel template; model that
-      in user code via an explicit index op instead.
-    - The input ``x`` is read by the surrounding workload kernel but its
-      values are not used by the output — ``MaskSlice`` is a pure
-      position-based writer. The dependency edge is preserved so the
-      compiler still fuses it with its neighbours.
-
-    Parameters
-    ----------
-    start : int
-        Inclusive lower bound along ``dim``.
-    end : int
-        Exclusive upper bound along ``dim``.
-    dim : int
-        Axis to slice (1 = :math:`D_0`, 2 = :math:`D_1`).
-    alpha : float
-        Value written for positions inside ``[start, end)``.
-    beta : float
-        Value written for positions outside.
+            Y_{\dots,i,\dots} = \begin{cases} \alpha, & \text{start} \le i < \text{end}, \\ \beta, & \text{otherwise}. \end{cases}
+    :__init__: ``MaskSlice(start, end, dim, alpha=1.0, beta=0.0)`` — write
+        :math:`\alpha` on ``[start, end)`` of axis ``dim`` (1 or 2) and
+        :math:`\beta` elsewhere.
+    :__call__: ``y = op(x, ctx=ctx)`` — ``x`` ``[S, D_0, D_1]`` → same shape. A
+        pure **position** writer (``x`` values are unused); output is
+        ``BATCHED`` iff ``x`` is.
+    :Note: only ``dim ∈ {1, 2}`` (the packed ``S`` axis is structural).
     """
 
     def __init__(

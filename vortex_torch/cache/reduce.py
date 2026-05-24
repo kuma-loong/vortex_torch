@@ -7,57 +7,28 @@ from typing import Optional
 
 class Reduce(vOp):
     r"""
-    Generic reduction op over the last two logical axes.
+    Generic 1-D reduction over one inner axis of a rank-3 cache tensor.
 
-    Covers a family of reductions (mean/max/min/L2-norm/sum, etc.) on
-    rank-3 tensors
+    :Math:
+        For input :math:`X\in\mathbb{R}^{B\times N\times D}` and a per-axis
+        reduction :math:`\rho` (mean / max / min / L2-norm, fixed by the
+        subclass):
 
-    .. math::
+        .. math::
 
-        X \in \mathbb{R}^{B \times N \times D},
-
-    where:
-
-    - :math:`B` is a leading batch-like axis (typically derived from the
-      runtime, e.g. ``max_new_tokens_per_batch * head_num``),
-    - :math:`N` is a sequence or position dimension, and
-    - :math:`D` is a feature/channel dimension.
-
-    The reduction dimension is chosen by :attr:`dim`:
-
-    - ``dim == 1`` (row-wise reduction over :math:`N`):
-
-      .. math::
-
-         \text{out} \in \mathbb{R}^{B \times 1 \times D},
-
-    - ``dim == 2`` (column-wise reduction over :math:`D`):
-
-      .. math::
-
-         \text{out} \in \mathbb{R}^{B \times N \times 1}.
-
-    The exact reduction operation (mean, max, min, L2-norm, sum, etc.) is
-    encoded in :attr:`reduce_type` and interpreted by the implementation.
-
-    Output format rule: if a caller-provided ``output`` is supplied with
-    ``PAGED`` format, the output is ``PAGED``; in every other case the
-    output is ``RAGGED``. Format compatibility is enforced by the
-    compiler's per-block kernel.
-
-    Attributes
-    ----------
-    dim : int
-        Reduction dimension in the logical 3D tensor. Must be either:
-
-        - ``1`` for row-wise reduction over :math:`N`, or
-        - ``2`` for column-wise reduction over :math:`D`.
-    reduce_type : Optional[ReduceType]
-        Enum describing which reduction to perform.
-    output_format : Optional[FORMAT]
-        The output tensor format as determined in :meth:`profile`.
-    output_buffer : Optional[vTensor]
-        Pure-metadata vTensor descriptor for the output (graph node).
+            \begin{aligned}
+            (\text{dim}=1):\quad & Y_{b,0,d} = \rho_{\,0 \le i < N}\, X_{b,i,d}, \\
+            (\text{dim}=2):\quad & Y_{b,n,0} = \rho_{\,0 \le j < D}\, X_{b,n,j}.
+            \end{aligned}
+    :__init__: ``Reduce(dim=1)`` — inner axis to reduce, ``1`` (over :math:`N`)
+        or ``2`` (over :math:`D`).
+    :__call__: ``op(x, output, loc=loc, ctx=ctx)`` — runs once per page in
+        ``forward_cache``; ``x`` is ``[B, N, D]`` and the reduced axis becomes
+        size 1. ``PAGED`` iff a ``PAGED`` ``output`` is supplied, else
+        ``RAGGED``.
+    :Note: use a concrete subclass — :class:`Mean`, :class:`Max`,
+        :class:`Min`, :class:`L2Norm`. Cache-side reductions support
+        ``dim ∈ {1, 2}`` only.
     """
 
     def __init__(self, dim: int = 1):
@@ -102,54 +73,10 @@ class Reduce(vOp):
     def profile(
         self, x: vTensor, output: Optional[vTensor], loc: torch.Tensor, ctx: Context
     ) -> vTensor:
-        r"""
-        Validate inputs, resolve the reduction implementation and output
-        format, and optionally allocate an internal output buffer.
-
-        The input tensor ``x`` is expected to have logical shape
-        ``[B, N, D]``. According to :attr:`dim`, the expected output
-        logical shape is:
-
-        - ``dim == 1``: ``[B, 1, D]``
-        - ``dim == 2``: ``[B, N, 1]``
-
-        The auxiliary tensor ``loc`` carries per-position metadata used
-        by the implementation; its shape and semantics are
-        implementation-defined.
-
-        Parameters
-        ----------
-        x : vTensor
-            Input tensor with logical shape ``[B, N, D]``.
-
-        output : Optional[vTensor]
-            Optional preallocated output tensor. If ``None``, an internal
-            buffer with shape ``[B, exp_N, exp_D]`` is allocated using
-            ``ctx.max_new_tokens_per_batch * ctx.head_num`` for ``B`` and a
-            RAGGED-output implementation is selected. If not ``None``,
-            this tensor must have rank 3 and shape compatible with
-            :attr:`dim` as described above.
-
-        loc : torch.Tensor
-            Auxiliary tensor carrying metadata required by the reduction
-            implementation.
-
-        ctx : Context
-            Execution context that provides the runtime value of ``B`` and
-            is used for auxiliary memory accounting.
-
-        Returns
-        -------
-        vTensor
-            A :class:`vTensor` view representing the resolved output:
-            either the provided ``output`` or an internally allocated
-            buffer.
-
-        Raises
-        ------
-        AssertionError
-            If types, ranks, shapes, or devices are incompatible.
-        """
+        r"""Trace-time: validate ``x`` ``[B, N, D]`` (and ``output`` if given),
+        register the op, and return a ``vTensor`` view of the reduced output
+        (fresh ``RAGGED`` buffer when ``output is None``; see the class
+        docstring for shapes)."""
         prefix = self._prefix()
 
         # --- type & rank checks ---
@@ -238,38 +165,17 @@ class Reduce(vOp):
 
 class Mean(Reduce):
     r"""
-    Mean reduction over a single logical axis.
+    Mean reduction over one inner axis (a :class:`Reduce`).
 
-    This operator reduces a rank-3 tensor
+    :Math:
+        .. math::
 
-    .. math::
-
-        X \in \mathbb{R}^{B \times N \times D}
-
-    by taking the arithmetic mean along one of the inner dimensions, as
-    configured by :attr:`dim`:
-
-    - ``dim == 1``: row-wise mean over :math:`N`, producing
-
-      .. math::
-
-          Y \in \mathbb{R}^{B \times 1 \times D}, \qquad
-          Y[b, 0, d]
-          = \frac{1}{N} \sum_{n=0}^{N-1} X[b, n, d].
-
-    - ``dim == 2``: column-wise mean over :math:`D`, producing
-
-      .. math::
-
-          Y \in \mathbb{R}^{B \times N \times 1}, \qquad
-          Y[b, n, 0]
-          = \frac{1}{D} \sum_{d=0}^{D-1} X[b, n, d].
-
-    Parameters
-    ----------
-    dim : int, optional
-        Logical reduction dimension. Must be ``1`` (reduce over
-        :math:`N`) or ``2`` (reduce over :math:`D`). Default is ``1``.
+            \begin{aligned}
+            (\text{dim}=1):\quad & Y_{b,0,d} = \frac{1}{N}\sum_{n=0}^{N-1} X_{b,n,d}, \\
+            (\text{dim}=2):\quad & Y_{b,n,0} = \frac{1}{D}\sum_{d=0}^{D-1} X_{b,n,d}.
+            \end{aligned}
+    :__init__: ``Mean(dim=1)`` — axis to reduce (``1`` → :math:`N`,
+        ``2`` → :math:`D`).
     """
     def __init__(self, dim: int = 1):
         super().__init__(dim)
@@ -279,38 +185,17 @@ class Mean(Reduce):
 
 class Max(Reduce):
     r"""
-    Max reduction over a single logical axis.
+    Max reduction over one inner axis (a :class:`Reduce`).
 
-    This operator reduces a rank-3 tensor
+    :Math:
+        .. math::
 
-    .. math::
-
-        X \in \mathbb{R}^{B \times N \times D}
-
-    by taking the maximum along one of the inner dimensions, as
-    configured by :attr:`dim`:
-
-    - ``dim == 1``: row-wise maximum over :math:`N`, producing
-
-      .. math::
-
-          Y \in \mathbb{R}^{B \times 1 \times D}, \qquad
-          Y[b, 0, d]
-          = \max_{0 \le n < N} X[b, n, d].
-
-    - ``dim == 2``: column-wise maximum over :math:`D`, producing
-
-      .. math::
-
-          Y \in \mathbb{R}^{B \times N \times 1}, \qquad
-          Y[b, n, 0]
-          = \max_{0 \le d < D} X[b, n, d].
-
-    Parameters
-    ----------
-    dim : int, optional
-        Logical reduction dimension. Must be ``1`` (reduce over
-        :math:`N`) or ``2`` (reduce over :math:`D`). Default is ``1``.
+            \begin{aligned}
+            (\text{dim}=1):\quad & Y_{b,0,d} = \max_{0 \le n < N} X_{b,n,d}, \\
+            (\text{dim}=2):\quad & Y_{b,n,0} = \max_{0 \le d < D} X_{b,n,d}.
+            \end{aligned}
+    :__init__: ``Max(dim=1)`` — axis to reduce (``1`` → :math:`N`,
+        ``2`` → :math:`D`).
     """
     def __init__(self, dim: int = 1):
         super().__init__(dim)
@@ -320,38 +205,17 @@ class Max(Reduce):
 
 class Min(Reduce):
     r"""
-    Min reduction over a single logical axis.
+    Min reduction over one inner axis (a :class:`Reduce`).
 
-    This operator reduces a rank-3 tensor
+    :Math:
+        .. math::
 
-    .. math::
-
-        X \in \mathbb{R}^{B \times N \times D}
-
-    by taking the minimum along one of the inner dimensions, as
-    configured by :attr:`dim`:
-
-    - ``dim == 1``: row-wise minimum over :math:`N`, producing
-
-      .. math::
-
-          Y \in \mathbb{R}^{B \times 1 \times D}, \qquad
-          Y[b, 0, d]
-          = \min_{0 \le n < N} X[b, n, d].
-
-    - ``dim == 2``: column-wise minimum over :math:`D`, producing
-
-      .. math::
-
-          Y \in \mathbb{R}^{B \times N \times 1}, \qquad
-          Y[b, n, 0]
-          = \min_{0 \le d < D} X[b, n, d].
-
-    Parameters
-    ----------
-    dim : int, optional
-        Logical reduction dimension. Must be ``1`` (reduce over
-        :math:`N`) or ``2`` (reduce over :math:`D`). Default is ``1``.
+            \begin{aligned}
+            (\text{dim}=1):\quad & Y_{b,0,d} = \min_{0 \le n < N} X_{b,n,d}, \\
+            (\text{dim}=2):\quad & Y_{b,n,0} = \min_{0 \le d < D} X_{b,n,d}.
+            \end{aligned}
+    :__init__: ``Min(dim=1)`` — axis to reduce (``1`` → :math:`N`,
+        ``2`` → :math:`D`).
     """
     def __init__(self, dim: int = 1):
         super().__init__(dim)
@@ -361,50 +225,18 @@ class Min(Reduce):
 
 class L2Norm(Reduce):
     r"""
-    L2-norm reduction (not RMS) over a single logical axis.
+    L2-norm reduction (not RMS) over one inner axis (a :class:`Reduce`).
 
-    This operator reduces a rank-3 tensor
+    :Math:
+        .. math::
 
-    .. math::
-
-        X \in \mathbb{R}^{B \times N \times D}
-
-    by computing an L2 norm along one of the inner dimensions, as
-    configured by :attr:`dim`. The reduction is *not* normalized by the
-    number of elements (it is an L2 norm, not an RMS):
-
-    - ``dim == 1``: row-wise L2 norm over :math:`N`, producing
-
-      .. math::
-
-          Y \in \mathbb{R}^{B \times 1 \times D}, \qquad
-          Y[b, 0, d]
-          = \sqrt{\sum_{n=0}^{N-1} X[b, n, d]^2}.
-
-    - ``dim == 2``: column-wise L2 norm over :math:`D`, producing
-
-      .. math::
-
-          Y \in \mathbb{R}^{B \times N \times 1}, \qquad
-          Y[b, n, 0]
-          = \sqrt{\sum_{d=0}^{D-1} X[b, n, d]^2}.
-
-    Notes
-    -----
-    This is a pure L2 norm over the reduced axis:
-
-    .. math::
-
-        \|v\|_2 = \sqrt{\sum_i v_i^2},
-
-    with no division by the number of elements. It should not be
-    confused with RMS (root mean square).
-
-    Parameters
-    ----------
-    dim : int, optional
-        Logical reduction dimension. Must be ``1`` (reduce over
-        :math:`N`) or ``2`` (reduce over :math:`D`). Default is ``1``.
+            \begin{aligned}
+            (\text{dim}=1):\quad & Y_{b,0,d} = \Big(\sum_{n=0}^{N-1} X_{b,n,d}^2\Big)^{1/2}, \\
+            (\text{dim}=2):\quad & Y_{b,n,0} = \Big(\sum_{d=0}^{D-1} X_{b,n,d}^2\Big)^{1/2}.
+            \end{aligned}
+    :__init__: ``L2Norm(dim=1)`` — axis to reduce (``1`` → :math:`N`,
+        ``2`` → :math:`D`).
+    :Note: a pure :math:`L_2` norm (no division by element count) — not RMS.
     """
     def __init__(self, dim: int = 1):
         super().__init__(dim)

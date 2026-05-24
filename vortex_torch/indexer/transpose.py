@@ -6,42 +6,18 @@ from ..utils import Schedule
 
 class Transpose(vOp):
     r"""
-    Transpose op for rank-3 logical tensors.
+    Swap the two inner axes of each slice along the leading axis.
 
-    This operator transposes the last two dimensions of a rank-3 tensor
-    while keeping the leading axis unchanged. The input is treated as
+    :Math:
+        .. math::
 
-    .. math::
+            Y_{s,d_1,d_0} = X_{s,d_0,d_1},
 
-        X \in \mathbb{R}^{S \times D_0 \times D_1},
-
-    and the output has logical shape
-
-    .. math::
-
-        Y \in \mathbb{R}^{S \times D_1 \times D_0},
-
-    with
-
-    .. math::
-
-        Y[s, d_1, d_0] = X[s, d_0, d_1].
-
-    The leading dimension :math:`S` may represent a true sequence axis or
-    a packed axis (e.g. :math:`S_{\text{pack}} = \sum_b S_b`); the transpose
-    is applied independently for each slice along that axis.
-
-    Output format rule: ``BATCHED`` iff the input is ``BATCHED``,
-    otherwise ``RAGGED``. Format compatibility is enforced by the
-    compiler's per-workload kernel.
-
-    Attributes
-    ----------
-    output_format : Optional[FORMAT]
-        The output tensor format as determined in :meth:`profile`.
-    output_buffer : Optional[torch.Tensor]
-        Preallocated output tensor buffer with logical shape
-        ``[S, D_1, D_0]``.
+        applied independently per leading index :math:`s`.
+    :__init__: ``Transpose()`` — no arguments.
+    :__call__: ``y = op(x, ctx=ctx)`` — ``x`` ``[S, D_0, D_1]`` →
+        ``[S, D_1, D_0]``. ``BATCHED`` iff the input is ``BATCHED``, else
+        ``RAGGED``.
     """
 
     def __init__(self):
@@ -52,41 +28,9 @@ class Transpose(vOp):
 
     # ---------------- profile ----------------
     def profile(self, x: vTensor, ctx: Context) -> vTensor:
-        r"""
-        Validate the input, allocate the output buffer, and return a
-        :class:`vTensor` view.
-
-        The input tensor is expected to have logical shape
-        ``[S_in, D_0, D_1]``. The output buffer is allocated with shape
-
-        .. math::
-
-            [S, D_1, D_0],
-
-        where :math:`S` is taken from ``ctx.max_num_pages`` to match the
-        runtime configuration for the leading dimension.
-
-        Parameters
-        ----------
-        x : vTensor
-            Input tensor to be transposed, with logical shape
-            ``[S_in, D_0, D_1]``.
-
-        ctx : Context
-            Execution context providing ``ctx.max_num_pages`` for the leading
-            dimension and tracking auxiliary memory usage.
-
-        Returns
-        -------
-        vTensor
-            A ``vTensor`` view wrapping the internally allocated output
-            buffer.
-
-        Raises
-        ------
-        AssertionError
-            If ``x`` is not a :class:`vTensor` or its rank is not 3.
-        """
+        r"""Trace-time: validate ``x`` ``[S, D_0, D_1]``, resolve the output
+        format, and return a ``vTensor`` view of the ``[S, D_1, D_0]``
+        transpose."""
         prefix = self._prefix()
 
         # Type & rank checks

@@ -7,19 +7,18 @@ from typing import FrozenSet
 
 class Fill(vOp):
     r"""
-    In-place page-wise fill dispatcher (codegen path only).
+    In-place page-wise fill with a scalar.
 
-    Overwrites selected page tiles of a rank-3 tensor with a scalar
-    ``alpha``. Structurally a **pure producer** of its input tensor:
-    ``Fill`` takes no graph-level inputs, and its output tensor id is
-    the same as the input tensor id (cache field being initialized).
+    :Math:
+        .. math::
 
-    Attributes
-    ----------
-    _supported_formats : FrozenSet[FORMAT]
-        Input formats for which a codegen implementation exists.
-    alpha : float
-        Scalar fill value written into selected positions.
+            Y_{b,n,d} = \alpha \quad\text{(over the selected page tiles).}
+    :__init__: ``Fill(alpha=0.0)`` — scalar fill value :math:`\alpha`.
+    :__call__: ``op(x, loc=loc, ctx=ctx)`` — overwrites the page tiles of ``x``
+        (``PAGED``) at ``loc`` with :math:`\alpha`. A **pure producer**: its
+        output *is* ``x`` (used e.g. to zero a cache field before
+        :class:`vortex_torch.indexer.Save` / :class:`vortex_torch.indexer.Load`).
+    :Note: ``PAGED`` input only.
     """
 
     # Supported input formats; only PAGED is wired up for now.

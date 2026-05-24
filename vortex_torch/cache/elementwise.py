@@ -6,48 +6,24 @@ from typing import Optional
 
 class Elementwise(vOp):
     r"""
-    Unary elementwise op (e.g. ReLU/Sigmoid/SiLU/Abs/Affine).
+    Unary elementwise op — applies a scalar function pointwise.
 
-    Operates on rank-3 tensors
+    :Math:
+        .. math::
 
-    .. math::
+            Y_{b,n,d} = f(X_{b,n,d};\, \alpha, \beta),
 
-        X \in \mathbb{R}^{B \times N \times D},
-
-    where:
-
-    - :math:`B` is a leading batch-like axis (for example,
-      ``max_new_tokens_per_batch * head_num`` coming from the runtime
-      context),
-    - :math:`N` is a sequence or position dimension, and
-    - :math:`D` is a feature/channel dimension.
-
-    The operation is applied pointwise:
-
-    .. math::
-
-        Y[b, n, d] = f(X[b, n, d]; \alpha, \beta, \text{op_type}),
-
-    where the actual function :math:`f` is selected by :attr:`op_type`.
-
-    Output format rule: if a caller-provided ``output`` is supplied with
-    ``PAGED`` format, the output is ``PAGED``; in every other case
-    (``output is None``, or ``output._format == RAGGED``) the output is
-    ``RAGGED``. Format compatibility is enforced by the compiler's
-    per-block kernel.
-
-    Attributes
-    ----------
-    alpha : float
-        Scalar parameter used by certain unary ops.
-    beta : float
-        Scalar parameter used by certain unary ops.
-    op_type : Optional[ElementwiseOpType]
-        Runtime-set enum/int describing the specific elementwise operation.
-    output_format : Optional[FORMAT]
-        The output tensor format as determined in :meth:`profile`.
-    output_buffer : Optional[vTensor]
-        Pure-metadata vTensor descriptor for the output (graph node).
+        where :math:`f` is fixed by the subclass (ReLU / SiLU / Sigmoid /
+        affine / abs / log / exp).
+    :__init__: ``Elementwise(alpha=0.0, beta=1.0)`` — scalar parameters
+        :math:`\alpha`, :math:`\beta` consumed by :math:`f`.
+    :__call__: ``y = op(x, output, loc=loc, ctx=ctx)`` — ``x`` is ``[B, N, D]``;
+        ``output`` is an optional preallocated buffer (``None`` → fresh
+        ``RAGGED``). Returns the same ``[B, N, D]`` shape; ``PAGED`` iff a
+        ``PAGED`` ``output`` is supplied, else ``RAGGED``.
+    :Note: use a concrete subclass — :class:`Relu`, :class:`Silu`,
+        :class:`Sigmoid`, :class:`Add_Mul`, :class:`Abs`, :class:`Log`,
+        :class:`Exp`.
     """
 
     def __init__(self, alpha: float = 0.0, beta: float = 1.0):
@@ -67,63 +43,9 @@ class Elementwise(vOp):
     def profile(
         self, x: vTensor, output: Optional[vTensor], loc: torch.Tensor, ctx: Context
     ) -> vTensor:
-        r"""
-        Validate inputs and optionally allocate an internal output buffer.
-
-        The input tensor ``x`` is expected to have logical shape
-        ``[B, N, D]``.
-
-        Two modes:
-
-        - **No output provided** (``output is None``):
-
-          - Allocate an internal RAGGED buffer with shape ``[B, N, D]``,
-            where
-
-            .. math::
-
-                B = \text{ctx.max_new_tokens_per_batch} \times \text{ctx.head_num}.
-
-        - **Output provided** (``output is not None``):
-
-          - Take the format directly from ``output._format`` (must be
-            ``PAGED`` or ``RAGGED``).
-          - Validate that ``output`` has rank 3 and preserves the
-            ``(N, D)`` dimensions of ``x``.
-          - Validate device consistency between ``x`` and ``output``.
-
-        Parameters
-        ----------
-        x : vTensor
-            Input tensor with logical shape ``[B, N, D]``.
-
-        output : Optional[vTensor]
-            Optional preallocated output tensor. If ``None``, an internal
-            RAGGED buffer is allocated; otherwise, this tensor must have
-            shape ``[B_out, N, D]`` for some ``B_out`` and a format in
-            ``{PAGED, RAGGED}``.
-
-        loc : torch.Tensor
-            Auxiliary tensor carrying per-position metadata required by
-            the implementation (e.g., location/segment indices).
-
-        ctx : Context
-            Execution context that provides the runtime value of ``B``
-            (via ``ctx.max_new_tokens_per_batch`` and ``ctx.head_num``)
-            and is used for auxiliary memory accounting.
-
-        Returns
-        -------
-        vTensor
-            A :class:`vTensor` view representing the resolved output:
-            either the provided ``output`` or an internally allocated
-            buffer.
-
-        Raises
-        ------
-        AssertionError
-            If types, ranks, shapes, or devices are incompatible.
-        """
+        r"""Trace-time: validate ``x`` ``[B, N, D]`` (and ``output`` if given),
+        register the op, and return a ``vTensor`` view of the same-shape output
+        (a fresh ``RAGGED`` buffer when ``output is None``)."""
         prefix = self._prefix()
 
         # --- type & rank checks ---
@@ -189,34 +111,14 @@ class Elementwise(vOp):
 
 class Relu(Elementwise):
     r"""
-    Piecewise ReLU-like activation.
+    ReLU-like activation with threshold/fallback (an :class:`Elementwise`).
 
-    This operator applies, elementwise, the scalar function
+    :Math:
+        .. math::
 
-    .. math::
-
-        f(x; \alpha, \beta) =
-        \begin{cases}
-            x,      & x \ge \alpha, \\
-            \beta,  & x < \alpha.
-        \end{cases}
-
-    Given an input tensor :math:`X \in \mathbb{R}^{B \times N \times D}`,
-    the output is defined by
-
-    .. math::
-
-        Y[b, n, d] = f\bigl(X[b, n, d]; \alpha, \beta\bigr).
-
-    Parameters
-    ----------
-    alpha : float, optional
-        Threshold value :math:`\alpha`. Inputs greater than or equal to
-        this threshold are passed through unchanged. Default is ``0.0``.
-
-    beta : float, optional
-        Fallback value :math:`\beta` used when :math:`x < \alpha`.
-        Default is ``0.0``.
+            f(x;\alpha,\beta) = \begin{cases} x, & x \ge \alpha, \\ \beta, & x < \alpha. \end{cases}
+    :__init__: ``Relu(alpha=0.0, beta=0.0)`` — threshold :math:`\alpha`,
+        fallback value :math:`\beta` (used when :math:`x<\alpha`).
     """
     def __init__(self, alpha: float = 0.0, beta: float = 0.0):
         super().__init__(alpha, beta)
@@ -225,32 +127,14 @@ class Relu(Elementwise):
 
 class Silu(Elementwise):
     r"""
-    SiLU-like activation with configurable shift and slope.
+    SiLU-like activation with configurable shift/slope (an :class:`Elementwise`).
 
-    This operator applies, elementwise, the scalar function
+    :Math:
+        .. math::
 
-    .. math::
-
-        \operatorname{SiLU}(x; \alpha, \beta)
-        = \frac{x}{1 + \exp(\beta x + \alpha)}.
-
-    Given an input tensor :math:`X \in \mathbb{R}^{B \times N \times D}`,
-    the output is
-
-    .. math::
-
-        Y[b, n, d]
-        = \operatorname{SiLU}\bigl(X[b, n, d]; \alpha, \beta\bigr).
-
-    Parameters
-    ----------
-    alpha : float, optional
-        Bias term :math:`\alpha` added inside the exponential. Default is
-        ``0.0``.
-
-    beta : float, optional
-        Slope :math:`\beta` multiplying :math:`x` inside the exponential.
-        Default is ``0.0``.
+            f(x;\alpha,\beta) = \frac{x}{1 + \exp(\beta x + \alpha)}.
+    :__init__: ``Silu(alpha=0.0, beta=0.0)`` — bias :math:`\alpha`, slope
+        :math:`\beta` inside the exponential.
     """
     def __init__(self, alpha: float = 0.0, beta: float = 0.0):
         super().__init__(alpha, beta)
@@ -259,32 +143,14 @@ class Silu(Elementwise):
 
 class Sigmoid(Elementwise):
     r"""
-    Sigmoid activation with configurable shift and slope.
+    Sigmoid activation with configurable shift/slope (an :class:`Elementwise`).
 
-    This operator applies, elementwise, the scalar function
+    :Math:
+        .. math::
 
-    .. math::
-
-        \sigma(x; \alpha, \beta)
-        = \frac{1}{1 + \exp(\beta x + \alpha)}.
-
-    Given an input tensor :math:`X \in \mathbb{R}^{B \times N \times D}`,
-    the output is
-
-    .. math::
-
-        Y[b, n, d]
-        = \sigma\bigl(X[b, n, d]; \alpha, \beta\bigr).
-
-    Parameters
-    ----------
-    alpha : float, optional
-        Bias term :math:`\alpha` added inside the exponential. Default is
-        ``0.0``.
-
-    beta : float, optional
-        Slope :math:`\beta` multiplying :math:`x` inside the exponential.
-        Default is ``0.0``.
+            f(x;\alpha,\beta) = \frac{1}{1 + \exp(\beta x + \alpha)}.
+    :__init__: ``Sigmoid(alpha=0.0, beta=0.0)`` — bias :math:`\alpha`, slope
+        :math:`\beta` inside the exponential.
     """
     def __init__(self, alpha: float = 0.0, beta: float = 0.0):
         super().__init__(alpha, beta)
@@ -293,31 +159,14 @@ class Sigmoid(Elementwise):
 
 class Add_Mul(Elementwise):
     r"""
-    Affine transformation :math:`y = \beta x + \alpha`.
+    Affine transform :math:`\beta x + \alpha` (an :class:`Elementwise`).
 
-    This operator applies, elementwise, the scalar function
+    :Math:
+        .. math::
 
-    .. math::
-
-        f(x; \alpha, \beta) = \beta x + \alpha.
-
-    For an input tensor :math:`X \in \mathbb{R}^{B \times N \times D}`,
-    the output is
-
-    .. math::
-
-        Y[b, n, d]
-        = \beta \, X[b, n, d] + \alpha.
-
-    Parameters
-    ----------
-    alpha : float, optional
-        Additive term :math:`\alpha` in the affine transform. Default is
-        ``0.0``.
-
-    beta : float, optional
-        Multiplicative term :math:`\beta` in the affine transform.
-        Default is ``1.0``.
+            f(x;\alpha,\beta) = \beta x + \alpha.
+    :__init__: ``Add_Mul(alpha=0.0, beta=1.0)`` — additive :math:`\alpha`,
+        multiplicative :math:`\beta`.
     """
     def __init__(self, alpha: float = 0.0, beta: float = 1.0):
         super().__init__(alpha, beta)
@@ -326,31 +175,14 @@ class Add_Mul(Elementwise):
 
 class Abs(Elementwise):
     r"""
-    Absolute-value transform of an affine argument.
+    Absolute value of an affine transform (an :class:`Elementwise`).
 
-    This operator applies, elementwise, the scalar function
+    :Math:
+        .. math::
 
-    .. math::
-
-        f(x; \alpha, \beta) = \bigl|\beta x + \alpha\bigr|.
-
-    For an input tensor :math:`X \in \mathbb{R}^{B \times N \times D}`,
-    the output is
-
-    .. math::
-
-        Y[b, n, d]
-        = \bigl|\beta \, X[b, n, d] + \alpha\bigr|.
-
-    Parameters
-    ----------
-    alpha : float, optional
-        Additive term :math:`\alpha` inside the absolute value. Default is
-        ``0.0``.
-
-    beta : float, optional
-        Multiplicative term :math:`\beta` inside the absolute value.
-        Default is ``1.0``.
+            f(x;\alpha,\beta) = \lvert \beta x + \alpha \rvert.
+    :__init__: ``Abs(alpha=0.0, beta=1.0)`` — additive :math:`\alpha`,
+        multiplicative :math:`\beta` inside the absolute value.
     """
     def __init__(self, alpha: float = 0.0, beta: float = 1.0):
         super().__init__(alpha, beta)
@@ -359,28 +191,14 @@ class Abs(Elementwise):
 
 class Log(Elementwise):
     r"""
-    Natural logarithm of an affine transform.
+    Natural logarithm of an affine transform (an :class:`Elementwise`).
 
-    This operator applies, elementwise, the scalar function
+    :Math:
+        .. math::
 
-    .. math::
-
-        f(x; \alpha, \beta) = \log(\beta x + \alpha).
-
-    Given an input tensor :math:`X \in \mathbb{R}^{B \times N \times D}`,
-    the output is
-
-    .. math::
-
-        Y[b, n, d] = \log(\beta X[b, n, d] + \alpha).
-
-    Parameters
-    ----------
-    alpha : float, optional
-        Additive bias term inside the logarithm. Default is ``0.0``.
-
-    beta : float, optional
-        Multiplicative scale term inside the logarithm. Default is ``1.0``.
+            f(x;\alpha,\beta) = \log(\beta x + \alpha).
+    :__init__: ``Log(alpha=0.0, beta=1.0)`` — additive :math:`\alpha`,
+        multiplicative :math:`\beta` inside the logarithm.
     """
     def __init__(self, alpha: float = 0.0, beta: float = 1.0):
         super().__init__(alpha, beta)
@@ -389,28 +207,14 @@ class Log(Elementwise):
 
 class Exp(Elementwise):
     r"""
-    Exponential of an affine transform.
+    Exponential of an affine transform (an :class:`Elementwise`).
 
-    This operator applies, elementwise, the scalar function
+    :Math:
+        .. math::
 
-    .. math::
-
-        f(x; \alpha, \beta) = \exp(\beta x + \alpha).
-
-    Given an input tensor :math:`X \in \mathbb{R}^{B \times N \times D}`,
-    the output is
-
-    .. math::
-
-        Y[b, n, d] = \exp(\beta X[b, n, d] + \alpha).
-
-    Parameters
-    ----------
-    alpha : float, optional
-        Additive bias term inside the exponential. Default is ``0.0``.
-
-    beta : float, optional
-        Multiplicative scale term inside the exponential. Default is ``1.0``.
+            f(x;\alpha,\beta) = \exp(\beta x + \alpha).
+    :__init__: ``Exp(alpha=0.0, beta=1.0)`` — additive :math:`\alpha`,
+        multiplicative :math:`\beta` inside the exponential.
     """
     def __init__(self, alpha: float = 0.0, beta: float = 1.0):
         super().__init__(alpha, beta)

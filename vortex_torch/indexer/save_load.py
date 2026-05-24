@@ -6,35 +6,21 @@ from ..utils import Schedule
 
 class Save(vOp):
     r"""
-    Format-aware save (copy/convert) dispatcher.
+    Persist a per-page indexer value across decode steps (paired with
+    :class:`Load`) by copying it into a preallocated cache field.
 
-    This operator copies or converts data from an input tensor ``x`` into a
-    preallocated output tensor ``o``. Both tensors are treated as rank-3
-    objects with logical shape
+    :Math:
+        .. math::
 
-    .. math::
+            O \leftarrow X
 
-        [S, D_0, D_1],
-
-    where :math:`S` is a generic leading dimension (it may represent a batch,
-    a sequence length, or a page count, depending on the surrounding runtime).
-
-    Key properties:
-
-    - Dispatch is keyed **only** by the format of ``x`` (``x._format``).
-    - No internal buffer is allocated; the provided output tensor ``o`` is
-      validated and written into directly.
-    - The output format is determined by the dispatch table and must match
-      ``o._format``.
-
-    Attributes
-    ----------
-    _impl_map : Dict[FORMAT, FORMAT]
-        Dispatch table keyed by ``x_format``. Each entry maps to the
-        resolved output format.
-
-    output_format : Optional[FORMAT]
-        The expected output format for ``o`` as determined in :meth:`profile`.
+        (a format/layout copy ``RAGGED`` → ``PAGED``; no arithmetic).
+    :__init__: ``Save()`` — no arguments.
+    :__call__: ``op(x, o, ctx=ctx)`` — ``x`` ``[S, D_0, D_1]`` (``RAGGED``) is
+        written **in place** into the preallocated ``o`` (``PAGED``, matching
+        ``D_0`` / ``D_1``). Returns nothing.
+    :Note: write side of the persistent-state pattern; a flow that uses
+        ``Save`` requires the engine to set ``disable_radix_cache=True``.
     """
 
     # Dispatch table keyed by x_format -> resolved output format.
@@ -50,47 +36,9 @@ class Save(vOp):
 
     # ---------------- profile ----------------
     def profile(self, x: vTensor, o: vTensor, ctx: Context) -> vTensor:
-        r"""
-        Validate inputs, resolve the implementation, and return ``o`` as
-        the output view.
-
-        This method checks:
-
-        - that both ``x`` and ``o`` are rank-3 ``vTensor`` instances with
-          logical shape ``[S, D_0, D_1]``,
-        - that their inner dimensions ``D_0`` and ``D_1`` match,
-        - that a save implementation is registered for ``x._format``, and
-        - that ``o._format`` matches the format required by the dispatch.
-
-        No new buffers are allocated; the provided ``o`` will be used as the
-        destination.
-
-        Parameters
-        ----------
-        x : vTensor
-            Input tensor to be copied/converted. Expected logical shape
-            ``[S, D_0, D_1]``.
-
-        o : vTensor
-            Preallocated output tensor. Must have logical shape compatible
-            with ``x`` (matching ``D_0`` and ``D_1``) and the format expected
-            by the selected implementation.
-
-        ctx : Context
-            Execution context (included for API symmetry; not used for buffer
-            allocation in this dispatcher).
-
-        Returns
-        -------
-        vTensor
-            The same object as ``o``, returned as the resolved output view.
-
-        Raises
-        ------
-        AssertionError
-            If types, ranks, shapes, formats, or devices are incompatible,
-            or if no implementation is registered for ``x._format``.
-        """
+        r"""Trace-time: validate ``x`` / ``o`` (rank-3, matching ``D_0`` /
+        ``D_1``, compatible formats), register the op, and return ``o`` as the
+        output view (no buffer is allocated)."""
         prefix = self._prefix()
 
         # Type & rank checks
@@ -149,38 +97,19 @@ class Save(vOp):
 
 class Load(vOp):
     r"""
-    Format-aware load (copy/convert) dispatcher.
+    Read back a per-page value persisted by :class:`Save` (the read side of
+    the cross-decode-step persistent-state pattern).
 
-    This operator copies or converts data from an input tensor ``x`` into an
-    internally allocated output buffer. Both input and output are treated as
-    rank-3 tensors with logical shape
+    :Math:
+        .. math::
 
-    .. math::
+            Y \leftarrow X
 
-        [S, D_0, D_1],
-
-    where :math:`S` is a generic leading dimension (it may represent a batch
-    size, a sequence length, or a page count, depending on the surrounding
-    runtime).
-
-    Key properties
-    --------------
-    - Dispatch is keyed **only** by the format of ``x`` (``x._format``).
-    - The output buffer is allocated during :meth:`profile` using the runtime
-      value ``ctx.max_num_pages`` for the leading dimension.
-    - The output format is determined by the dispatch table and used when
-      wrapping the internal buffer as a :class:`vTensor`.
-
-    Attributes
-    ----------
-    _impl_map : Dict[FORMAT, FORMAT]
-        Dispatch table keyed by ``x_format``. Each entry maps to the
-        resolved output format.
-    output_format : Optional[FORMAT]
-        The output tensor format as determined in :meth:`profile`.
-    output_buffer : Optional[torch.Tensor]
-        Preallocated output tensor buffer with logical shape
-        ``[S_out, D_0, D_1]``, where ``S_out`` comes from the runtime context.
+        (a format/layout copy ``PAGED`` → ``RAGGED``; no arithmetic).
+    :__init__: ``Load()`` — no arguments.
+    :__call__: ``y = op(x, ctx=ctx)`` — ``x`` ``[S, D_0, D_1]`` (``PAGED``);
+        returns a freshly-allocated ``RAGGED`` view of the same inner shape.
+    :Note: read side of the persistent-state pattern (see :class:`Save`).
     """
 
     # Dispatch table keyed by x_format -> resolved output format.
@@ -197,42 +126,9 @@ class Load(vOp):
 
     # ---------------- profile ----------------
     def profile(self, x: vTensor, ctx: Context) -> vTensor:
-        r"""
-        Validate the input, select an implementation, allocate the output
-        buffer, and return an :func:`as_vtensor` view with the resolved format.
-
-        The input tensor is expected to have logical shape ``[S_in, D_0, D_1]``.
-        The output tensor is allocated with shape
-
-        .. math::
-
-            [S_{\text{out}}, D_0, D_1],
-
-        where :math:`S_{\text{out}}` is taken from ``ctx.max_num_pages`` to
-        match the runtime configuration for the leading dimension.
-
-        Parameters
-        ----------
-        x : vTensor
-            Input tensor to be loaded from, with logical shape
-            ``[S_in, D_0, D_1]``.
-
-        ctx : Context
-            Execution context providing ``ctx.max_num_pages`` for the leading
-            dimension and tracking auxiliary memory usage.
-
-        Returns
-        -------
-        vTensor
-            A ``vTensor`` view wrapping the internally allocated output
-            buffer with the resolved output format.
-
-        Raises
-        ------
-        AssertionError
-            If ``x`` is not a :class:`vTensor`, if its rank is not 3, or if
-            no implementation is registered for ``x._format``.
-        """
+        r"""Trace-time: validate ``x`` ``[S, D_0, D_1]``, register the op, and
+        return a freshly-allocated ``vTensor`` view of the loaded value (same
+        inner shape, ``RAGGED``)."""
         prefix = self._prefix()
 
         # Type & rank checks

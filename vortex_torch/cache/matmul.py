@@ -7,49 +7,21 @@ from typing import Optional
 
 class GeMM(vOp):
     r"""
-    General matrix-matrix multiplication for page/token-tiled layouts.
+    Per-block matrix–matrix product, :math:`O_b = Y_b X_b^{\top}` (cache side).
 
-    This operator computes a batched GEMM of the form
+    :Math:
+        For :math:`X\in\mathbb{R}^{B\times N_x\times K}`,
+        :math:`Y\in\mathbb{R}^{B\times N_y\times K}`:
 
-    .. math::
+        .. math::
 
-        O_b = Y_b X_b^\top, \qquad b = 0, \dots, B-1,
-
-    where, for each batch index :math:`b`,
-
-    - :math:`X_b \in \mathbb{R}^{N_x \times K}`,
-    - :math:`Y_b \in \mathbb{R}^{N_y \times K}`, and
-    - :math:`O_b \in \mathbb{R}^{N_y \times N_x}`.
-
-    In the logical 3D layout, the tensors have shapes
-
-    .. math::
-
-        X &\in \mathbb{R}^{B \times N_x \times K}, \\
-        Y &\in \mathbb{R}^{B \times N_y \times K}, \\
-        O &\in \mathbb{R}^{B \times N_y \times N_x},
-
-    where the leading dimension :math:`B` is a batch-like axis typically
-    derived from the runtime (for example,
-    ``max_new_tokens_per_batch * head_num`` in an attention-style kernel).
-
-    Output format rule: if a caller-provided ``output`` is supplied with
-    ``PAGED`` format, the output is ``PAGED``; in every other case the
-    output is ``RAGGED``. Format compatibility is enforced by the
-    compiler's per-block kernel.
-
-    The shared inner dimension :math:`K` must match:
-
-    .. math::
-
-        K_x = x.\text{shape}[2], \quad K_y = y.\text{shape}[2], \quad K_x = K_y.
-
-    Attributes
-    ----------
-    output_format : Optional[FORMAT]
-        The output tensor format as determined in :meth:`profile`.
-    output_buffer : Optional[vTensor]
-        Pure-metadata vTensor descriptor for the output (graph node).
+            O_{b,a,c} = \sum_{k=0}^{K-1} Y_{b,a,k}\,X_{b,c,k},
+            \qquad O\in\mathbb{R}^{B\times N_y\times N_x}.
+    :__init__: ``GeMM()`` — no arguments.
+    :__call__: ``o = op(x, y, output, loc=loc, ctx=ctx)`` — ``x``
+        ``[B, N_x, K]``, ``y`` ``[B, N_y, K]`` (matching ``K``); ``o``
+        ``[B, N_y, N_x]``. ``PAGED`` iff a ``PAGED`` ``output`` is supplied,
+        else ``RAGGED``.
     """
 
     def __init__(self):

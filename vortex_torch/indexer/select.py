@@ -19,61 +19,33 @@ from .context import Context
 
 
 class TopK(vOp):
-    r"""Block-table top-k for the trtllm backend (k explicit, multi-output).
+    r"""
+    Explicit-``k`` block-table top-k (trtllm backend, two outputs).
 
-    Distinct from :class:`vortex_torch.indexer.topK` (lowercase ``t``,
-    a.k.a. *TopKOut*): :class:`topK` writes selected block ids into a
-    caller-supplied ``o`` and has a *predetermined* k (sourced from
-    ``ctx.topk_val`` / ``ctx.sparse_kv_indptr`` diff at runtime). This
-    :class:`TopK` is **trtllm-only**, takes the top-k budget ``k`` as an
-    *explicit* constructor argument, and **returns its own
-    ``(block_tables, seqlens)`` tuple** — both auto-allocated as
-    intermediate buffers by the compiler's ``memory_initiazation_str``.
-    A separate op (developed elsewhere) is responsible for copying these
-    intermediates into the final output buffers consumed by
-    ``trtllm_batch_decode_with_kv_cache``.
+    :Math:
+        For request row :math:`i` with score :math:`s` over its dense blocks,
+        ``bos`` / ``eos`` reserved blocks and
+        :math:`L_i = \lceil \text{seqlen}_i / \text{block\_size}\rceil`:
 
-    Per-row behavior, with ``bos = ctx.block_reserved_bos``,
-    ``eos = ctx.block_reserved_eos``, ``block_len = ceil(dense_seqlens[i] / block_size)``:
+        .. math::
 
-      * If ``block_len <= bos + k + eos`` → copy the entire dense row
-        into ``block_tables[i, :block_len]`` and set ``seqlens[i] =
-        dense_seqlens[i]``. No selection — the row is already small
-        enough to fit the budget.
-      * Otherwise → write a sparse row of ``bos + k + eos`` blocks:
+            \mathcal{B}_i = \begin{cases}
+                \{0,\dots,L_i-1\}, & L_i \le \text{bos}+k+\text{eos}, \\[2pt]
+                [0,\text{bos}) \;\cup\; \operatorname*{top\text{-}k}_{\,\text{bos}\le j<L_i-\text{eos}} s_j
+                \;\cup\; [L_i-\text{eos}, L_i), & \text{otherwise}.
+            \end{cases}
 
-        - ``[0:bos)`` ← first ``bos`` dense blocks
-        - ``[bos:bos+k)`` ← top-``k`` blocks by score over
-          ``[bos, block_len-eos)`` of the dense row
-        - ``[bos+k:bos+k+eos)`` ← last ``eos`` dense blocks
-
-        and set ``seqlens[i] = (bos+k+eos-1) * block_size + last_block_len``,
-        where ``last_block_len`` is the per-row trailing block's token count
-        (so the last block contributes the exact token count trtllm decode
-        expects).
-
-    Constructor
-    -----------
-    ``k`` : int — number of *selected* blocks (excludes the reserved
-    BOS+EOS slots). The total per-row sparse block count is
-    ``bos + k + eos``.
-
-    Invocation
-    ----------
-    ::
-
-        block_tables, seqlens = self.topk(score, ctx=ctx)
-
-    ``score`` is the per-block RAGGED scores ``[S_pack, 1, 1]``. The op
-    returns two new intermediate vTensors:
-
-      * ``block_tables`` — RAGGED int32, leading dim ``ctx.max_num_blocks``
-        (= ``eff_bs * max_blocks_per_seq``). The CUDA kernel addresses it
-        as the contiguous 2D ``[eff_bs, max_blocks_per_seq]`` memory it is.
-      * ``seqlens`` — BATCHED int32, leading dim ``ctx.max_bs * num_kv_heads``.
-
-    Both are allocated by ``interface.generate_entry_point``'s
-    ``memory_initiazation_str`` (no aliasing with ``ctx.metadata``).
+        Rows that already fit the budget are copied dense; larger rows keep
+        the leading ``bos`` and trailing ``eos`` blocks and fill the middle
+        with the top-``k`` by score.
+    :__init__: ``TopK(k)`` — number of *selected* blocks (excludes the
+        reserved BOS/EOS); per-row sparse block count is ``bos + k + eos``.
+    :__call__: ``block_tables, seqlens = op(score, ctx=ctx)`` — ``score`` RAGGED
+        ``[S, 1, 1]`` → ``block_tables`` (RAGGED int32) and ``seqlens``
+        (BATCHED int32), both auto-allocated. Feed the pair to
+        :class:`Union` before ``trtllm_batch_decode_with_kv_cache``.
+    :Note: **trtllm only** — asserts under flashinfer; use :func:`topK` for
+        flashinfer / CSR layouts.
     """
 
     _supported_formats: FrozenSet[FORMAT] = frozenset({FORMAT.RAGGED})

@@ -7,51 +7,24 @@ from ..utils import Schedule
 
 class Reshape(vOp):
     r"""
-    Same-numel reshape of the inner two axes of a rank-3 indexer tensor.
+    Same-numel reshape of the inner two axes (indexer side).
 
-    Given an input
+    :Math:
+        .. math::
 
-    .. math::
+            X\in\mathbb{R}^{S\times x_1\times y_1} \;\longrightarrow\;
+            Y\in\mathbb{R}^{S\times x_2\times y_2},\qquad x_2\,y_2 = x_1\,y_1,
 
-        X \in \mathbb{R}^{S \times x_1 \times y_1},
-
-    this op produces
-
-    .. math::
-
-        Y \in \mathbb{R}^{S \times x_2 \times y_2},
-        \qquad \text{with} \qquad x_2 \cdot y_2 \;=\; x_1 \cdot y_1,
-
-    by interpreting the flat ``x_1 * y_1`` elements row-major into the
-    new ``(x_2, y_2)`` layout, independently for each of the ``S``
-    slices. The leading axis is preserved and must be passed as
-    ``-1`` to the constructor as a placeholder, mirroring
-    ``torch.reshape``'s "infer this dim" convention.
-
-    No data movement happens beyond the existing per-workload load /
-    store — the loaded ``(W, x_1, y_1)`` block is reshaped at the
-    Triton-tile level via :func:`tl.reshape` to ``(W, x_2, y_2)``.
-    The constraint ``x_1 * y_1 == x_2 * y_2`` is enforced at
-    :meth:`profile` time (and again by ``tl.reshape`` at compile
-    time as a numel check).
-
-    Output format rule: ``BATCHED`` iff the input is ``BATCHED``,
-    otherwise ``RAGGED``. Format compatibility is enforced by the
-    compiler's per-workload kernel.
-
-    Constructor
-    -----------
-    ``Reshape(-1, x2, y2)`` — three integers; the leading must be
-    ``-1`` (the leading ``S`` axis is preserved automatically).
-
-    Attributes
-    ----------
-    x2, y2 : int
-        Target inner-axis sizes.
-    output_format : Optional[FORMAT]
-        Resolved output format from :meth:`profile`.
-    output_buffer : Optional[vTensor]
-        Pure-metadata vTensor descriptor for the output (graph node).
+        reading the flat :math:`x_1 y_1` elements row-major into the new
+        :math:`(x_2, y_2)` layout, independently per leading index :math:`s`
+        (a Triton-tile :func:`tl.reshape`; no data movement beyond the
+        existing load/store).
+    :__init__: ``Reshape(-1, x2, y2)`` — the leading dim must be ``-1`` (the
+        ``S`` axis is preserved); ``x2*y2`` must equal the input's ``x1*y1``
+        (checked at trace time).
+    :__call__: ``y = op(x, ctx=ctx)`` — ``x`` ``[S, x_1, y_1]`` →
+        ``[S, x_2, y_2]``. ``BATCHED`` iff the input is ``BATCHED``, else
+        ``RAGGED``.
     """
 
     def __init__(self, batch_dim: int, x2: int, y2: int):
@@ -77,16 +50,9 @@ class Reshape(vOp):
 
     # ---------------- profile ----------------
     def profile(self, x: vTensor, ctx: Context) -> vTensor:
-        r"""
-        Validate, resolve format, and register this reshape in the
-        indexer graph.
-
-        Checks ``x.dim() == 3`` and the same-numel constraint
-        ``x.shape[1] * x.shape[2] == self.x2 * self.y2``. The leading
-        axis is preserved (the metadata vTensor is allocated with a
-        placeholder leading dim — the runtime knows the actual one
-        from the pipeline).
-        """
+        r"""Trace-time: validate ``x`` ``[S, x1, y1]`` and the same-numel
+        constraint (``x1*y1 == x2*y2``), resolve the output format, register
+        the op, and return a ``vTensor`` view of the ``[S, x2, y2]`` output."""
         prefix = self._prefix()
 
         assert isinstance(x, vTensor), (

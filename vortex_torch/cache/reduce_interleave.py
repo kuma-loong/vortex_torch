@@ -7,78 +7,29 @@ from typing import Optional
 
 class ReduceInterleave(vOp):
     r"""
-    Generic *interleaved* reduction dispatcher over the last two logical
-    axes.
+    Interleaved 1-D reduction — folds consecutive groups of ``k`` elements.
 
-    This dispatcher covers a family of reductions (mean/max/min/L2-norm/sum,
-    etc.) on rank-3 tensors that fold consecutive groups of :attr:`k`
-    elements along the reduced axis into a single output element. The
-    input is treated as
+    :Math:
+        For input :math:`X\in\mathbb{R}^{B\times N\times D}` and a per-group
+        reduction :math:`\rho` (mean / max / min / L2-norm, fixed by the
+        subclass), each group of :math:`k` adjacent elements collapses to one:
 
-    .. math::
+        .. math::
 
-        X \in \mathbb{R}^{B \times N \times D},
-
-    where:
-
-    - :math:`B` is a leading batch-like axis (typically derived from the
-      runtime, e.g. ``max_new_tokens_per_batch * head_num``),
-    - :math:`N` is a sequence or position dimension, and
-    - :math:`D` is a feature/channel dimension.
-
-    The reduction dimension is chosen by :attr:`dim`. The size of the
-    reduced axis must be divisible by :attr:`k`, and consecutive groups of
-    :attr:`k` adjacent elements collapse into one output element:
-
-    - ``dim == 1`` (interleaved row-wise reduction over :math:`N`,
-      requires ``N % k == 0``):
-
-      .. math::
-
-         \text{out} \in \mathbb{R}^{B \times (N/k) \times D}, \qquad
-         \text{out}[b, m, d]
-         = \mathop{\mathrm{reduce}}_{0 \le j < k}
-           X[b, m \cdot k + j, d].
-
-    - ``dim == 2`` (interleaved column-wise reduction over :math:`D`,
-      requires ``D % k == 0``):
-
-      .. math::
-
-         \text{out} \in \mathbb{R}^{B \times N \times (D/k)}, \qquad
-         \text{out}[b, n, e]
-         = \mathop{\mathrm{reduce}}_{0 \le j < k}
-           X[b, n, e \cdot k + j].
-
-    Setting ``k == 1`` makes this op an identity (each group has a single
-    element). Setting ``k`` equal to the full reduced-axis length recovers
-    the plain :class:`Reduce` op.
-
-    The exact reduction operation (mean, max, min, L2-norm, sum, etc.) is
-    encoded in :attr:`reduce_type` and interpreted by the implementation.
-
-    Output format rule: if a caller-provided ``output`` is supplied with
-    ``PAGED`` format, the output is ``PAGED``; in every other case the
-    output is ``RAGGED``. Format compatibility is enforced by the
-    compiler's per-block kernel.
-
-    Attributes
-    ----------
-    dim : int
-        Reduction dimension in the logical 3D tensor. Must be either:
-
-        - ``1`` for row-wise reduction over :math:`N`, or
-        - ``2`` for column-wise reduction over :math:`D`.
-    k : int
-        Group size. Consecutive ``k`` elements along the reduced axis are
-        folded into one output element. Must be a positive integer that
-        divides the size of the reduced axis.
-    reduce_type : Optional[ReduceType]
-        Enum describing which reduction to perform.
-    output_format : Optional[FORMAT]
-        The output tensor format as determined in :meth:`profile`.
-    output_buffer : Optional[vTensor]
-        Pure-metadata vTensor descriptor for the output (graph node).
+            \begin{aligned}
+            (\text{dim}=1,\ N\%k=0):\quad & Y_{b,m,d} = \rho_{\,0 \le j < k}\, X_{b,\,mk+j,\,d}, \\
+            (\text{dim}=2,\ D\%k=0):\quad & Y_{b,n,e} = \rho_{\,0 \le j < k}\, X_{b,n,\,ek+j}.
+            \end{aligned}
+    :__init__: ``ReduceInterleave(dim=1, k=2)`` — inner axis (``1`` over
+        :math:`N`, ``2`` over :math:`D`) and group size ``k`` (must divide the
+        reduced axis; ``k=1`` is identity, ``k`` = full length recovers the
+        plain reduction).
+    :__call__: ``op(x, output, loc=loc, ctx=ctx)`` — ``x`` ``[B, N, D]``; the
+        reduced axis shrinks by a factor of ``k`` (``N→N/k`` or ``D→D/k``).
+        ``PAGED`` iff a ``PAGED`` ``output`` is supplied, else ``RAGGED``.
+    :Note: use a concrete subclass — :class:`MeanInterleave`,
+        :class:`MaxInterleave`, :class:`MinInterleave`,
+        :class:`L2NormInterleave`.
     """
 
     def __init__(self, dim: int = 1, k: int = 2):
@@ -127,56 +78,10 @@ class ReduceInterleave(vOp):
     def profile(
         self, x: vTensor, output: Optional[vTensor], loc: torch.Tensor, ctx: Context
     ) -> vTensor:
-        r"""
-        Validate inputs, resolve the interleaved reduction implementation
-        and output format, and optionally allocate an internal output
-        buffer.
-
-        The input tensor ``x`` is expected to have logical shape
-        ``[B, N, D]``. According to :attr:`dim` and :attr:`k`, the
-        expected output logical shape is:
-
-        - ``dim == 1``: ``[B, N // k, D]`` (requires ``N % k == 0``)
-        - ``dim == 2``: ``[B, N, D // k]`` (requires ``D % k == 0``)
-
-        The auxiliary tensor ``loc`` carries per-position metadata used
-        by the implementation; its shape and semantics are
-        implementation-defined.
-
-        Parameters
-        ----------
-        x : vTensor
-            Input tensor with logical shape ``[B, N, D]``.
-
-        output : Optional[vTensor]
-            Optional preallocated output tensor. If ``None``, an internal
-            buffer with shape ``[B, exp_N, exp_D]`` is allocated using
-            ``ctx.max_new_tokens_per_batch * ctx.head_num`` for ``B`` and a
-            RAGGED-output implementation is selected. If not ``None``,
-            this tensor must have rank 3 and shape compatible with
-            :attr:`dim` and :attr:`k` as described above.
-
-        loc : torch.Tensor
-            Auxiliary tensor carrying metadata required by the reduction
-            implementation.
-
-        ctx : Context
-            Execution context that provides the runtime value of ``B`` and
-            is used for auxiliary memory accounting.
-
-        Returns
-        -------
-        vTensor
-            A :class:`vTensor` view representing the resolved output:
-            either the provided ``output`` or an internally allocated
-            buffer.
-
-        Raises
-        ------
-        AssertionError
-            If types, ranks, shapes, or devices are incompatible, or if
-            the reduced axis is not divisible by :attr:`k`.
-        """
+        r"""Trace-time: validate ``x`` ``[B, N, D]`` (reduced axis divisible by
+        ``k``, and ``output`` if given), register the op, and return a
+        ``vTensor`` view of the folded output (see the class docstring for
+        shapes)."""
         prefix = self._prefix()
 
         # --- type & rank checks ---
@@ -261,43 +166,17 @@ class ReduceInterleave(vOp):
 
 class MeanInterleave(ReduceInterleave):
     r"""
-    Interleaved mean reduction over a single logical axis.
+    Interleaved mean over groups of ``k`` (a :class:`ReduceInterleave`).
 
-    This operator reduces a rank-3 tensor
+    :Math:
+        .. math::
 
-    .. math::
-
-        X \in \mathbb{R}^{B \times N \times D}
-
-    by taking the arithmetic mean over consecutive groups of :attr:`k`
-    elements along one of the inner dimensions, as configured by
-    :attr:`dim`:
-
-    - ``dim == 1`` (requires ``N % k == 0``): grouped row-wise mean over
-      :math:`N`, producing
-
-      .. math::
-
-          Y \in \mathbb{R}^{B \times (N/k) \times D}, \qquad
-          Y[b, m, d]
-          = \frac{1}{k} \sum_{j=0}^{k-1} X[b, m \cdot k + j, d].
-
-    - ``dim == 2`` (requires ``D % k == 0``): grouped column-wise mean
-      over :math:`D`, producing
-
-      .. math::
-
-          Y \in \mathbb{R}^{B \times N \times (D/k)}, \qquad
-          Y[b, n, e]
-          = \frac{1}{k} \sum_{j=0}^{k-1} X[b, n, e \cdot k + j].
-
-    Parameters
-    ----------
-    dim : int, optional
-        Logical reduction dimension. Must be ``1`` (reduce over
-        :math:`N`) or ``2`` (reduce over :math:`D`). Default is ``1``.
-    k : int, optional
-        Group size. Default is ``2``.
+            \begin{aligned}
+            (\text{dim}=1):\quad & Y_{b,m,d} = \frac{1}{k}\sum_{j=0}^{k-1} X_{b,\,mk+j,\,d}, \\
+            (\text{dim}=2):\quad & Y_{b,n,e} = \frac{1}{k}\sum_{j=0}^{k-1} X_{b,n,\,ek+j}.
+            \end{aligned}
+    :__init__: ``MeanInterleave(dim=1, k=2)`` — inner axis (``1``/``2``) and
+        group size ``k``.
     """
     def __init__(self, dim: int = 1, k: int = 2):
         super().__init__(dim, k)
@@ -306,42 +185,17 @@ class MeanInterleave(ReduceInterleave):
 
 class MaxInterleave(ReduceInterleave):
     r"""
-    Interleaved max reduction over a single logical axis.
+    Interleaved max over groups of ``k`` (a :class:`ReduceInterleave`).
 
-    This operator reduces a rank-3 tensor
+    :Math:
+        .. math::
 
-    .. math::
-
-        X \in \mathbb{R}^{B \times N \times D}
-
-    by taking the maximum over consecutive groups of :attr:`k` elements
-    along one of the inner dimensions, as configured by :attr:`dim`:
-
-    - ``dim == 1`` (requires ``N % k == 0``): grouped row-wise max over
-      :math:`N`, producing
-
-      .. math::
-
-          Y \in \mathbb{R}^{B \times (N/k) \times D}, \qquad
-          Y[b, m, d]
-          = \max_{0 \le j < k} X[b, m \cdot k + j, d].
-
-    - ``dim == 2`` (requires ``D % k == 0``): grouped column-wise max
-      over :math:`D`, producing
-
-      .. math::
-
-          Y \in \mathbb{R}^{B \times N \times (D/k)}, \qquad
-          Y[b, n, e]
-          = \max_{0 \le j < k} X[b, n, e \cdot k + j].
-
-    Parameters
-    ----------
-    dim : int, optional
-        Logical reduction dimension. Must be ``1`` (reduce over
-        :math:`N`) or ``2`` (reduce over :math:`D`). Default is ``1``.
-    k : int, optional
-        Group size. Default is ``2``.
+            \begin{aligned}
+            (\text{dim}=1):\quad & Y_{b,m,d} = \max_{0 \le j < k} X_{b,\,mk+j,\,d}, \\
+            (\text{dim}=2):\quad & Y_{b,n,e} = \max_{0 \le j < k} X_{b,n,\,ek+j}.
+            \end{aligned}
+    :__init__: ``MaxInterleave(dim=1, k=2)`` — inner axis (``1``/``2``) and
+        group size ``k``.
     """
     def __init__(self, dim: int = 1, k: int = 2):
         super().__init__(dim, k)
@@ -350,42 +204,17 @@ class MaxInterleave(ReduceInterleave):
 
 class MinInterleave(ReduceInterleave):
     r"""
-    Interleaved min reduction over a single logical axis.
+    Interleaved min over groups of ``k`` (a :class:`ReduceInterleave`).
 
-    This operator reduces a rank-3 tensor
+    :Math:
+        .. math::
 
-    .. math::
-
-        X \in \mathbb{R}^{B \times N \times D}
-
-    by taking the minimum over consecutive groups of :attr:`k` elements
-    along one of the inner dimensions, as configured by :attr:`dim`:
-
-    - ``dim == 1`` (requires ``N % k == 0``): grouped row-wise min over
-      :math:`N`, producing
-
-      .. math::
-
-          Y \in \mathbb{R}^{B \times (N/k) \times D}, \qquad
-          Y[b, m, d]
-          = \min_{0 \le j < k} X[b, m \cdot k + j, d].
-
-    - ``dim == 2`` (requires ``D % k == 0``): grouped column-wise min
-      over :math:`D`, producing
-
-      .. math::
-
-          Y \in \mathbb{R}^{B \times N \times (D/k)}, \qquad
-          Y[b, n, e]
-          = \min_{0 \le j < k} X[b, n, e \cdot k + j].
-
-    Parameters
-    ----------
-    dim : int, optional
-        Logical reduction dimension. Must be ``1`` (reduce over
-        :math:`N`) or ``2`` (reduce over :math:`D`). Default is ``1``.
-    k : int, optional
-        Group size. Default is ``2``.
+            \begin{aligned}
+            (\text{dim}=1):\quad & Y_{b,m,d} = \min_{0 \le j < k} X_{b,\,mk+j,\,d}, \\
+            (\text{dim}=2):\quad & Y_{b,n,e} = \min_{0 \le j < k} X_{b,n,\,ek+j}.
+            \end{aligned}
+    :__init__: ``MinInterleave(dim=1, k=2)`` — inner axis (``1``/``2``) and
+        group size ``k``.
     """
     def __init__(self, dim: int = 1, k: int = 2):
         super().__init__(dim, k)
@@ -394,49 +223,18 @@ class MinInterleave(ReduceInterleave):
 
 class L2NormInterleave(ReduceInterleave):
     r"""
-    Interleaved L2-norm reduction (not RMS) over a single logical axis.
+    Interleaved L2-norm over groups of ``k`` (a :class:`ReduceInterleave`).
 
-    This operator reduces a rank-3 tensor
+    :Math:
+        .. math::
 
-    .. math::
-
-        X \in \mathbb{R}^{B \times N \times D}
-
-    by computing an L2 norm over consecutive groups of :attr:`k` elements
-    along one of the inner dimensions, as configured by :attr:`dim`. The
-    reduction is *not* normalized by the number of elements (it is an L2
-    norm, not an RMS):
-
-    - ``dim == 1`` (requires ``N % k == 0``): grouped row-wise L2 norm
-      over :math:`N`, producing
-
-      .. math::
-
-          Y \in \mathbb{R}^{B \times (N/k) \times D}, \qquad
-          Y[b, m, d]
-          = \sqrt{\sum_{j=0}^{k-1} X[b, m \cdot k + j, d]^2}.
-
-    - ``dim == 2`` (requires ``D % k == 0``): grouped column-wise L2 norm
-      over :math:`D`, producing
-
-      .. math::
-
-          Y \in \mathbb{R}^{B \times N \times (D/k)}, \qquad
-          Y[b, n, e]
-          = \sqrt{\sum_{j=0}^{k-1} X[b, n, e \cdot k + j]^2}.
-
-    Notes
-    -----
-    This is a pure L2 norm over each group, with no division by the
-    group size. It should not be confused with an RMS over the group.
-
-    Parameters
-    ----------
-    dim : int, optional
-        Logical reduction dimension. Must be ``1`` (reduce over
-        :math:`N`) or ``2`` (reduce over :math:`D`). Default is ``1``.
-    k : int, optional
-        Group size. Default is ``2``.
+            \begin{aligned}
+            (\text{dim}=1):\quad & Y_{b,m,d} = \Big(\sum_{j=0}^{k-1} X_{b,\,mk+j,\,d}^2\Big)^{1/2}, \\
+            (\text{dim}=2):\quad & Y_{b,n,e} = \Big(\sum_{j=0}^{k-1} X_{b,n,\,ek+j}^2\Big)^{1/2}.
+            \end{aligned}
+    :__init__: ``L2NormInterleave(dim=1, k=2)`` — inner axis (``1``/``2``) and
+        group size ``k``.
+    :Note: a pure :math:`L_2` norm per group (no division) — not RMS.
     """
     def __init__(self, dim: int = 1, k: int = 2):
         super().__init__(dim, k)
