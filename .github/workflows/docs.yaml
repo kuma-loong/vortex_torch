@@ -5,6 +5,7 @@ on:
     branches: [ v0.5 ]
     paths:
       - "docs/**"
+      - "vortex_torch/**"
       - ".github/workflows/docs.yaml"
 
 jobs:
