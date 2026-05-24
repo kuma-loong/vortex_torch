@@ -55,6 +55,11 @@ autodoc_default_options = {
     #"members": True,
     "undoc-members": False,
     "show-inheritance": True,
+    # ``profile`` is the trace-time graph-registration hook — an internal
+    # implementation detail, not part of the user-facing op surface. Hide it
+    # everywhere so the rendered op pages show only the Math / __init__ /
+    # __call__ / Note contract from the class docstring.
+    "exclude-members": "profile",
 }
 
 source_suffix = {".rst": "restructuredtext", ".md": "markdown"}
