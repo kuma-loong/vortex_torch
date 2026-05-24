@@ -9,11 +9,16 @@ class GeMV(vOp):
     r"""
     Per-request batched matrix–vector product, :math:`O = Y X^{\top}`.
 
-    :Math: with a batched query :math:`X\in\mathbb{R}^{B\times 1\times D}` and
-        packed pages :math:`Y\in\mathbb{R}^{S\times 1\times D}`, each page
-        :math:`s` of request :math:`i` scores as
-        :math:`O[s]=\langle Y[s],\,X[i]\rangle`, giving
-        :math:`O\in\mathbb{R}^{S\times 1\times 1}`.
+    :Math:
+        Batched query :math:`X\in\mathbb{R}^{B\times 1\times D}`, packed pages
+        :math:`Y\in\mathbb{R}^{S\times 1\times D}`; for page :math:`s` in
+        request :math:`i(s)`,
+
+        .. math::
+
+            O_{s,0,0} = \sum_{d=0}^{D-1} Y_{s,0,d}\,X_{i(s),0,d}
+                      = \langle Y_s,\, X_{i(s)} \rangle,
+            \qquad O\in\mathbb{R}^{S\times 1\times 1}.
     :__init__: ``GeMV()`` — no arguments.
     :__call__: ``o = op(x, y, ctx=ctx)`` — ``x`` is ``[B, 1, D]``, ``y`` is
         ``[S, 1, D]`` (matching ``D``); returns ``o`` ``[S, 1, 1]``. Output is
@@ -77,11 +82,15 @@ class GeMM(vOp):
     r"""
     Per-page matrix–matrix product, :math:`O[s] = Y[s]\,X[s]^{\top}`.
 
-    :Math: with :math:`Y\in\mathbb{R}^{S\times N_y\times K}` and
-        :math:`X\in\mathbb{R}^{(B\,\text{or}\,S)\times N_x\times K}`, per page
-        :math:`s`:
-        :math:`O[s]=Y[s]\,X[s]^{\top}\in\mathbb{R}^{N_y\times N_x}` — i.e.
-        ``GeMM(x, y) = y xᵀ``. Output :math:`O\in\mathbb{R}^{S\times N_y\times N_x}`.
+    :Math:
+        :math:`Y\in\mathbb{R}^{S\times N_y\times K}`,
+        :math:`X\in\mathbb{R}^{(B\text{ or }S)\times N_x\times K}`; per page
+        :math:`s` this is :math:`O_s = Y_s X_s^{\top}` (i.e. ``GeMM(x, y) = y xᵀ``):
+
+        .. math::
+
+            O_{s,a,b} = \sum_{k=0}^{K-1} Y_{s,a,k}\,X_{s,b,k},
+            \qquad O\in\mathbb{R}^{S\times N_y\times N_x}.
     :__init__: ``GeMM()`` — no arguments.
     :__call__: ``o = op(x, y, ctx=ctx)`` — ``x`` is ``[B|S, N_x, K]``, ``y`` is
         ``[S, N_y, K]`` (matching ``K``); returns ``o`` ``[S, N_y, N_x]``.

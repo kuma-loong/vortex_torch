@@ -11,10 +11,17 @@ class topK(vOp):
     The terminal op of a ``forward_indexer``: it turns per-page scores into the
     sparse set of pages each request attends to.
 
-    :Math: for each request's packed score segment
-        :math:`X\in\mathbb{R}^{S\times 1\times 1}`, the selected page set is the
-        first ``block_reserved_bos`` pages, the last ``block_reserved_eos``
-        pages, and the ``topk_val`` highest-scoring of the remaining pages.
+    :Math:
+        For a request's per-page scores :math:`X_p` (:math:`p=0,\dots,S-1`),
+        with reserved prefix :math:`\mathcal{B}=\{0,\dots,n_{\mathrm{bos}}-1\}`
+        and suffix :math:`\mathcal{E}=\{S-n_{\mathrm{eos}},\dots,S-1\}`, the
+        selected page set is
+
+        .. math::
+
+            \mathcal{S} = \mathcal{B}\,\cup\,\mathcal{E}\,\cup\,
+            \operatorname*{top\text{-}k}_{\,p\,\notin\,\mathcal{B}\cup\mathcal{E}} X_p,
+            \qquad k = \texttt{topk\_val}.
     :__init__: ``topK()`` — no arguments; the budget ``topk_val`` and the
         reserved BOS/EOS counts are read from :class:`Context` at runtime.
     :__call__: ``op(score, o, ctx=ctx)`` — ``score`` is ``[S, 1, 1]`` (one
@@ -84,11 +91,17 @@ class approxTopK(topK):
     r"""
     Approximate :class:`topK` — faster adaptive 8-bit radix selection.
 
-    :Math: same selection as :class:`topK` (reserved BOS/EOS pages +
-        ``topk_val`` by score), but the top-``topk_val`` set is found with an
-        adaptive 8-bit radix kernel that stops early once the slots still owed
-        by the threshold bin fall within ``tolerate_ratio`` of the target,
-        filling any remainder in arrival order.
+    :Math:
+        The selected set :math:`\mathcal{S}` matches :class:`topK`, but the
+        top-:math:`k` search over the non-reserved pages stops at the first
+        radix round whose count :math:`r` still owed by the threshold bin
+        satisfies
+
+        .. math::
+
+            r \;\le\; \texttt{tolerate\_ratio}\cdot k,
+
+        with any remaining slots filled in arrival order.
     :__init__: ``approxTopK(tolerate_ratio=0.0)`` — approximation budget in
         ``[0, 1]``: ``0.0`` = exact (all radix rounds run), higher = cheaper
         but looser (typical throughput sweet spot ``0.05–0.15``).

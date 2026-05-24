@@ -10,13 +10,17 @@ class Reduce(vOp):
 
     :Math:
         For input :math:`X\in\mathbb{R}^{N\times D_0\times D_1}` and a
-        reduction :math:`\rho` (mean / max / min / L2-norm / sum, fixed by the
-        subclass): ``dim=1`` →
-        :math:`\text{out}[n,0,d_1]=\rho_{d_0}\,X[n,d_0,d_1]` (shape
-        ``[N, 1, D_1]``); ``dim=2`` →
-        :math:`\text{out}[n,d_0,0]=\rho_{d_1}\,X[n,d_0,d_1]` (shape
-        ``[N, D_0, 1]``); ``dim=0`` collapses the packed leading axis to one
-        row per ``(batch, kv_head)``.
+        per-axis reduction :math:`\rho` (mean / max / min / L2-norm / sum,
+        fixed by the subclass):
+
+        .. math::
+
+            Y_{n,0,d} = \rho_{\,0 \le i < D_0}\, X_{n,i,d}\ \ (\text{dim}=1),
+            \qquad
+            Y_{n,d,0} = \rho_{\,0 \le j < D_1}\, X_{n,d,j}\ \ (\text{dim}=2).
+
+        ``dim=0`` collapses the packed leading axis to one row per
+        ``(batch, kv\_head)``.
     :__init__:
         ``Reduce(dim=1)`` — logical axis to reduce, one of ``0`` / ``1`` / ``2``.
     :__call__:
@@ -101,8 +105,12 @@ class Max(Reduce):
     r"""
     Max reduction over one logical axis (a :class:`Reduce`).
 
-    :Math: ``dim=1``: :math:`\text{out}[n,0,d_1]=\max_{d_0}X[n,d_0,d_1]`;
-        ``dim=2``: :math:`\text{out}[n,d_0,0]=\max_{d_1}X[n,d_0,d_1]`.
+    :Math:
+        .. math::
+
+            Y_{n,0,d} = \max_{0 \le i < D_0} X_{n,i,d}\ \ (\text{dim}=1),
+            \qquad
+            Y_{n,d,0} = \max_{0 \le j < D_1} X_{n,d,j}\ \ (\text{dim}=2).
     :__init__: ``Max(dim=1)`` — axis to reduce (``1`` → :math:`D_0`,
         ``2`` → :math:`D_1`).
     :__call__: ``y = op(x, ctx=ctx)`` — ``[N, D_0, D_1]`` → ``[N, 1, D_1]``
@@ -117,8 +125,12 @@ class Min(Reduce):
     r"""
     Min reduction over one logical axis (a :class:`Reduce`).
 
-    :Math: ``dim=1``: :math:`\text{out}[n,0,d_1]=\min_{d_0}X[n,d_0,d_1]`;
-        ``dim=2``: :math:`\text{out}[n,d_0,0]=\min_{d_1}X[n,d_0,d_1]`.
+    :Math:
+        .. math::
+
+            Y_{n,0,d} = \min_{0 \le i < D_0} X_{n,i,d}\ \ (\text{dim}=1),
+            \qquad
+            Y_{n,d,0} = \min_{0 \le j < D_1} X_{n,d,j}\ \ (\text{dim}=2).
     :__init__: ``Min(dim=1)`` — axis to reduce (``1`` → :math:`D_0`,
         ``2`` → :math:`D_1`).
     :__call__: ``y = op(x, ctx=ctx)`` — ``[N, D_0, D_1]`` → ``[N, 1, D_1]``
@@ -133,8 +145,12 @@ class Mean(Reduce):
     r"""
     Mean reduction over one logical axis (a :class:`Reduce`).
 
-    :Math: ``dim=1``: :math:`\text{out}[n,0,d_1]=\frac{1}{D_0}\sum_{d_0}X[n,d_0,d_1]`;
-        ``dim=2``: :math:`\text{out}[n,d_0,0]=\frac{1}{D_1}\sum_{d_1}X[n,d_0,d_1]`.
+    :Math:
+        .. math::
+
+            Y_{n,0,d} = \frac{1}{D_0}\sum_{i=0}^{D_0-1} X_{n,i,d}\ \ (\text{dim}=1),
+            \qquad
+            Y_{n,d,0} = \frac{1}{D_1}\sum_{j=0}^{D_1-1} X_{n,d,j}\ \ (\text{dim}=2).
     :__init__: ``Mean(dim=1)`` — axis to reduce (``1`` → :math:`D_0`,
         ``2`` → :math:`D_1`).
     :__call__: ``y = op(x, ctx=ctx)`` — ``[N, D_0, D_1]`` → ``[N, 1, D_1]``
@@ -149,8 +165,12 @@ class L2Norm(Reduce):
     r"""
     L2-norm reduction over one logical axis (a :class:`Reduce`).
 
-    :Math: ``dim=1``: :math:`\text{out}[n,0,d_1]=\sqrt{\sum_{d_0}X[n,d_0,d_1]^2}`;
-        ``dim=2``: :math:`\text{out}[n,d_0,0]=\sqrt{\sum_{d_1}X[n,d_0,d_1]^2}`.
+    :Math:
+        .. math::
+
+            Y_{n,0,d} = \Big(\sum_{i=0}^{D_0-1} X_{n,i,d}^2\Big)^{1/2}\ \ (\text{dim}=1),
+            \qquad
+            Y_{n,d,0} = \Big(\sum_{j=0}^{D_1-1} X_{n,d,j}^2\Big)^{1/2}\ \ (\text{dim}=2).
     :__init__: ``L2Norm(dim=1)`` — axis to reduce (``1`` → :math:`D_0`,
         ``2`` → :math:`D_1`).
     :__call__: ``y = op(x, ctx=ctx)`` — ``[N, D_0, D_1]`` → ``[N, 1, D_1]``
@@ -165,8 +185,12 @@ class Sum(Reduce):
     r"""
     Sum reduction over one logical axis (a :class:`Reduce`).
 
-    :Math: ``dim=1``: :math:`\text{out}[n,0,d_1]=\sum_{d_0}X[n,d_0,d_1]`;
-        ``dim=2``: :math:`\text{out}[n,d_0,0]=\sum_{d_1}X[n,d_0,d_1]`.
+    :Math:
+        .. math::
+
+            Y_{n,0,d} = \sum_{i=0}^{D_0-1} X_{n,i,d}\ \ (\text{dim}=1),
+            \qquad
+            Y_{n,d,0} = \sum_{j=0}^{D_1-1} X_{n,d,j}\ \ (\text{dim}=2).
     :__init__: ``Sum(dim=1)`` — axis to reduce (``1`` → :math:`D_0`,
         ``2`` → :math:`D_1`).
     :__call__: ``y = op(x, ctx=ctx)`` — ``[N, D_0, D_1]`` → ``[N, 1, D_1]``
