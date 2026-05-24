@@ -76,39 +76,51 @@ Note: Some operators are not yet fused or fully optimized, which may lead to inc
 ## 🧩 Quick Example: Custom Sparse Attention
 
 ```python
+from typing import Dict
+import torch
+
+from vortex_torch.flow import vFlow, register
+from vortex_torch.indexer import GeMM, Mean, topK
+from vortex_torch.cache import Mean as CMean
+from vortex_torch.abs import ContextBase
+
+
 @register("custom_sparse_attention")
 class CustomSparseAttention(vFlow):
 
     def __init__(self):
         super().__init__()
-        # Indexer-side ops
-        self.gemv = GeMV()
-        self.output_func = topK()
+        # Indexer-side ops (run every decode step)
+        self.mean = Mean(dim=1)        # average over the query heads
+        self.gemm = GeMM()             # GeMM(x, y) = y @ xᵀ
+        self.output_func = topK()      # must end in topK / approxTopK
 
-        # Cache-side ops
-        self.reduction = CMean(dim=1)
+        # Cache-side ops (run once per finished page)
+        self.reduction = CMean(dim=1)  # one centroid (mean key) per page
 
     def forward_indexer(
         self,
-        q: torch.Tensor,                 # viewed as [1, H_q, D]
+        q: torch.Tensor,                 # viewed as [B, H_q, D]
         o: torch.Tensor,
-        cache: Dict[str, torch.Tensor],  # viewed as [S, r, c] depending on create_cache()
+        cache: Dict[str, torch.Tensor],  # viewed as [S, r, c] per create_cache()
         ctx: ContextBase,
     ):
-        q_mean = q.mean(dim=1, keepdim=True)
-        score = self.gemv(q_mean, cache["centroids"], ctx=ctx)
-        self.output_func(score, o, ctx=ctx)
+        # No native torch ops here — every tensor flows through vortex ops.
+        q_mean = self.mean(q, ctx=ctx)                          # [B, 1, D]
+        score = self.gemm(q_mean, cache["centroids"], ctx=ctx)  # [S, 1, 1]
+        self.output_func(score, o, ctx=ctx)                     # selected pages -> o
 
     def forward_cache(
         self,
-        cache: Dict[str, torch.Tensor],  # viewed as [B, r, c] depending on create_cache()
+        cache: Dict[str, torch.Tensor],  # viewed as [B, r, c] per create_cache()
         loc: torch.Tensor,
         ctx: ContextBase,
     ):
         # triggered only when a page is finished
         self.reduction(cache["k"], cache["centroids"], loc=loc, ctx=ctx)
 
-    def create_cache(self, page_size: int, head_dim: int):
+    def create_cache(self, block_size: int, head_dim: int):
+        # "k" and "v" are provided automatically — do not declare them
         return {
             "centroids": (1, head_dim),
         }
@@ -127,8 +139,8 @@ llm = sgl.Engine(
     disable_overlap_schedule=True,    # Mandatory
     attention_backend="flashinfer",   # Mandatory
     enable_vortex_sparsity=True,      # Otherwise full attention is used
-    vortex_page_reserved_bos=1,
-    vortex_page_reserved_eos=1,
+    vortex_block_reserved_bos=1,
+    vortex_block_reserved_eos=1,
     vortex_layers_skip=list(range(1)),  # Full attention for layer 0
     vortex_module_path="path/to/custom_sparse_attention.py",
     vortex_module_name="custom_sparse_attention", # the registered name for your algorithm
