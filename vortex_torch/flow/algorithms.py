@@ -20,86 +20,38 @@ from .registry import register
 @register("block_sparse_attention")
 class BlockSparseAttention(vFlow):
     r"""
-    Block-sparse attention flow with centroid-based routing.
+    Block-sparse routing by **key-centroid** similarity.
 
-    This flow implements a simple **block-sparse routing** strategy
-    inspired by the block-top-k routing used in Kinetics
-    [sadhukhan2025kinetics]_ (arXiv:2506.05333). It maintains a
-    per-request centroid over keys and uses query–centroid similarity to
-    select a sparse set of pages.
+    Keep one centroid per page (the mean of its keys) and select the pages
+    whose centroid best aligns with the query — the block-top-:math:`k` idea
+    from Kinetics [sadhukhan2025kinetics]_ (arXiv:2506.05333).
 
-    High-level behavior
-    -------------------
-    - During :meth:`forward_cache`, the flow computes a **centroid**
-      vector for each request from its key cache ``cache["k"]`` and
-      stores the result in ``cache["centroids"]`` with shape
+    **Cache.** :meth:`forward_cache` stores one centroid per page with
+    :class:`CMean`:
 
-      .. math::
+    .. math::
 
-          \text{cache["centroids"]} \in \mathbb{R}^{B \times 1 \times D},
+        c_p \;=\; \frac{1}{|p|} \sum_{k \in p} k \;\in\; \mathbb{R}^{D}.
 
-      where :math:`B` is the number of requests and :math:`D` is the
-      head dimension.
+    **Routing.** With the query summary
+    :math:`\bar q = \tfrac{1}{H_q}\sum_{h} q_h`, :meth:`forward_indexer`
+    scores each page by the centroid dot product and keeps the highest with
+    :class:`topK`:
 
-    - During :meth:`forward_indexer`, the flow:
-      
-      1. Averages query tokens per request to obtain a single
-         **query summary** per request,
-      2. Applies a generalized matrix–vector multiplication
-         :class:`GeMV` between the query summaries and the cached
-         centroids to obtain a scalar **score** for each (request, page),
-      3. Uses :class:`topK` to convert these scores into sparse page
-         indices ``o`` of shape
+    .. math::
 
-         .. math::
+        \operatorname{score}(p) \;=\; \langle \bar q,\; c_p \rangle.
 
-             o \in \mathbb{R}^{S \times 1 \times 1},
-
-         Here :math:`S` is the leading page axis. Internally it is a packed
-         axis (often denoted :math:`S_{\mathrm{pack}}`), obtained by
-         concatenating the pages from all requests. As a user, you can simply
-         think of :math:`S` as "the number of pages for this request"; the
-         vFlow kernels and :class:`ContextBase` will take care of mapping
-         between per-request page counts and the packed layout automatically.
-
-    Cache layout
-    ------------
-    This flow declares a single extra cache tensor via
-    :meth:`create_cache`:
-
-    .. code-block:: python
-
-        {
-            "centroids": (1, head_dim)
-        }
-
-    The runtime then also allocates ``"k"`` and ``"v"`` with inner shapes
-    ``(page_size, head_dim)``. As per the :class:`vFlow` contract,
-    each cache tensor has two logical views:
-
-    - In :meth:`forward_indexer` (page-packed view):
-
-      .. math::
-
-          \text{cache["centroids"]} \sim
-          \mathbb{R}^{S \times 1 \times D},
-
-    - In :meth:`forward_cache` (batch-major view):
-
-      .. math::
-
-          \text{cache["centroids"]} \sim
-          \mathbb{R}^{B \times 1 \times D}.
+    **Shapes.** ``q`` is ``[B, H_q, D]``; ``cache["centroids"]`` is
+    ``[S, 1, D]`` in the indexer (page-packed, :math:`S` = packed page axis)
+    and ``[B, 1, D]`` in the cache (batch-major).
 
     References
     ----------
-    .. rubric:: Bibliography
-
     .. [sadhukhan2025kinetics]
        Ranajoy Sadhukhan, Zhuoming Chen, Haizhong Zheng, Yang Zhou,
        Emma Strubell, Beidi Chen.
-       *Kinetics: Rethinking Test-Time Scaling Laws*.
-       arXiv:2506.05333, 2025.
+       *Kinetics: Rethinking Test-Time Scaling Laws*. arXiv:2506.05333, 2025.
     """
 
     def __init__(self):
@@ -119,53 +71,9 @@ class BlockSparseAttention(vFlow):
         cache: Dict[str, torch.Tensor],
         ctx: ContextBase,
     ):
-        r"""
-        Compute sparse page indices from queries and cached centroids.
-
-        Parameters
-        ----------
-        q : torch.Tensor
-            Query tensor with shape ``[B, H_q, D]`` (typically
-            :class:`torch.bfloat16`), where :math:`B` is the batch–head
-            axis, :math:`H_q` is the number of query positions per
-            request, and :math:`D` is the head dimension.
-
-        o : torch.Tensor
-            Output tensor for sparse page indices with shape
-            ``[S_sparse, 1, 1]`` and integer dtype. It is filled
-            in-place by :class:`topK` according to the scores computed
-            by :class:`GeMV`.
-
-        cache : Dict[str, torch.Tensor]
-            Cache dictionary in the **indexer view**, where:
-
-            - ``cache["k"]`` and ``cache["v"]`` are page-packed key/value
-              tensors,
-            - ``cache["centroids"]`` is interpreted as
-              ``[S, 1, D]`` (page-packed centroids).
-
-        ctx : ContextBase
-            Runtime context carrying page layout, top-k configuration
-            (``topk_val``, ``page_reserved_bos``, ``page_reserved_eos``),
-            and other metadata.
-
-        Notes
-        -----
-        The implementation:
-
-        1. Computes a per-request query summary
-
-           .. math::
-
-              q_{\mathrm{mean}}[b, 0, :]
-              = \frac{1}{H_q} \sum_{h=0}^{H_q-1} q[b, h, :],
-
-        2. Applies :class:`GeMV` between ``q_mean`` and
-           ``cache["centroids"]`` to obtain scalar scores per page,
-        3. Uses :class:`topK` to select a sparse set of pages per request
-           and write the corresponding indices into ``o`` in the packed
-           sparse layout.
-        """
+        r"""Score each page from ``q`` and the cached state, then write the selected
+        page indices into ``o`` (ends in :class:`topK`). See the class docstring
+        for the scoring math."""
         q_mean = self.mean(q, ctx=ctx)
         score = self.gemm(q_mean, cache["centroids"], ctx=ctx)
         self.output_func(score, o, ctx=ctx)
@@ -176,61 +84,14 @@ class BlockSparseAttention(vFlow):
         loc: torch.Tensor,
         ctx: ContextBase,
     ):
-        r"""
-        Update cache centroids from the key cache in batch-major view.
-
-        Parameters
-        ----------
-        cache : Dict[str, torch.Tensor]
-            Cache dictionary in the **batch-major view**, where:
-
-            - ``cache["k"]`` has shape ``[B, page_size, D]``,
-            - ``cache["centroids"]`` has shape ``[B, 1, D]``.
-
-        loc : torch.Tensor
-            Positional or layout metadata used by :class:`CMean` to
-            aggregate keys into centroids (e.g. page boundaries or valid
-            token masks).
-
-        ctx : ContextBase
-            Runtime context forwarded to the reduction op.
-
-        Notes
-        -----
-        This method calls :class:`CMean` with ``dim=1`` so that for each
-        request :math:`b` it computes a mean over the key axis and writes
-        it to ``cache["centroids"][b, 0, :]``. The exact handling of
-        padding or invalid positions is controlled by ``loc`` and the
-        backend implementation of :class:`CMean`.
-        """
+        r"""Refresh this flow's per-page cache state from the freshly written keys /
+        values. See the class docstring for the formulas."""
         self.reduction(cache["k"], cache["centroids"], loc=loc, ctx=ctx)
 
     def create_cache(self, block_size: int, head_dim: int):
-        r"""
-        Declare inner shapes for custom cache tensors.
-
-        Parameters
-        ----------
-        page_size : int
-            Number of tokens per page (unused here but part of the
-            generic vFlow contract).
-
-        head_dim : int
-            Head dimension :math:`D`. Used as the second dimension of
-            the centroid tensor.
-
-        Returns
-        -------
-        Dict[str, Tuple[int, int]]
-            Mapping from cache tensor names to inner shapes ``(r, c)``.
-            This flow defines a single extra tensor:
-
-            - ``"centroids"`` with inner shape ``(1, head_dim)``, which
-              becomes
-
-              - ``[S, 1, head_dim]`` in :meth:`forward_indexer`,
-              - ``[B, 1, head_dim]`` in :meth:`forward_cache`.
-        """
+        r"""Declare this flow's per-page cache tensors; ``"k"`` and ``"v"`` are added
+        automatically. ``block_size`` is the per-block token count, ``head_dim``
+        the head dimension. See the class docstring."""
         return {
             "centroids": (1, head_dim),
         }
@@ -239,30 +100,30 @@ class BlockSparseAttention(vFlow):
 @register("gqa_block_sparse_attention")
 class GQABlockSparseAttention(vFlow):
     r"""
-    Grouped-query block-sparse attention flow.
+    Grouped-query block-sparse routing with a **softmax over pages**.
 
-    This flow uses a GQA-style block-sparse routing: queries are grouped,
-    scored against per-request centroids, normalized with a softmax, then
-    aggregated across groups before a top-k over pages is applied.
+    Like :class:`BlockSparseAttention` it scores pages by query–centroid
+    similarity, but keeps every grouped-query head separate: each head turns
+    its per-page scores into a softmax distribution over pages, and a page's
+    final score is the **max** of that probability across heads. (Design akin
+    to the GQA sparse-attention formulation in arXiv:2502.11089.)
 
-    - Queries ``q`` have shape ``[B, H_q, D]``.
-    - Centroids cache ``cache["centroids"]`` has inner shape
-      ``(1, head_dim)`` and is viewed as:
+    **Cache.** Per-page centroid :math:`c_p = \frac{1}{|p|}\sum_{k\in p} k`
+    via :class:`CMean`.
 
-      - ``[S, 1, D]`` in :meth:`forward_indexer`,
-      - ``[B, 1, D]`` in :meth:`forward_cache`.
+    **Routing.** For grouped-query head :math:`q_h` and page :math:`p`, with
+    temperature :math:`\tau = 0.09 \approx 1/\sqrt{D}`,
 
-      Here :math:`S` is the leading page axis. Internally it is a packed
-      axis (often denoted :math:`S_{\mathrm{pack}}`), obtained by
-      concatenating the pages from all requests. As a user, you can simply
-      think of :math:`S` as "the number of pages for this request"; the
-      vFlow kernels and :class:`ContextBase` will take care of mapping
-      between per-request page counts and the packed layout automatically.
-      
-    For a design similar in spirit to grouped-query block sparsity, see
-    the GQA sparse attention formulation in:
+    .. math::
 
-    - https://arxiv.org/abs/2502.11089
+        a_{p,h} = \operatorname{softmax}_{p}\!\big(\tau\,\langle q_h, c_p\rangle\big),
+        \qquad
+        \operatorname{score}(p) = \max_{h} a_{p,h},
+
+    then :class:`topK` keeps the highest-scoring pages.
+
+    **Shapes.** ``q`` is ``[B, H_q, D]``; ``cache["centroids"]`` is
+    ``[S, 1, D]`` (indexer) / ``[B, 1, D]`` (cache).
     """
 
     def __init__(self):
@@ -283,30 +144,9 @@ class GQABlockSparseAttention(vFlow):
         cache: Dict[str, torch.Tensor],
         ctx: ContextBase,
     ):
-        r"""
-        Compute sparse page indices from grouped-query scores.
-
-        Pipeline
-        --------
-        1. Apply :class:`GeMM` between queries and centroids (o = yx^t):
-
-           - ``q``: ``[B, H_q, D]``
-           - ``cache["centroids"]`` (indexer view): ``[S, 1, D]``
-           - ``score``: ``[S, 1, H_q]`` (logical ``[S, Ny, Nx]``)
-
-        2. Apply in-place softmax over the leading (page) axis with a
-           scaling factor ``scale``:
-
-           .. math::
-              \mathrm{softmax}(x \cdot \mathrm{scale})
-
-        3. Aggregate over the query-group dimension with :class:`Max`
-           (``dim=2``), yielding a single scalar score per page.
-
-        4. Use :class:`topK` on the aggregated scores to write packed
-           sparse page indices into ``o`` with shape
-           ``[S_sparse, 1, 1]``.
-        """
+        r"""Score each page from ``q`` and the cached state, then write the selected
+        page indices into ``o`` (ends in :class:`topK`). See the class docstring
+        for the scoring math."""
         score = self.gemm(q, cache["centroids"], ctx=ctx)
         normalized_score = self.softmax(score, ctx=ctx)
         aggr_score = self.max_op(normalized_score, ctx=ctx)
@@ -318,37 +158,14 @@ class GQABlockSparseAttention(vFlow):
         loc: torch.Tensor,
         ctx: ContextBase,
     ):
-        r"""
-        Update per-request centroids from the key cache.
-
-        - ``cache["k"]``: ``[B, page_size, D]`` (batch-major view)
-        - ``cache["centroids"]``: ``[B, 1, D]``
-
-        The :class:`CMean` operator with ``dim=1`` computes a mean over
-        the key axis (optionally masked/structured via ``loc``) and
-        writes the result into ``cache["centroids"]`` in-place.
-        """
+        r"""Refresh this flow's per-page cache state from the freshly written keys /
+        values. See the class docstring for the formulas."""
         self.reduction(cache["k"], cache["centroids"], loc=loc, ctx=ctx)
 
     def create_cache(self, block_size: int, head_dim: int):
-        r"""
-        Declare inner shapes for custom cache tensors.
-
-        Parameters
-        ----------
-        page_size : int
-            Number of tokens per page (not used directly here).
-
-        head_dim : int
-            Head dimension ``D`` for centroids.
-
-        Returns
-        -------
-        Dict[str, Tuple[int, int]]
-            Custom cache metadata. This flow defines:
-
-            - ``"centroids"``: inner shape ``(1, head_dim)``.
-        """
+        r"""Declare this flow's per-page cache tensors; ``"k"`` and ``"v"`` are added
+        automatically. ``block_size`` is the per-block token count, ``head_dim``
+        the head dimension. See the class docstring."""
         return {
             "centroids": (1, head_dim),
         }
@@ -365,38 +182,28 @@ class GQAQuestSparseAttention(vFlow):
     it maintains per-page **max** and **min** envelopes of keys and uses
     them to compute a conservative upper bound on query–key similarity.
 
-    Shapes
-    ------
-    - Queries ``q``: ``[B, H_q, D]`` (typically bfloat16).
-    - Cache entries (inner shapes as declared in :meth:`create_cache`):
+    **Cache.** :meth:`forward_cache` stores, per page :math:`p`, the
+    coordinate-wise envelopes via :class:`CMax` / :class:`CMin`:
 
-      - ``cache["max"]`` and ``cache["min"]``: ``(1, head_dim)``
-        → viewed as
+    .. math::
 
-        - ``[S, 1, D]`` in :meth:`forward_indexer`,
-        - ``[B, 1, D]`` in :meth:`forward_cache`.
+        M_p = \max_{k\in p} k, \qquad m_p = \min_{k\in p} k \;\in\; \mathbb{R}^{D}.
 
-      - ``cache["k"]``: standard key cache with inner shape
-        ``(page_size, head_dim)``.
+    **Routing.** For each grouped-query head :math:`q_h` the QUEST bound takes,
+    per coordinate, the larger of the two signed products, sums over features,
+    and finally maxes over heads:
 
-      Here :math:`S` is the leading page axis. Internally it is a packed
-      axis (often denoted :math:`S_{\mathrm{pack}}`), obtained by
-      concatenating the pages from all requests. As a user, you can simply
-      think of :math:`S` as "the number of pages for this request"; the
-      vFlow kernels and :class:`ContextBase` will take care of mapping
-      between per-request page counts and the packed layout automatically.
-      
-    Routing intuition
-    -----------------
-    For each query and page envelope:
+    .. math::
 
-    1. Compute elementwise products with the **max** and **min** envelopes.
-    2. Take an elementwise maximum of these two products to form a
-       QUEST-style upper bound.
-    3. Sum over the feature dimension and then take a max over the
-       grouped-query axis to get a single scalar score per page.
-    4. Feed the resulting per-page scores into :class:`topK` to obtain
-       sparse page indices.
+        \operatorname{score}(p)
+        = \max_{h} \sum_{d=1}^{D}
+          \max\!\big(q_{h,d}\,M_{p,d},\; q_{h,d}\,m_{p,d}\big),
+
+    then :class:`topK` keeps the highest-scoring pages.
+
+    **Shapes.** ``q`` is ``[B, H_q, D]``; ``cache["max"]`` and ``cache["min"]``
+    are ``[S, 1, D]`` in the indexer (page-packed) and ``[B, 1, D]`` in the
+    cache (batch-major).
     """
 
     def __init__(self):
@@ -421,27 +228,9 @@ class GQAQuestSparseAttention(vFlow):
         cache: Dict[str, torch.Tensor],
         ctx: ContextBase,
     ):
-        r"""
-        Compute sparse page indices using QUEST-style envelope scores.
-
-        Pipeline (indexer view)
-        -----------------------
-        Let:
-
-        - ``q``: ``[B, H_q, D]``
-        - ``cache["max"]``: ``[S, 1, D]``
-        - ``cache["min"]``: ``[S, 1, D]``
-
-        Steps:
-
-        1. ``s_max = q * max_envelope``
-        2. ``s_min = q * min_envelope``
-        3. ``s = max(s_max, s_min)`` (elementwise)
-        4. ``score = sum(s, dim=D)`` → ``[S, H_q, 1]``
-        5. ``aggr_score = max(score, dim=H_q)`` → per-page scalar
-        6. :class:`topK` converts ``aggr_score`` into sparse page
-           indices ``o`` of shape ``[S_sparse, 1, 1]``.
-        """
+        r"""Score each page from ``q`` and the cached state, then write the selected
+        page indices into ``o`` (ends in :class:`topK`). See the class docstring
+        for the scoring math."""
         s_max = self.mul_max(q, cache["max"], ctx=ctx)
         s_min = self.mul_min(q, cache["min"], ctx=ctx)
         s = self.maximum_op(s_max, s_min, ctx=ctx)
@@ -455,43 +244,15 @@ class GQAQuestSparseAttention(vFlow):
         loc: torch.Tensor,
         ctx: ContextBase,
     ):
-        r"""
-        Update per-page max/min envelopes from the key cache.
-
-        Cache-update view
-        -----------------
-        - ``cache["k"]``: ``[B, page_size, D]``
-        - ``cache["max"]``: ``[B, 1, D]``
-        - ``cache["min"]``: ``[B, 1, D]``
-
-        The :class:`CMax` and :class:`CMin` ops (with ``dim=1``) take
-        page-wise maxima and minima over keys (optionally masked/structured
-        via ``loc``) and write the envelopes into ``cache["max"]`` and
-        ``cache["min"]``.
-        """
+        r"""Refresh this flow's per-page cache state from the freshly written keys /
+        values. See the class docstring for the formulas."""
         self.reduction_max(cache["k"], cache["max"], loc=loc, ctx=ctx)
         self.reduction_min(cache["k"], cache["min"], loc=loc, ctx=ctx)
 
     def create_cache(self, block_size: int, head_dim: int):
-        r"""
-        Declare inner shapes for custom cache tensors.
-
-        Parameters
-        ----------
-        page_size : int
-            Number of tokens per page (unused here but part of the vFlow contract).
-
-        head_dim : int
-            Head dimension ``D`` used by the envelopes.
-
-        Returns
-        -------
-        Dict[str, Tuple[int, int]]
-            Custom cache metadata:
-
-            - ``"max"``: inner shape ``(1, head_dim)``
-            - ``"min"``: inner shape ``(1, head_dim)``
-        """
+        r"""Declare this flow's per-page cache tensors; ``"k"`` and ``"v"`` are added
+        automatically. ``block_size`` is the per-block token count, ``head_dim``
+        the head dimension. See the class docstring."""
         return {
             "max": (1, head_dim),
             "min": (1, head_dim),
@@ -502,45 +263,39 @@ class GQAQuestSparseAttention(vFlow):
 @register("lserve_sparse_attention")
 class LServeSparseAttention(vFlow):
     r"""
-    GQA-style QUEST sparse attention flow.
+    LSERVE: QUEST envelopes at **sub-block** granularity.
 
-    This flow uses **query–envelope matching** similar to QUEST sparse
-    attention (see https://arxiv.org/abs/2406.10774). For each request,
-    it maintains per-page **max** and **min** envelopes of keys and uses
-    them to compute a conservative upper bound on query–key similarity.
+    Sharpens :class:`GQAQuestSparseAttention` by splitting each page into
+    consecutive sub-blocks of :attr:`LSERVE_BLOCK_SIZE` tokens and keeping a
+    separate max/min envelope **per sub-block**. A page is ranked by its
+    single best-matching (head, sub-block) pair, so one relevant sub-region is
+    enough to select the page — a tighter bound than one envelope per page.
 
-    Shapes
-    ------
-    - Queries ``q``: ``[B, H_q, D]`` (typically bfloat16).
-    - Cache entries (inner shapes as declared in :meth:`create_cache`):
+    **Cache.** :meth:`forward_cache` stores, for each of the
+    :math:`n_b = \text{block\_size} / \text{LSERVE\_BLOCK\_SIZE}` sub-blocks
+    :math:`b` of page :math:`p`, coordinate-wise envelopes via
+    :class:`CMaxInterleave` / :class:`CMinInterleave`:
 
-      - ``cache["max"]`` and ``cache["min"]``: ``(1, head_dim)``
-        → viewed as
+    .. math::
 
-        - ``[S, 1, D]`` in :meth:`forward_indexer`,
-        - ``[B, 1, D]`` in :meth:`forward_cache`.
+        M_{p,b} = \max_{k\in b} k, \qquad m_{p,b} = \min_{k\in b} k.
 
-      - ``cache["k"]``: standard key cache with inner shape
-        ``(page_size, head_dim)``.
+    **Routing.** Query heads are combined with the sub-block envelopes via
+    :class:`Kron`, and the QUEST bound is maximized over both heads and
+    sub-blocks:
 
-      Here :math:`S` is the leading page axis. Internally it is a packed
-      axis (often denoted :math:`S_{\mathrm{pack}}`), obtained by
-      concatenating the pages from all requests. As a user, you can simply
-      think of :math:`S` as "the number of pages for this request"; the
-      vFlow kernels and :class:`ContextBase` will take care of mapping
-      between per-request page counts and the packed layout automatically.
-      
-    Routing intuition
-    -----------------
-    For each query and page envelope:
+    .. math::
 
-    1. Compute elementwise products with the **max** and **min** envelopes.
-    2. Take an elementwise maximum of these two products to form a
-       QUEST-style upper bound.
-    3. Sum over the feature dimension and then take a max over the
-       grouped-query axis to get a single scalar score per page.
-    4. Feed the resulting per-page scores into :class:`topK` to obtain
-       sparse page indices.
+        \operatorname{score}(p)
+        = \max_{h,\,b} \sum_{d=1}^{D}
+          \max\!\big(q_{h,d}\,M_{p,b,d},\; q_{h,d}\,m_{p,b,d}\big),
+
+    then :class:`topK` keeps the highest pages.
+
+    **Shapes.** ``q`` is ``[B, H_q, D]``; ``cache["max"]`` / ``cache["min"]``
+    are ``[S, n_b, D]`` (indexer) / ``[B, n_b, D]`` (cache). With
+    ``block_size == LSERVE_BLOCK_SIZE`` (:math:`n_b = 1`) this reduces to
+    :class:`GQAQuestSparseAttention`.
     """
     LSERVE_BLOCK_SIZE = 16
     def __init__(self):
@@ -565,27 +320,9 @@ class LServeSparseAttention(vFlow):
         cache: Dict[str, torch.Tensor],
         ctx: ContextBase,
     ):
-        r"""
-        Compute sparse page indices using QUEST-style envelope scores.
-
-        Pipeline (indexer view)
-        -----------------------
-        Let:
-
-        - ``q``: ``[B, H_q, D]``
-        - ``cache["max"]``: ``[S, b//k, D]``
-        - ``cache["min"]``: ``[S, b//k, D]``
-
-        Steps:
-
-        1. ``s_max = q * max_envelope``
-        2. ``s_min = q * min_envelope``
-        3. ``s = max(s_max, s_min)`` (elementwise)
-        4. ``score = sum(s, dim=D)`` → ``[S, H_q, 1]``
-        5. ``aggr_score = max(score, dim=H_q)`` → per-page scalar
-        6. :class:`topK` converts ``aggr_score`` into sparse page
-           indices ``o`` of shape ``[S_sparse, 1, 1]``.
-        """
+        r"""Score each page from ``q`` and the cached state, then write the selected
+        page indices into ``o`` (ends in :class:`topK`). See the class docstring
+        for the scoring math."""
         s_max = self.mul_max(q, cache["max"], ctx=ctx)
         s_min = self.mul_min(q, cache["min"], ctx=ctx)
         s = self.maximum_op(s_max, s_min, ctx=ctx)
@@ -599,43 +336,15 @@ class LServeSparseAttention(vFlow):
         loc: torch.Tensor,
         ctx: ContextBase,
     ):
-        r"""
-        Update per-page max/min envelopes from the key cache.
-
-        Cache-update view
-        -----------------
-        - ``cache["k"]``: ``[B, page_size, D]``
-        - ``cache["max"]``: ``[B, 1, D]``
-        - ``cache["min"]``: ``[B, 1, D]``
-
-        The :class:`CMax` and :class:`CMin` ops (with ``dim=1``) take
-        page-wise maxima and minima over keys (optionally masked/structured
-        via ``loc``) and write the envelopes into ``cache["max"]`` and
-        ``cache["min"]``.
-        """
+        r"""Refresh this flow's per-page cache state from the freshly written keys /
+        values. See the class docstring for the formulas."""
         self.reduction_max(cache["k"], cache["max"], loc=loc, ctx=ctx)
         self.reduction_min(cache["k"], cache["min"], loc=loc, ctx=ctx)
 
     def create_cache(self, block_size: int, head_dim: int):
-        r"""
-        Declare inner shapes for custom cache tensors.
-
-        Parameters
-        ----------
-        page_size : int
-            Number of tokens per page (unused here but part of the vFlow contract).
-
-        head_dim : int
-            Head dimension ``D`` used by the envelopes.
-
-        Returns
-        -------
-        Dict[str, Tuple[int, int]]
-            Custom cache metadata:
-
-            - ``"max"``: inner shape ``(1, head_dim)``
-            - ``"min"``: inner shape ``(1, head_dim)``
-        """
+        r"""Declare this flow's per-page cache tensors; ``"k"`` and ``"v"`` are added
+        automatically. ``block_size`` is the per-block token count, ``head_dim``
+        the head dimension. See the class docstring."""
         return {
             "max": (block_size // self.LSERVE_BLOCK_SIZE, head_dim),
             "min": (block_size // self.LSERVE_BLOCK_SIZE, head_dim),
@@ -645,41 +354,34 @@ class LServeSparseAttention(vFlow):
 @register("lserve_centroid_sparse_attention")
 class LServeCentroidSparseAttention(vFlow):
     r"""
-    Centroid block-sparse routing at LSERVE sub-block granularity.
+    Centroid routing at LSERVE **sub-block** granularity.
 
-    This flow keeps the **centroid** routing of
-    :class:`BlockSparseAttention` — a page is scored by the dot product
-    between a query summary and a *mean* key vector — but borrows the
-    sub-block granularity idea of :class:`LServeSparseAttention`. Rather
-    than collapsing a whole page into a single centroid, the page is
-    split into consecutive sub-blocks of :attr:`SUB_BLOCK_SIZE` tokens
-    and a separate centroid is stored per sub-block. The page score is
-    the **max** over its sub-block centroids, so a page is selected when
-    *any* of its sub-regions matches the query — the same "finest-grained
-    statistic, then max" intuition LSERVE applies to min/max envelopes,
-    here applied to means.
+    Combines :class:`BlockSparseAttention`'s centroid routing with the
+    sub-block idea of :class:`LServeSparseAttention`: each page is split into
+    consecutive sub-blocks of :attr:`SUB_BLOCK_SIZE` tokens, a centroid is
+    kept **per sub-block**, and a page is ranked by its best-matching
+    sub-block — finer than collapsing the whole page into one centroid.
 
-    Shapes
-    ------
-    - Queries ``q``: ``[B, H_q, D]`` (typically bfloat16).
-    - ``cache["centroids"]``: inner shape ``(block_size // SUB_BLOCK_SIZE, head_dim)``
-      → viewed as ``[S, n_sub, D]`` in :meth:`forward_indexer` and
-      ``[B, n_sub, D]`` in :meth:`forward_cache`, where
-      ``n_sub = block_size // SUB_BLOCK_SIZE`` is the number of
-      sub-blocks per page.
-    - ``cache["k"]``: standard key cache, inner shape ``(page_size, head_dim)``.
+    **Cache.** :meth:`forward_cache` stores, for each of the
+    :math:`n_b = \text{block\_size} / \text{SUB\_BLOCK\_SIZE}` sub-blocks
+    :math:`b` of page :math:`p`, a centroid via :class:`CMeanInterleave`:
 
-    Routing intuition
-    -----------------
-    1. Average the query over the grouped-query heads → one summary
-       vector per request.
-    2. Dot the query summary against every sub-block centroid → one
-       score per (page, sub-block).
-    3. Take the max over sub-blocks → a single per-page score.
-    4. Feed per-page scores into :class:`topK` for sparse page indices.
+    .. math::
 
-    When ``block_size == SUB_BLOCK_SIZE`` there is exactly one sub-block
-    per page and this reduces identically to
+        c_{p,b} = \frac{1}{|b|} \sum_{k\in b} k.
+
+    **Routing.** With the query summary
+    :math:`\bar q = \frac{1}{H_q}\sum_h q_h`,
+
+    .. math::
+
+        \operatorname{score}(p) = \max_{b}\, \langle \bar q,\; c_{p,b} \rangle,
+
+    then :class:`topK` keeps the highest pages.
+
+    **Shapes.** ``q`` is ``[B, H_q, D]``; ``cache["centroids"]`` is
+    ``[S, n_b, D]`` (indexer) / ``[B, n_b, D]`` (cache). With
+    ``block_size == SUB_BLOCK_SIZE`` (:math:`n_b = 1`) this reduces to
     :class:`BlockSparseAttention`.
     """
     SUB_BLOCK_SIZE = 16
@@ -703,23 +405,9 @@ class LServeCentroidSparseAttention(vFlow):
         cache: Dict[str, torch.Tensor],
         ctx: ContextBase,
     ):
-        r"""
-        Compute sparse page indices from sub-block centroid scores.
-
-        Pipeline (indexer view)
-        -----------------------
-        - ``q``: ``[B, H_q, D]``
-        - ``cache["centroids"]``: ``[S, n_sub, D]``
-
-        Steps:
-
-        1. ``q_summary = mean(q, dim=H_q)`` → ``[B, 1, D]``
-        2. ``score = GeMM(q_summary, centroids)`` → ``[S, n_sub, 1]``
-           (per sub-block dot product, since ``GeMM(x, y) = y x^t``)
-        3. ``page_score = max(score, dim=n_sub)`` → ``[S, 1, 1]``
-        4. :class:`topK` converts ``page_score`` into sparse page
-           indices ``o`` of shape ``[S_sparse, 1, 1]``.
-        """
+        r"""Score each page from ``q`` and the cached state, then write the selected
+        page indices into ``o`` (ends in :class:`topK`). See the class docstring
+        for the scoring math."""
         q_summary = self.mean(q, ctx=ctx)
         score = self.gemm(q_summary, cache["centroids"], ctx=ctx)
         page_score = self.max_sub(score, ctx=ctx)
@@ -731,31 +419,14 @@ class LServeCentroidSparseAttention(vFlow):
         loc: torch.Tensor,
         ctx: ContextBase,
     ):
-        r"""
-        Update per-sub-block centroids from the key cache.
-
-        Cache-update view
-        -----------------
-        - ``cache["k"]``: ``[B, page_size, D]``
-        - ``cache["centroids"]``: ``[B, n_sub, D]``
-
-        :class:`CMeanInterleave` (``dim=1``, ``k=SUB_BLOCK_SIZE``) takes a
-        grouped mean over consecutive groups of ``SUB_BLOCK_SIZE`` keys,
-        writing one centroid per sub-block.
-        """
+        r"""Refresh this flow's per-page cache state from the freshly written keys /
+        values. See the class docstring for the formulas."""
         self.reduction(cache["k"], cache["centroids"], loc=loc, ctx=ctx)
 
     def create_cache(self, block_size: int, head_dim: int):
-        r"""
-        Declare inner shapes for custom cache tensors.
-
-        Returns
-        -------
-        Dict[str, Tuple[int, int]]
-            - ``"centroids"``: inner shape
-              ``(block_size // SUB_BLOCK_SIZE, head_dim)`` — one centroid
-              per sub-block of the page.
-        """
+        r"""Declare this flow's per-page cache tensors; ``"k"`` and ``"v"`` are added
+        automatically. ``block_size`` is the per-block token count, ``head_dim``
+        the head dimension. See the class docstring."""
         return {
             "centroids": (block_size // self.SUB_BLOCK_SIZE, head_dim),
         }
@@ -764,31 +435,33 @@ class LServeCentroidSparseAttention(vFlow):
 @register("masked_quest_sparse_attention")
 class MaskedQuestSparseAttention(vFlow):
     r"""
-    QUEST-style sparse attention with a feature-axis :class:`MaskSlice`.
+    QUEST routing with a feature-axis mask that drops low-signal channels.
 
-    Identical to :class:`GQAQuestSparseAttention` in its routing logic,
-    but before summing over the feature dimension it multiplies the
-    envelope tensor by a position-dependent mask built with
-    :class:`MaskSlice`:
+    Identical to :class:`GQAQuestSparseAttention`, but a :class:`MaskSlice`
+    zeroes the leading ``MASK_END`` feature coordinates of the QUEST bound
+    before the feature sum — a cheap, position-only way to exclude
+    low-signal channels (e.g. large-magnitude "sink" dimensions). Since
+    :class:`MaskSlice` is a pure position writer, no extra state is threaded
+    through ``ctx``.
+
+    **Cache.** Per-page key envelopes :math:`M_p = \max_{k\in p} k` and
+    :math:`m_p = \min_{k\in p} k` via :class:`CMax` / :class:`CMin`.
+
+    **Routing.** With the mask :math:`w_d = 0` for :math:`d < \text{MASK\_END}`
+    and :math:`w_d = 1` otherwise,
 
     .. math::
 
-        m[\ldots, d] =
-        \begin{cases}
-            0, & d < \text{MASK\_END}, \\
-            1, & d \ge \text{MASK\_END}.
-        \end{cases}
+        \operatorname{score}(p)
+        = \max_{h} \sum_{d=1}^{D} w_d \,
+          \max\!\big(q_{h,d}\,M_{p,d},\; q_{h,d}\,m_{p,d}\big),
 
-    This suppresses the leading ``MASK_END`` feature planes of the
-    QUEST envelope score — a cheap, position-only way to exclude
-    low-signal channels. Because :class:`MaskSlice` is a pure
-    position-based writer (its output does not depend on the input
-    values), no extra state is threaded through ``ctx``.
+    then :class:`topK` keeps the highest pages. The mask is applied on
+    ``dim=2`` (the feature dim :math:`D`), so ``MASK_END`` (default 8) must be
+    :math:`\le D` — safe for the verification sweep :math:`D\in\{32,64,128\}`.
 
-    The mask is applied along ``dim=2`` (the head / feature dim ``D``),
-    so ``MASK_END`` must be :math:`\le D` at runtime. The default
-    ``MASK_END = 8`` is safe for all head dims in the verification
-    sweep (``D \in \{32, 64, 128\}``).
+    **Shapes.** ``q`` is ``[B, H_q, D]``; ``cache["max"]`` / ``cache["min"]``
+    are ``[S, 1, D]`` (indexer) / ``[B, 1, D]`` (cache).
     """
 
     MASK_END = 8  # mask [0, MASK_END) features; safe for D in {32, 64, 128}
@@ -848,32 +521,29 @@ class MaskedQuestSparseAttention(vFlow):
 @register("centered_block_sparse_attention")
 class CenteredBlockSparseAttention(vFlow):
     r"""
-    Block-sparse attention that **centers** per-page scores against a
-    per-(batch, kv_head) mean before topK selection.
+    Centroid block-sparse routing with per-request **mean-centering**.
 
-    The centering uses two features that landed together:
+    Scores pages by query–centroid similarity like
+    :class:`BlockSparseAttention`, then subtracts the per-request mean score
+    across pages before selection — so a page competes by how far *above
+    average* it is, not by raw similarity.
 
-    1. :class:`Mean` with ``dim=0`` — a *cross-row* (Schedule.S) reduce
-       that collapses the packed page axis into one value per
-       (batch, kv_head). The result is a BATCHED intermediate of shape
-       :math:`[B \cdot H_{kv}, 1, 1]`, allocated by the compiler with
-       leading dim ``ctx.max_bs * ctx.num_kv_heads``.
+    **Cache.** Per-page centroid :math:`c_p = \frac{1}{|p|}\sum_{k\in p} k`
+    via :class:`CMean`.
 
-    2. :class:`Add` with ``alpha=1, beta=-1`` over a (RAGGED, BATCHED)
-       pair — uses the new mixed-format dispatch in
-       :class:`Elementwise_Binary` so the per-page RAGGED score can be
-       offset by the BATCHED summary.
+    **Routing.** With the per-head dot averaged over heads,
+    :math:`s_p = \frac{1}{H_q}\sum_h \langle q_h, c_p\rangle`, and its
+    per-request mean over pages :math:`\bar s = \frac{1}{S}\sum_{p} s_p`
+    (a cross-page :class:`Mean` with ``dim=0``),
 
-    Pipeline (indexer)
-    ------------------
-    .. code-block:: text
+    .. math::
 
-        s         = q * cache["centroids"]      # RAGGED [S, H_q, D]
-        score_d   = sum(s, dim=2)               # RAGGED [S, H_q, 1]
-        score     = mean(score_d, dim=1)        # RAGGED [S, 1, 1]
-        mean_seq  = mean(score, dim=0)          # BATCHED [B*H_kv, 1, 1]   (Schedule.S)
-        centered  = score - mean_seq            # RAGGED [S, 1, 1]   (RAGGED + BATCHED)
-        topK(centered, o)
+        \operatorname{score}(p) = s_p - \bar s,
+
+    then :class:`topK` keeps the highest pages.
+
+    **Shapes.** ``q`` is ``[B, H_q, D]``; ``cache["centroids"]`` is
+    ``[S, 1, D]`` (indexer) / ``[B, 1, D]`` (cache).
     """
 
     def __init__(self):
@@ -920,25 +590,35 @@ class CenteredBlockSparseAttention(vFlow):
 @register("running_avg_block_sparse")
 class RunningAvgBlockSparse(vFlow):
     r"""
-    Block-sparse attention with a running-average page score.
+    Centroid block-sparse routing with a per-page **running score**
+    (a :class:`Save` / :class:`Load` demo).
 
-    Each decode step we maintain a per-page persistent scalar
-    ``cache["running_score"]`` updated by
+    Like :class:`BlockSparseAttention`, but instead of scoring on the current
+    step alone it keeps an exponentially-decayed running score per page across
+    decode steps: pages that stay relevant accumulate, pages that fade decay.
+
+    **Cache.** Per-page centroid :math:`c_p` via :class:`CMean`; the persistent
+    ``running_score`` is zero-initialised with :class:`CFill` when a page is
+    first filled (thereafter it is owned by :meth:`forward_indexer`).
+
+    **Routing.** With :math:`\bar q_t = \frac{1}{H_q}\sum_h q_{h,t}`, decay
+    :math:`\alpha` (= ``ALPHA`` = 0.5), and the previous value read via
+    :class:`Load`,
 
     .. math::
 
-        \text{running\_score} \leftarrow
-        \alpha \cdot \text{last\_running\_score} + \text{current\_score},
+        r_t(p) = \alpha\, r_{t-1}(p) + \langle \bar q_t,\; c_p \rangle,
 
-    where ``current_score`` is the usual ``q_mean · centroid`` per-page
-    score and ``alpha`` controls momentum. Pages that keep scoring
-    highly accumulate; pages that lose relevance decay.
+    the new :math:`r_t(p)` is persisted via :class:`Save` and fed to
+    :class:`topK`.
 
-    Illustrates the :class:`Save` / :class:`Load` pattern for persistent
-    state across decode steps — ``running_score`` is declared in
-    :meth:`create_cache` but written entirely from
-    :meth:`forward_indexer` via ``Save``; :meth:`forward_cache` never
-    touches it.
+    **Shapes.** ``q`` is ``[B, H_q, D]``; ``cache["centroids"]`` is
+    ``[S, 1, D]`` / ``[B, 1, D]``; ``cache["running_score"]`` is ``[S, 1, 1]``
+    / ``[B, 1, 1]``.
+
+    .. note::
+       Because it ``Save``\ s per-step state, an engine using this flow must
+       set ``disable_radix_cache=True``.
     """
     ALPHA = 0.5
 
@@ -992,14 +672,34 @@ class RunningAvgBlockSparse(vFlow):
 
 @register("venergy_gated_centroid")
 class VEnergyGatedCentroid(vFlow):
-    """
-    Score pages by centroid dot-product gated by the mean token magnitude
-    of the value block.  Pages whose values carry little energy are muted
+    r"""
+    Centroid routing **gated by value-block energy**.
+
+    Scores a page by the query–centroid dot product like
+    :class:`BlockSparseAttention`, then multiplies by the page's mean value
+    magnitude (its "energy"): pages whose values carry little energy are muted
     even when the key centroid aligns with the query.
 
-    Novelty: v-block energy as a multiplicative gate on the key-centroid
-    score via CL2Norm(dim=2) → CMean(dim=1) chain in forward_cache.
-    §16.4 — value-side signal exploitation.
+    **Cache.** :meth:`forward_cache` stores a per-page key centroid
+    :math:`c_p` (:class:`CMean`) and the value energy — the mean :math:`L_2`
+    norm of its value tokens (:class:`CL2Norm` over :math:`D`, then
+    :class:`CMean` over tokens):
+
+    .. math::
+
+        e_p = \frac{1}{|p|} \sum_{k\in p} \lVert v_k \rVert_2.
+
+    **Routing.** With :math:`\bar q = \frac{1}{H_q}\sum_h q_h`,
+
+    .. math::
+
+        \operatorname{score}(p) = \langle \bar q,\; c_p \rangle \cdot e_p,
+
+    then :class:`topK` keeps the highest pages.
+
+    **Shapes.** ``q`` is ``[B, H_q, D]``; ``cache["centroids"]`` is
+    ``[S, 1, D]`` / ``[B, 1, D]``; ``cache["v_energy"]`` is ``[S, 1, 1]`` /
+    ``[B, 1, 1]``.
     """
 
     def __init__(self):

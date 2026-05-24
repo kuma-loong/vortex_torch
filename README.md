@@ -41,11 +41,11 @@ Vortex allows you to express novel sparse attention concisely while relying on a
 ## 🚀 Installation
 
 ```bash
-git clone -b v1 --recursive https://github.com/Infini-AI-Lab/vortex_torch.git
+git clone --recursive https://github.com/Infini-AI-Lab/vortex_torch.git
 
-# Install SGLang dependency (support 0.4.9)
-cd third_party/sglang/v0.4.9/sglang
-bash install.sh
+# Install SGLang dependency
+cd third_party/sglang/v0.5.9/sglang
+pip install -e "python"
 cd ../../../../
 
 # Install Vortex

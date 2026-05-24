@@ -118,7 +118,7 @@ class vFlow(ABC):
 
         {
             "centroids": (1, head_dim),
-            "my_aux_tensor": (page_size, head_dim),
+            "my_aux_tensor": (block_size, head_dim),
             ...
         }
 
@@ -127,8 +127,8 @@ class vFlow(ABC):
 
     .. math::
 
-        \text{k} &: (\text{page_size}, \text{head_dim}), \\
-        \text{v} &: (\text{page_size}, \text{head_dim}),
+        \text{k} &: (\text{block_size}, \text{head_dim}), \\
+        \text{v} &: (\text{block_size}, \text{head_dim}),
 
     so subclasses must not add ``"k"`` or ``"v"`` themselves.
 
@@ -142,11 +142,11 @@ class vFlow(ABC):
         \text{token_ratio}
         = \sum_{\text{key}}
           \frac{r_{\text{key}} \cdot c_{\text{key}}}
-               {\text{page_size} \cdot \text{head_dim}}.
+               {\text{block_size} \cdot \text{head_dim}}.
 
     This ignores the leading dimension (whether :math:`B` or
     :math:`S`) and compares only inner shapes to the
-    baseline ``(page_size, head_dim)``.
+    baseline ``(block_size, head_dim)``.
 
     Subclass responsibilities
     -------------------------
@@ -160,7 +160,7 @@ class vFlow(ABC):
       update cache tensors using the :math:`B`-major view and positional
       metadata.
 
-    - :meth:`create_cache(page_size, head_dim)`:
+    - :meth:`create_cache(block_size, head_dim)`:
       declare inner shapes :math:`(r, c)` for all extra cache tensors
       (excluding ``"k"`` and ``"v"``).
     """
@@ -309,9 +309,10 @@ class vFlow(ABC):
 
         Parameters
         ----------
-        page_size : int
-            Number of tokens per page. For the standard ``"k"`` and
-            ``"v"`` entries, this will be the first dimension.
+        block_size : int
+            Number of tokens per block (the inner length of a ``"k"`` / ``"v"``
+            cache slot). For the standard ``"k"`` and ``"v"`` entries this is
+            the first inner dimension.
 
         head_dim : int
             Head dimension. For the standard ``"k"`` and ``"v"`` entries,
@@ -332,7 +333,7 @@ class vFlow(ABC):
         The keys ``"k"`` and ``"v"`` are reserved and **must not** be
         present in the returned dictionary. They are added automatically
         by :meth:`get_cache_meta_info` with inner shape
-        ``(page_size, head_dim)``.
+        ``(block_size, head_dim)``.
         """
         pass
 
