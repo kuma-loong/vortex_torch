@@ -47,6 +47,10 @@ autosummary_generate = True
 autosummary_generate_overwrite = False
 autodoc_typehints = "description"
 autodoc_member_order = "bysource"
+# Drop the long ``vortex_torch.indexer.elementwise_binary.`` module-path
+# prefix from signature headers — each class lives on its own module page,
+# so the bare ``class Maximum(...)`` name is unambiguous and fits the card.
+add_module_names = False
 # Render type-hint cross-references with their short name but resolve them to
 # the exact (fully-qualified) target — disambiguates same-named classes that
 # legitimately exist in two packages (e.g. cache.Context vs indexer.Context).
