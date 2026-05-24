@@ -40,15 +40,17 @@ class TopK(vOp):
         into ``block_tables[i, :block_len]`` and set ``seqlens[i] =
         dense_seqlens[i]``. No selection — the row is already small
         enough to fit the budget.
-      * Otherwise → write
-          - ``[0:bos)``           ← first ``bos`` dense blocks
-          - ``[bos:bos+k)``       ← top-``k`` blocks by score over
-                                    ``[bos, block_len-eos)`` of the dense row
-          - ``[bos+k:bos+k+eos)`` ← last ``eos`` dense blocks
-        and set ``seqlens[i] = (bos+k+eos-1) * block_size + last_block_len``
-        where ``last_block_len`` is the per-row trailing block's token
-        count (so the last block — the dense path's last — contributes
-        the exact token count trtllm decode expects).
+      * Otherwise → write a sparse row of ``bos + k + eos`` blocks:
+
+        - ``[0:bos)`` ← first ``bos`` dense blocks
+        - ``[bos:bos+k)`` ← top-``k`` blocks by score over
+          ``[bos, block_len-eos)`` of the dense row
+        - ``[bos+k:bos+k+eos)`` ← last ``eos`` dense blocks
+
+        and set ``seqlens[i] = (bos+k+eos-1) * block_size + last_block_len``,
+        where ``last_block_len`` is the per-row trailing block's token count
+        (so the last block contributes the exact token count trtllm decode
+        expects).
 
     Constructor
     -----------
