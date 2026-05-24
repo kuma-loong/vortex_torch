@@ -6,69 +6,22 @@ from ..utils import Schedule
 
 class topK(vOp):
     r"""
-    Piecewise top-k dispatcher for packed sequences with reserved pages.
+    Per-request top-k page selector with reserved BOS/EOS pages.
 
-    The input is treated as a rank-3 tensor
+    The terminal op of a ``forward_indexer``: it turns per-page scores into the
+    sparse set of pages each request attends to.
 
-    .. math::
-
-        X \in \mathbb{R}^{S_{\text{pack}} \times 1 \times 1},
-
-    where the leading dimension :math:`S_{\text{pack}}` is a packed
-    concatenation of :math:`B` segments:
-
-    .. math::
-
-        S_{\text{pack}} = \sum_{b=0}^{B-1} S_b, \qquad
-        X =
-        \begin{bmatrix}
-            X_0 \\
-            X_1 \\
-            \vdots \\
-            X_{B-1}
-        \end{bmatrix},
-
-    with
-
-    .. math::
-
-        X_b \in \mathbb{R}^{S_b \times 1 \times 1}.
-
-    For each segment :math:`b`, the operator selects a subset of pages
-    according to scores stored in ``x`` (and additional key/value
-    metadata from :class:`Context`), but **always** preserves:
-
-    - the first ``page_reserved_bos`` pages in that segment,
-    - the last ``page_reserved_eos`` pages in that segment, and
-    - an additional ``topk_val`` pages chosen by top-k over the remaining
-      candidates in the segment.
-
-    Let :math:`\mathcal{I}_b \subset [0, S_{\text{pack}})` denote the index
-    range of segment :math:`b`. The implementation computes a subset
-    :math:`\mathcal{J}_b \subset \mathcal{I}_b` such that:
-
-    - all indices corresponding to the reserved prefix (BOS) and suffix
-      (EOS) pages in :math:`\mathcal{I}_b` are included, and
-    - up to ``topk_val`` additional indices are selected by score.
-
-    The result is written into a preallocated output tensor ``o``; the
-    exact layout of ``o`` is defined by the upstream contract and the
-    implementation.
-
-    Key properties
-    --------------
-    - Dispatch is keyed **only** by the input format ``x._format``.
-    - The operation is logically out-of-place, but writes into ``o`` in-place.
-    - :meth:`profile` only validates and selects the implementation; it does
-      not allocate or return any buffers.
-    - :meth:`execute` performs the per-segment selection using context
-      metadata (indptr arrays, indices, reserved-page counts, and ``topk_val``).
-
-    Attributes
-    ----------
-    _supported_formats : FrozenSet[FORMAT]
-        Set of input formats for which a top-k codegen implementation
-        exists. Used by :meth:`profile` for dispatch validation.
+    :Math: for each request's packed score segment
+        :math:`X\in\mathbb{R}^{S\times 1\times 1}`, the selected page set is the
+        first ``block_reserved_bos`` pages, the last ``block_reserved_eos``
+        pages, and the ``topk_val`` highest-scoring of the remaining pages.
+    :__init__: ``topK()`` — no arguments; the budget ``topk_val`` and the
+        reserved BOS/EOS counts are read from :class:`Context` at runtime.
+    :__call__: ``op(score, o, ctx=ctx)`` — ``score`` is ``[S, 1, 1]`` (one
+        scalar per page; must be ``RAGGED``); the selected page ids are written
+        **in place** into ``o``. Returns nothing.
+    :Note: every flow's ``forward_indexer`` must end in this op (or
+        :class:`approxTopK`).
     """
 
     # Supported input formats; only RAGGED is supported for now.
@@ -80,45 +33,9 @@ class topK(vOp):
 
     # ---------------- profile ----------------
     def profile(self, x: vTensor, o: vTensor, ctx: Context) -> None:
-        r"""
-        Validate input/output tensors and select the implementation.
-
-        This method checks:
-
-        - that ``x`` and ``o`` are both rank-3 :class:`vTensor` objects,
-        - that ``x`` has shape ``[S_pack, 1, 1]`` (one scalar score per page),
-        - that a top-k implementation is registered for ``x._format``, and
-        - that ``x`` and ``o`` reside on the same device.
-
-        No buffers are allocated here and nothing is returned; this call
-        simply validates that ``x._format`` has a registered codegen path.
-
-        Parameters
-        ----------
-        x : vTensor
-            Input tensor carrying per-page scalar scores, with logical shape
-            ``[S_pack, 1, 1]``.
-
-        o : vTensor
-            Preallocated output tensor that will be filled in-place by the
-            top-k implementation. Its shape and semantics are defined by
-            the upstream contract and the implementation.
-
-        ctx : Context
-            Execution context providing:
-
-            - ``dense_kv_indptr`` and ``sparse_kv_indptr``: segment
-              boundaries in the packed axis,
-            - ``dense_kv_indices``: indices into underlying storage, and
-            - scalar configuration such as ``batch_size``, ``num_kv_heads``,
-              ``topk_val``, ``page_reserved_bos``, and ``page_reserved_eos``.
-
-        Raises
-        ------
-        AssertionError
-            If types, ranks, shapes, formats, or devices are incompatible,
-            or if no implementation is registered for ``x._format``.
-        """
+        r"""Trace-time: validate ``x`` ``[S, 1, 1]`` and ``o`` (both ``RAGGED``
+        ``vTensor`` on the same device) and register the op. Allocates nothing
+        and returns nothing — ``o`` is filled in place at execute time."""
         prefix = self._prefix()
 
         # ---- type checks ----
@@ -165,58 +82,20 @@ class topK(vOp):
 
 class approxTopK(topK):
     r"""
-    Approximate top-k page selector with bounded approximation.
+    Approximate :class:`topK` — faster adaptive 8-bit radix selection.
 
-    Drop-in replacement for :class:`topK` that swaps the exact selection
-    kernel for an **adaptive 8-bit radix top-k** with a tunable
-    cost/quality knob ``tolerate_ratio``.
-
-    The radix kernel runs up to four 8-bit refinement rounds (32 bits
-    total) on fp32-promoted scores. After each round, the threshold bin
-    is found and ``topk_remaining`` is the number of slots still owed
-    by that bin. The kernel **stops early** as soon as
-
-    .. math::
-
-        \text{topk\_remaining} \;\le\; \text{tolerate\_ratio} \cdot
-        \text{target\_k},
-
-    filling the remaining slots from the current candidate set in
-    atomic-arrival order. The trade-off:
-
-    - ``tolerate_ratio = 0.0`` → all four rounds always run; result is
-      bit-exact to :class:`topK` (sorted output is the only difference —
-      this kernel emits unsorted indices, which `topK` semantics allow).
-    - ``tolerate_ratio = 1.0`` → kernel always stops after round 0,
-      cheapest setting. Selection becomes coarse: the top page-bin is
-      retained but ordering inside it is arrival-driven.
-    - ``0 < tolerate_ratio < 1`` → adaptive: cheap when scores are
-      well-separated, refines when they're tightly bunched.
-
-    The output set still always contains the reserved BOS / EOS pages
-    plus exactly ``topk_val`` chosen pages — only the *selection
-    quality* is traded for speed.
-
-    Parameters
-    ----------
-    tolerate_ratio : float, default 0.0
-        Approximation budget in ``[0.0, 1.0]``. Higher = cheaper but
-        looser. ``0.0`` recovers exact (radix) top-k. Typical values
-        for throughput hunting: ``0.05 - 0.15``.
-
-    Notes
-    -----
-    - Same dispatch as :class:`topK` (only ``RAGGED`` input format).
-    - Same per-segment contract (BOS/EOS preserved, ``topk_val`` chosen).
-    - Output indices are **unsorted within each segment** (this matches
-      ``topk_output_v2`` in the C kernel; downstream consumers must not
-      assume sorted order).
-    - Use this op when score distributions are heavy-tailed and the
-      exact top-k cost dominates indexer time. For score distributions
-      where many candidates are near the threshold, low
-      ``tolerate_ratio`` (≤ 0.05) is safer; for distributions with a
-      clear gap between selected and dropped pages, push higher
-      (0.2 - 0.5).
+    :Math: same selection as :class:`topK` (reserved BOS/EOS pages +
+        ``topk_val`` by score), but the top-``topk_val`` set is found with an
+        adaptive 8-bit radix kernel that stops early once the slots still owed
+        by the threshold bin fall within ``tolerate_ratio`` of the target,
+        filling any remainder in arrival order.
+    :__init__: ``approxTopK(tolerate_ratio=0.0)`` — approximation budget in
+        ``[0, 1]``: ``0.0`` = exact (all radix rounds run), higher = cheaper
+        but looser (typical throughput sweet spot ``0.05–0.15``).
+    :__call__: ``op(score, o, ctx=ctx)`` — same signature as :class:`topK`
+        (``score`` ``[S, 1, 1]``, ``RAGGED``; writes page ids into ``o``).
+    :Note: indices are **unsorted within each request**; downstream consumers
+        must not assume sorted order.
     """
 
     def __init__(self, tolerate_ratio: float = 0.0):

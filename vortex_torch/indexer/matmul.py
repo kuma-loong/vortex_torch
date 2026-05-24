@@ -7,69 +7,17 @@ from ..utils import Schedule
 
 class GeMV(vOp):
     r"""
-    General matrix-vector multiplication (GEMV) dispatcher.
+    Per-request batched matrix–vector product, :math:`O = Y X^{\top}`.
 
-    This operator computes a *piecewise* batched matrix-vector product.
-    Let
-
-    .. math::
-
-        X \in \mathbb{R}^{B \times 1 \times D}, \qquad
-        Y \in \mathbb{R}^{S_{\text{pack}} \times 1 \times D},
-
-    where the ``S``-axis of :math:`Y` is a concatenation of batch-wise
-    segments
-
-    .. math::
-
-        S_{\text{pack}} = \sum_{i=0}^{B-1} S_i, \qquad
-        Y =
-        \begin{bmatrix}
-            Y_0 \\
-            Y_1 \\
-            \vdots \\
-            Y_{B-1}
-        \end{bmatrix},
-
-    with
-
-    .. math::
-
-        Y_i \in \mathbb{R}^{S_i \times 1 \times D}, \qquad
-        X_i = X[i, 0, :] \in \mathbb{R}^{1 \times D}.
-
-    For each batch index :math:`i \in \{0,\dots,B-1\}`, we define
-
-    .. math::
-
-        O_i = Y_i X_i^{\mathsf{T}} \in \mathbb{R}^{S_i \times 1 \times 1},
-
-    and the overall output is the concatenation
-
-    .. math::
-
-        O =
-        \begin{bmatrix}
-            O_0 \\
-            O_1 \\
-            \vdots \\
-            O_{B-1}
-        \end{bmatrix}
-        \in \mathbb{R}^{S_{\text{pack}} \times 1 \times 1}.
-
-    In the runtime, :math:`S_{\text{pack}}` is given by
-    ``ctx.max_num_pages``. Output format rule: ``BATCHED`` iff both
-    inputs are ``BATCHED`` (both have their ``S`` axis already collapsed
-    to 1), otherwise ``RAGGED``. Format compatibility is enforced by
-    the compiler's per-workload kernel.
-
-    Attributes
-    ----------
-    output_format : Optional[FORMAT]
-        The output tensor format as determined in :meth:`profile`.
-
-    output_buffer : Optional[torch.Tensor]
-        Preallocated output tensor buffer of shape ``[S_pack, 1, 1]``.
+    :Math: with a batched query :math:`X\in\mathbb{R}^{B\times 1\times D}` and
+        packed pages :math:`Y\in\mathbb{R}^{S\times 1\times D}`, each page
+        :math:`s` of request :math:`i` scores as
+        :math:`O[s]=\langle Y[s],\,X[i]\rangle`, giving
+        :math:`O\in\mathbb{R}^{S\times 1\times 1}`.
+    :__init__: ``GeMV()`` — no arguments.
+    :__call__: ``o = op(x, y, ctx=ctx)`` — ``x`` is ``[B, 1, D]``, ``y`` is
+        ``[S, 1, D]`` (matching ``D``); returns ``o`` ``[S, 1, 1]``. Output is
+        ``BATCHED`` iff both inputs are, else ``RAGGED``.
     """
 
     def __init__(self):
@@ -79,19 +27,9 @@ class GeMV(vOp):
         self.schedule = Schedule.W
     # ---------------- profile ----------------
     def profile(self, x: vTensor, y: vTensor, ctx: Context) -> vTensor:
-        r"""
-        Validate inputs, allocate the output buffer, and return a
-        :class:`vTensor` view.
-
-        The method enforces the logical shapes
-
-        - ``x``: ``[B, 1, D]``
-        - ``y``: ``[S_pack, 1, D]``
-
-        and checks that the last dimensions match. The output buffer is
-        allocated with shape ``[S_pack, 1, 1]``, where ``S_pack`` is taken
-        from the runtime context as ``ctx.max_num_pages``.
-        """
+        r"""Trace-time: validate ``x`` ``[B, 1, D]`` / ``y`` ``[S, 1, D]``,
+        register the op, and return a ``vTensor`` view of the ``[S, 1, 1]``
+        output (see the class docstring)."""
         prefix = self._prefix()
 
         # Type checks
@@ -137,51 +75,17 @@ class GeMV(vOp):
 # ------------------------------ GeMM ------------------------------ #
 class GeMM(vOp):
     r"""
-    General matrix-matrix multiplication (GeMM) dispatcher.
+    Per-page matrix–matrix product, :math:`O[s] = Y[s]\,X[s]^{\top}`.
 
-    Logically this computes, for each logical ``S``-slice, a matrix-matrix
-    product
-
-    .. math::
-
-        O[s] = Y[s] X[s]^{\mathsf{T}}, \quad s = 0, \dots, S-1,
-
-    with slice-wise shapes
-
-    .. math::
-
-        X[s] \in \mathbb{R}^{N_x \times K}, \quad
-        Y[s] \in \mathbb{R}^{N_y \times K}, \quad
-        O[s] \in \mathbb{R}^{N_y \times N_x}.
-
-    In the packed 3D representation used by this dispatcher:
-
-    - ``Y`` has logical shape ``[S, N_y, K]``.
-    - ``X`` has logical shape ``[L_x, N_x, K]``, where the leading
-      dimension :math:`L_x` can represent **either**:
-
-      * a batch axis :math:`B` (when ``x_format == FORMAT.BATCHED``), or
-      * the same ``S`` axis as ``Y`` (when ``x_format`` is ragged/paged and
-        already laid out per-page).
-
-      This is why the code comments use ``X: [B/S, N_x, K]``: the first
-      dimension is interpreted as either a batch size :math:`B` or an
-      ``S``-like logical page index, depending on the format.
-
-    - The output tensor ``O`` has logical shape ``[S, N_y, N_x]``.
-
-    At runtime, the logical ``S`` is taken from ``ctx.max_num_pages``.
-    Output format rule: ``BATCHED`` iff both inputs are ``BATCHED``,
-    otherwise ``RAGGED``. Format compatibility is enforced by the
-    compiler's per-workload kernel.
-
-    Attributes
-    ----------
-    output_format : Optional[FORMAT]
-        The output tensor format as determined in :meth:`profile`.
-
-    output_buffer : Optional[torch.Tensor]
-        Preallocated output tensor buffer of shape ``[S, N_y, N_x]``.
+    :Math: with :math:`Y\in\mathbb{R}^{S\times N_y\times K}` and
+        :math:`X\in\mathbb{R}^{(B\,\text{or}\,S)\times N_x\times K}`, per page
+        :math:`s`:
+        :math:`O[s]=Y[s]\,X[s]^{\top}\in\mathbb{R}^{N_y\times N_x}` — i.e.
+        ``GeMM(x, y) = y xᵀ``. Output :math:`O\in\mathbb{R}^{S\times N_y\times N_x}`.
+    :__init__: ``GeMM()`` — no arguments.
+    :__call__: ``o = op(x, y, ctx=ctx)`` — ``x`` is ``[B|S, N_x, K]``, ``y`` is
+        ``[S, N_y, K]`` (matching ``K``); returns ``o`` ``[S, N_y, N_x]``.
+        Output is ``BATCHED`` iff both inputs are, else ``RAGGED``.
     """
 
     def __init__(self):
@@ -192,48 +96,9 @@ class GeMM(vOp):
 
     # ---------------- profile ----------------
     def profile(self, x: vTensor, y: vTensor, ctx: Context) -> vTensor:
-        r"""
-        Validate inputs, allocate the output buffer, and return a
-        :class:`vTensor` view.
-
-        The method enforces that both inputs are rank-3 tensors and that the
-        inner dimension :math:`K` matches:
-
-        - ``x``: ``[B_or_S, N_x, K]``
-
-          *When* ``x_format == FORMAT.BATCHED``, the leading dimension is a
-          batch size :math:`B`. For ragged/paged formats, it may conceptually
-          coincide with :math:`S`.
-
-        - ``y``: ``[S, N_y, K]``
-
-        The output buffer is allocated with shape ``[S, N_y, N_x]``, where
-        ``S`` is taken from the runtime context as ``ctx.max_num_pages``.
-
-        Parameters
-        ----------
-        x : vTensor
-            Right-hand operand (transposed in the mathematical view), with
-            shape ``[B_or_S, N_x, K]``.
-
-        y : vTensor
-            Left-hand operand with shape ``[S, N_y, K]``.
-
-        ctx : Context
-            Execution context providing ``ctx.max_num_pages`` for the logical
-            ``S`` dimension and tracking auxiliary memory.
-
-        Returns
-        -------
-        vTensor
-            A ``vTensor`` view wrapping the allocated output buffer.
-
-        Raises
-        ------
-        AssertionError
-            If types are not ``vTensor``, ranks are not 3, or the inner
-            dimensions :math:`K` do not match.
-        """
+        r"""Trace-time: validate ``x`` ``[B|S, N_x, K]`` / ``y`` ``[S, N_y, K]``
+        (matching ``K``), register the op, and return a ``vTensor`` view of the
+        ``[S, N_y, N_x]`` output (see the class docstring)."""
         prefix = self._prefix()
 
         # Type checks

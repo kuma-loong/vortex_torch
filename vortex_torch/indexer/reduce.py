@@ -6,60 +6,26 @@ from ..utils import ReduceType, Schedule
 
 class Reduce(vOp):
     r"""
-    Generic reduction op for rank-3 logical tensors ``[N, D_0, D_1]``.
+    Generic 1-D reduction over one axis of a rank-3 logical tensor.
 
-    This operator performs a 1D reduction over the leading ``N`` axis,
-    the ``D_0`` axis, or the ``D_1`` axis of a 3D tensor.
-
-    Given an input tensor
-
-    .. math::
-
-        X \in \mathbb{R}^{N \times D_0 \times D_1},
-
-    the output logical shape depends on the configured reduction dimension
-    ``dim``:
-
-    - ``dim == 0`` (reduce over the packed leading axis):
-      collapses ``N`` to one row per ``(batch, kv_head)``; produces a
-      ``BATCHED`` output (custom standalone kernel, requires
-      ``RAGGED`` input).
-    - ``dim == 1`` (reduce over :math:`D_0`):
-
-      .. math::
-
-         \text{out} \in \mathbb{R}^{N \times 1 \times D_1}.
-
-    - ``dim == 2`` (reduce over :math:`D_1`):
-
-      .. math::
-
-         \text{out} \in \mathbb{R}^{N \times D_0 \times 1}.
-
-    For ``dim ∈ {1, 2}`` the output is ``BATCHED`` iff the input is
-    ``BATCHED`` (per-row reduction preserves the leading-axis layout);
-    otherwise ``RAGGED``. Format compatibility is enforced by the
-    compiler's per-workload kernel.
-
-    The specific reduction operation (e.g. mean, max, min, L2-norm, sum)
-    is selected via :attr:`reduce_type`.
-
-    Attributes
-    ----------
-    dim : int
-        Reduction dimension in the logical 3D tensor: must be ``0``,
-        ``1``, or ``2``.
-
-    reduce_type : Optional[ReduceType]
-        The type of reduction to perform (e.g. mean, max, min, L2-norm, sum).
-
-    output_format : Optional[FORMAT]
-        The output tensor format as determined in :meth:`profile`.
-
-    output_buffer : Optional[torch.Tensor]
-        Preallocated output tensor buffer with logical shape
-        ``[N, out_D0, out_D1]``, where ``out_D0`` and ``out_D1`` depend on
-        ``dim`` as described above.
+    :Math:
+        For input :math:`X\in\mathbb{R}^{N\times D_0\times D_1}` and a
+        reduction :math:`\rho` (mean / max / min / L2-norm / sum, fixed by the
+        subclass): ``dim=1`` →
+        :math:`\text{out}[n,0,d_1]=\rho_{d_0}\,X[n,d_0,d_1]` (shape
+        ``[N, 1, D_1]``); ``dim=2`` →
+        :math:`\text{out}[n,d_0,0]=\rho_{d_1}\,X[n,d_0,d_1]` (shape
+        ``[N, D_0, 1]``); ``dim=0`` collapses the packed leading axis to one
+        row per ``(batch, kv_head)``.
+    :__init__:
+        ``Reduce(dim=1)`` — logical axis to reduce, one of ``0`` / ``1`` / ``2``.
+    :__call__:
+        ``y = op(x, ctx=ctx)`` — ``x`` is ``[N, D_0, D_1]``; the reduced axis is
+        kept with size 1. For ``dim ∈ {1, 2}`` the output is ``BATCHED`` iff the
+        input is; ``dim=0`` requires ``RAGGED`` input and returns ``BATCHED``.
+    :Note:
+        Use a concrete subclass — :class:`Max`, :class:`Min`, :class:`Mean`,
+        :class:`L2Norm`, :class:`Sum`.
     """
 
     def __init__(self, dim: int = 1):
@@ -79,42 +45,9 @@ class Reduce(vOp):
 
     # ---------------- profile ----------------
     def profile(self, x: vTensor, ctx: Context) -> vTensor:
-        r"""
-        Validate the input, select an implementation based on ``x._format``,
-        allocate the output buffer, and return a ``vTensor`` view.
-
-        The input tensor is expected to have logical shape ``[N, D_0, D_1]``,
-        where the leading dimension ``N`` may represent either a batch size or
-        a sequence/page count. The runtime uses ``ctx.max_num_pages`` to define
-        the leading dimension of the output, in line with other operators that
-        treat the first axis as the logical ``N`` axis.
-
-        According to :attr:`dim`, the output logical shape is:
-
-        - ``dim == 1`` → ``[N, 1, D_1]``
-        - ``dim == 2`` → ``[N, D_0, 1]``
-
-        Parameters
-        ----------
-        x : vTensor
-            Input tensor with logical shape ``[N, D_0, D_1]``.
-
-        ctx : Context
-            Execution context providing ``ctx.max_num_pages`` for the leading
-            dimension and tracking auxiliary memory usage.
-
-        Returns
-        -------
-        vTensor
-            A ``vTensor`` view wrapping the allocated output buffer with the
-            resolved output format.
-
-        Raises
-        ------
-        AssertionError
-            If ``x`` is not a :class:`vTensor`, if its rank is not 3, or if no
-            implementation is registered for ``x._format``.
-        """
+        r"""Trace-time: validate ``x`` (``[N, D_0, D_1]``), resolve the output
+        format, register the op, and return a ``vTensor`` view of the reduced
+        output (see the class docstring for shapes)."""
         prefix = self._prefix()
 
         # Type & rank checks
@@ -166,43 +99,14 @@ class Reduce(vOp):
 
 class Max(Reduce):
     r"""
-    Maximum reduction over a single logical axis.
+    Max reduction over one logical axis (a :class:`Reduce`).
 
-    Given an input tensor
-
-    .. math::
-
-        X \in \mathbb{R}^{N \times D_0 \times D_1},
-
-    this operator computes, depending on ``dim``:
-
-    - ``dim == 1`` (reduce over :math:`D_0`):
-
-      .. math::
-
-         \text{out}[n, 0, d_1]
-         = \max_{0 \le d_0 < D_0} X[n, d_0, d_1],
-
-      with shape :math:`[N, 1, D_1]`.
-
-    - ``dim == 2`` (reduce over :math:`D_1`):
-
-      .. math::
-
-         \text{out}[n, d_0, 0]
-         = \max_{0 \le d_1 < D_1} X[n, d_0, d_1],
-
-      with shape :math:`[N, D_0, 1]`.
-
-    The leading dimension :math:`N` may represent either a batch axis
-    (``B``) or a sequence/page axis (``S``); the reduction is applied
-    independently for each slice along this dimension.
-
-    Parameters
-    ----------
-    dim : int, optional
-        Reduction dimension in the logical 3D tensor (``1`` for :math:`D_0`,
-        ``2`` for :math:`D_1`). Default is ``1``.
+    :Math: ``dim=1``: :math:`\text{out}[n,0,d_1]=\max_{d_0}X[n,d_0,d_1]`;
+        ``dim=2``: :math:`\text{out}[n,d_0,0]=\max_{d_1}X[n,d_0,d_1]`.
+    :__init__: ``Max(dim=1)`` — axis to reduce (``1`` → :math:`D_0`,
+        ``2`` → :math:`D_1`).
+    :__call__: ``y = op(x, ctx=ctx)`` — ``[N, D_0, D_1]`` → ``[N, 1, D_1]``
+        (``dim=1``) or ``[N, D_0, 1]`` (``dim=2``).
     """
     def __init__(self, dim: int = 1):
         super().__init__(dim)
@@ -211,43 +115,14 @@ class Max(Reduce):
 
 class Min(Reduce):
     r"""
-    Minimum reduction over a single logical axis.
+    Min reduction over one logical axis (a :class:`Reduce`).
 
-    Given an input tensor
-
-    .. math::
-
-        X \in \mathbb{R}^{N \times D_0 \times D_1},
-
-    this operator computes, depending on ``dim``:
-
-    - ``dim == 1`` (reduce over :math:`D_0`):
-
-      .. math::
-
-         \text{out}[n, 0, d_1]
-         = \min_{0 \le d_0 < D_0} X[n, d_0, d_1],
-
-      with shape :math:`[N, 1, D_1]`.
-
-    - ``dim == 2`` (reduce over :math:`D_1`):
-
-      .. math::
-
-         \text{out}[n, d_0, 0]
-         = \min_{0 \le d_1 < D_1} X[n, d_0, d_1],
-
-      with shape :math:`[N, D_0, 1]`.
-
-    The leading dimension :math:`N` may represent either a batch axis
-    (``B``) or a sequence/page axis (``S``); the reduction is applied
-    independently for each slice along this dimension.
-
-    Parameters
-    ----------
-    dim : int, optional
-        Reduction dimension in the logical 3D tensor (``1`` for :math:`D_0`,
-        ``2`` for :math:`D_1`). Default is ``1``.
+    :Math: ``dim=1``: :math:`\text{out}[n,0,d_1]=\min_{d_0}X[n,d_0,d_1]`;
+        ``dim=2``: :math:`\text{out}[n,d_0,0]=\min_{d_1}X[n,d_0,d_1]`.
+    :__init__: ``Min(dim=1)`` — axis to reduce (``1`` → :math:`D_0`,
+        ``2`` → :math:`D_1`).
+    :__call__: ``y = op(x, ctx=ctx)`` — ``[N, D_0, D_1]`` → ``[N, 1, D_1]``
+        (``dim=1``) or ``[N, D_0, 1]`` (``dim=2``).
     """
     def __init__(self, dim: int = 1):
         super().__init__(dim)
@@ -256,43 +131,14 @@ class Min(Reduce):
 
 class Mean(Reduce):
     r"""
-    Mean reduction over a single logical axis.
+    Mean reduction over one logical axis (a :class:`Reduce`).
 
-    Given an input tensor
-
-    .. math::
-
-        X \in \mathbb{R}^{N \times D_0 \times D_1},
-
-    this operator computes, depending on ``dim``:
-
-    - ``dim == 1`` (reduce over :math:`D_0`):
-
-      .. math::
-
-         \text{out}[n, 0, d_1]
-         = \frac{1}{D_0} \sum_{d_0=0}^{D_0-1} X[n, d_0, d_1],
-
-      with shape :math:`[N, 1, D_1]`.
-
-    - ``dim == 2`` (reduce over :math:`D_1`):
-
-      .. math::
-
-         \text{out}[n, d_0, 0]
-         = \frac{1}{D_1} \sum_{d_1=0}^{D_1-1} X[n, d_0, d_1],
-
-      with shape :math:`[N, D_0, 1]`.
-
-    The leading dimension :math:`N` may represent either a batch axis
-    (``B``) or a sequence/page axis (``S``); the reduction is applied
-    independently for each slice along this dimension.
-
-    Parameters
-    ----------
-    dim : int, optional
-        Reduction dimension in the logical 3D tensor (``1`` for :math:`D_0`,
-        ``2`` for :math:`D_1`). Default is ``1``.
+    :Math: ``dim=1``: :math:`\text{out}[n,0,d_1]=\frac{1}{D_0}\sum_{d_0}X[n,d_0,d_1]`;
+        ``dim=2``: :math:`\text{out}[n,d_0,0]=\frac{1}{D_1}\sum_{d_1}X[n,d_0,d_1]`.
+    :__init__: ``Mean(dim=1)`` — axis to reduce (``1`` → :math:`D_0`,
+        ``2`` → :math:`D_1`).
+    :__call__: ``y = op(x, ctx=ctx)`` — ``[N, D_0, D_1]`` → ``[N, 1, D_1]``
+        (``dim=1``) or ``[N, D_0, 1]`` (``dim=2``).
     """
     def __init__(self, dim: int = 1):
         super().__init__(dim)
@@ -301,43 +147,14 @@ class Mean(Reduce):
 
 class L2Norm(Reduce):
     r"""
-    L2-norm reduction over a single logical axis.
+    L2-norm reduction over one logical axis (a :class:`Reduce`).
 
-    Given an input tensor
-
-    .. math::
-
-        X \in \mathbb{R}^{N \times D_0 \times D_1},
-
-    this operator computes, depending on ``dim``:
-
-    - ``dim == 1`` (reduce over :math:`D_0`):
-
-      .. math::
-
-         \text{out}[n, 0, d_1]
-         = \sqrt{\sum_{d_0=0}^{D_0-1} X[n, d_0, d_1]^2},
-
-      with shape :math:`[N, 1, D_1]`.
-
-    - ``dim == 2`` (reduce over :math:`D_1`):
-
-      .. math::
-
-         \text{out}[n, d_0, 0]
-         = \sqrt{\sum_{d_1=0}^{D_1-1} X[n, d_0, d_1]^2},
-
-      with shape :math:`[N, D_0, 1]`.
-
-    The leading dimension :math:`N` may represent either a batch axis
-    (``B``) or a sequence/page axis (``S``); the reduction is applied
-    independently for each slice along this dimension.
-
-    Parameters
-    ----------
-    dim : int, optional
-        Reduction dimension in the logical 3D tensor (``1`` for :math:`D_0`,
-        ``2`` for :math:`D_1`). Default is ``1``.
+    :Math: ``dim=1``: :math:`\text{out}[n,0,d_1]=\sqrt{\sum_{d_0}X[n,d_0,d_1]^2}`;
+        ``dim=2``: :math:`\text{out}[n,d_0,0]=\sqrt{\sum_{d_1}X[n,d_0,d_1]^2}`.
+    :__init__: ``L2Norm(dim=1)`` — axis to reduce (``1`` → :math:`D_0`,
+        ``2`` → :math:`D_1`).
+    :__call__: ``y = op(x, ctx=ctx)`` — ``[N, D_0, D_1]`` → ``[N, 1, D_1]``
+        (``dim=1``) or ``[N, D_0, 1]`` (``dim=2``).
     """
     def __init__(self, dim: int = 1):
         super().__init__(dim)
@@ -346,43 +163,14 @@ class L2Norm(Reduce):
 
 class Sum(Reduce):
     r"""
-    Sum reduction over a single logical axis.
+    Sum reduction over one logical axis (a :class:`Reduce`).
 
-    Given an input tensor
-
-    .. math::
-
-        X \in \mathbb{R}^{N \times D_0 \times D_1},
-
-    this operator computes, depending on ``dim``:
-
-    - ``dim == 1`` (reduce over :math:`D_0`):
-
-      .. math::
-
-         \text{out}[n, 0, d_1]
-         = \sum_{d_0=0}^{D_0-1} X[n, d_0, d_1],
-
-      with shape :math:`[N, 1, D_1]`.
-
-    - ``dim == 2`` (reduce over :math:`D_1`):
-
-      .. math::
-
-         \text{out}[n, d_0, 0]
-         = \sum_{d_1=0}^{D_1-1} X[n, d_0, d_1],
-
-      with shape :math:`[N, D_0, 1]`.
-
-    The leading dimension :math:`N` may represent either a batch axis
-    (``B``) or a sequence/page axis (``S``); the reduction is applied
-    independently for each slice along this dimension.
-
-    Parameters
-    ----------
-    dim : int, optional
-        Reduction dimension in the logical 3D tensor (``1`` for :math:`D_0`,
-        ``2`` for :math:`D_1`). Default is ``1``.
+    :Math: ``dim=1``: :math:`\text{out}[n,0,d_1]=\sum_{d_0}X[n,d_0,d_1]`;
+        ``dim=2``: :math:`\text{out}[n,d_0,0]=\sum_{d_1}X[n,d_0,d_1]`.
+    :__init__: ``Sum(dim=1)`` — axis to reduce (``1`` → :math:`D_0`,
+        ``2`` → :math:`D_1`).
+    :__call__: ``y = op(x, ctx=ctx)`` — ``[N, D_0, D_1]`` → ``[N, 1, D_1]``
+        (``dim=1``) or ``[N, D_0, 1]`` (``dim=2``).
     """
     def __init__(self, dim: int = 1):
         super().__init__(dim)
