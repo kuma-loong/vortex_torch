@@ -98,25 +98,25 @@ modifying the compiler itself, not when writing a submission.
   across requests with matching prompt prefixes, corrupting
   Save/Load values. `check_engine_config` rejects the violation.
 
-## Environment — activate the `vortex_v04` conda env first
+## Environment — activate the `vortex_v1` conda env first
 
 Every python invocation in this project (`check_engine_config`,
 `run_submission_aime24.py`, the pre-flight loops in the slash
-commands, etc.) expects the **`vortex_v04`** conda environment.
+commands, etc.) expects the **`vortex_v1`** conda environment.
 **Activate it once at session start** before running any of the
 bash snippets below:
 
 ```bash
 source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate vortex_v04
-python -c "import sys; print(sys.executable)"   # expect a path under .../envs/vortex_v04/
+conda activate vortex_v1
+python -c "import sys; print(sys.executable)"   # expect a path under .../envs/vortex_v1/
 ```
 
 If `conda activate` isn't available in the current shell (e.g. a
 non-interactive sub-shell that didn't source the conda profile),
-fall back to `conda run -n vortex_v04 python ...` for every
+fall back to `conda run -n vortex_v1 python ...` for every
 python call. Either form is acceptable; what matters is that the
-running interpreter is the one inside `vortex_v04`.
+running interpreter is the one inside `vortex_v1`.
 
 ## Running the benchmark — policy
 
