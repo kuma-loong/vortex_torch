@@ -146,25 +146,25 @@ CLAUDE_MD = dedent("""\
       across requests with matching prompt prefixes, corrupting
       Save/Load values. `check_engine_config` rejects the violation.
 
-    ## Environment — activate the `vortex_v04` conda env first
+    ## Environment — activate the `vortex_v1` conda env first
 
     Every python invocation in this project (`check_engine_config`,
     `run_submission_aime24.py`, the pre-flight loops in the slash
-    commands, etc.) expects the **`vortex_v04`** conda environment.
+    commands, etc.) expects the **`vortex_v1`** conda environment.
     **Activate it once at session start** before running any of the
     bash snippets below:
 
     ```bash
     source "$(conda info --base)/etc/profile.d/conda.sh"
-    conda activate vortex_v04
-    python -c "import sys; print(sys.executable)"   # expect a path under .../envs/vortex_v04/
+    conda activate vortex_v1
+    python -c "import sys; print(sys.executable)"   # expect a path under .../envs/vortex_v1/
     ```
 
     If `conda activate` isn't available in the current shell (e.g. a
     non-interactive sub-shell that didn't source the conda profile),
-    fall back to `conda run -n vortex_v04 python ...` for every
+    fall back to `conda run -n vortex_v1 python ...` for every
     python call. Either form is acceptable; what matters is that the
-    running interpreter is the one inside `vortex_v04`.
+    running interpreter is the one inside `vortex_v1`.
 
     ## Running the benchmark — policy
 
@@ -413,19 +413,19 @@ SUBMISSION_WRITER = dedent("""\
     yet exist, create it; otherwise resume into it. Confirm the tag
     with the user only if you cannot determine your model name.
 
-    ### Second action — activate the `vortex_v04` conda env
+    ### Second action — activate the `vortex_v1` conda env
 
     Every python call in this workflow must run inside the
-    **`vortex_v04`** conda env. Activate once at session start:
+    **`vortex_v1`** conda env. Activate once at session start:
 
     ```bash
     source "$(conda info --base)/etc/profile.d/conda.sh"
-    conda activate vortex_v04
-    python -c "import sys; print(sys.executable)"   # must be .../envs/vortex_v04/...
+    conda activate vortex_v1
+    python -c "import sys; print(sys.executable)"   # must be .../envs/vortex_v1/...
     ```
 
     If `conda activate` isn't usable in the current shell, prefix
-    each python invocation with `conda run -n vortex_v04` instead.
+    each python invocation with `conda run -n vortex_v1` instead.
     A wrong-env python will fail to import the framework's C
     extension and every pre-flight / benchmark call below will error.
 
@@ -1074,7 +1074,7 @@ CMD_ITERATE = dedent("""\
     ```bash
     CONDA_BASE=$(conda info --base 2>/dev/null || echo /root/anaconda3)
     source "$CONDA_BASE/etc/profile.d/conda.sh"
-    conda activate vortex_v04
+    conda activate vortex_v1
     python -c "import sys; print(sys.executable)"
     ```
 

@@ -1,0 +1,155 @@
+import torch
+from typing import Dict
+
+from .flow_mla import vFlowMLA
+from .registry import register
+from ..indexer import topK, GeMM, Mean, Max
+from ..cache import Mean as CMean, MeanInterleave as CMeanInterleave
+from ..abs import ContextBase
+
+# MLA flows (DeepSeek-V2/V3-style latent attention). The cache stores a single
+# shared, fused latent per token: cache["latent"] = [ kv_c | k_pe ] of inner dim
+# (kv_lora_rank + qk_rope_head_dim), auto-provided. forward_indexer receives the
+# fused absorbed query q = [ q_nope_out | q_pe ] (the backend concatenates), so a
+# single dot ⟨q, centroid(latent)⟩ is the FULL decode logit
+# ⟨q_nope,kv_c⟩ + ⟨q_pe,k_pe⟩. See vortex_torch/flow/flow_mla.py.
+
+
+@register("rope_aware_block_sparse_mla")
+class RopeAwareBlockSparseMLA(vFlowMLA):
+    r"""
+    Block-sparse routing on the **fused MLA latent** — the full decode logit
+    (latent + RoPE terms) from one centroid and one dot product.
+
+    **Cache.** :meth:`forward_cache` keeps one centroid per page: the mean of the
+    page's fused latents
+
+    .. math::
+
+        c_p \;=\; \frac{1}{|p|}\sum_{t\in p}\text{latent}_t \;\in\; \mathbb{R}^{d_c+d_r},
+        \qquad \text{latent}_t = [\,\text{kv\_c}_t \,|\, \text{k\_pe}_t\,].
+
+    **Routing.** With the head-averaged fused query
+    :math:`\bar q = \tfrac1H\sum_h [\,q\_nope\_out_h \,|\, q\_pe_h\,]`, each page
+    is scored by the **complete** logit (both terms fall out of the single dot,
+    since the latent and query are the concatenations), then top-:math:`k`:
+
+    .. math::
+
+        \operatorname{score}(p) = \langle \bar q,\, c_p\rangle
+        = \langle \bar q_{\text{nope}}, c^{\text{kv}}_p\rangle
+        + \langle \bar q_{\text{pe}}, c^{\text{pe}}_p\rangle .
+    """
+
+    def __init__(self):
+        super().__init__()
+        # Indexer-side ops (run every decode step)
+        self.mean = Mean(dim=1)        # average the fused query over its H heads
+        self.gemm = GeMM()             # GeMM(x, y) = y @ xᵀ  → per-page score
+        self.output_func = topK()      # terminal: write selected page ids to o
+
+        # Cache-side op (run once per finished page)
+        self.reduction = CMean(dim=1)  # centroid = mean of the fused latent over the block
+
+    def forward_indexer(
+        self,
+        q: torch.Tensor,               # [B, H, latent_dim]  ([q_nope_out | q_pe])
+        o: torch.Tensor,
+        cache: Dict[str, torch.Tensor],
+        ctx: ContextBase,
+    ):
+        q_mean = self.mean(q, ctx=ctx)                              # [B, 1, latent_dim]
+        score = self.gemm(q_mean, cache["centroids"], ctx=ctx)     # [S, 1, 1]
+        self.output_func(score, o, ctx=ctx)
+
+    def forward_cache(
+        self,
+        cache: Dict[str, torch.Tensor],
+        loc: torch.Tensor,
+        ctx: ContextBase,
+    ):
+        self.reduction(cache["latent"], cache["centroids"], loc=loc, ctx=ctx)
+
+    def create_cache(self, block_size: int, kv_lora_rank: int, qk_rope_head_dim: int):
+        # "latent" is auto-provided — declare only the aux centroid (full width).
+        return {
+            "centroids": (1, kv_lora_rank + qk_rope_head_dim),
+        }
+
+
+@register("lserve_centroid_mla")
+class LServeCentroidMLA(vFlowMLA):
+    r"""
+    LServe-style **sub-block** centroid routing on the fused MLA latent.
+
+    Each block is split into consecutive sub-blocks of :attr:`SUB_BLOCK_SIZE`
+    tokens, and one fused-latent centroid is kept **per sub-block**. A block is
+    ranked by the query's best match against any of its sub-block centroids, so
+    a single relevant sub-region is enough to select the block — sharper than a
+    single block-mean when the relevant keys are concentrated in part of a
+    block.
+
+    **Cache.** :meth:`forward_cache` stores, for each of the
+    :math:`n_b = \text{block\_size} / \text{SUB\_BLOCK\_SIZE}` sub-blocks
+    :math:`b` of block :math:`p`, a fused-latent centroid via
+    :class:`MeanInterleave`:
+
+    .. math::
+
+        c_{p,b} = \frac{1}{|b|}\sum_{t\in b}\text{latent}_t,
+        \qquad \text{latent}_t = [\,\text{kv\_c}_t \,|\, \text{k\_pe}_t\,].
+
+    **Routing.** With the head-averaged fused query
+    :math:`\bar q = \tfrac1H\sum_h [\,q\_nope\_out_h \,|\, q\_pe_h\,]`, each
+    sub-block carries the **complete** decode logit (latent + RoPE terms fall
+    out of the one dot, since both query and latent are the concatenations);
+    the block score is the max over its sub-blocks:
+
+    .. math::
+
+        \operatorname{score}(p)
+        = \max_{b}\,\langle \bar q,\, c_{p,b}\rangle .
+
+    **Shapes.** ``q`` is ``[B, H, d_c+d_r]``; ``cache["centroids"]`` is
+    ``[S, n_b, d_c+d_r]`` (indexer) / ``[B, n_b, d_c+d_r]`` (cache). With
+    ``block_size == SUB_BLOCK_SIZE`` there is one sub-block per block
+    (:math:`n_b = 1`), recovering :class:`RopeAwareBlockSparseMLA`.
+    """
+    SUB_BLOCK_SIZE = 16
+
+    def __init__(self):
+        super().__init__()
+        # Indexer-side ops (run every decode step)
+        self.mean = Mean(dim=1)        # average the fused query over its H heads
+        self.gemm = GeMM()             # GeMM(x, y) = y @ xᵀ  → per-sub-block score
+        self.max_sub = Max(dim=1)      # max over the block's sub-block centroids
+        self.output_func = topK()      # terminal: write selected block ids to o
+
+        # Cache-side op (run once per finished block): per-sub-block latent mean
+        self.reduction = CMeanInterleave(dim=1, k=self.SUB_BLOCK_SIZE)
+
+    def forward_indexer(
+        self,
+        q: torch.Tensor,               # [B, H, latent_dim]  ([q_nope_out | q_pe])
+        o: torch.Tensor,
+        cache: Dict[str, torch.Tensor],
+        ctx: ContextBase,
+    ):
+        q_mean = self.mean(q, ctx=ctx)                              # [B, 1, latent_dim]
+        score = self.gemm(q_mean, cache["centroids"], ctx=ctx)     # [S, n_b, 1]
+        page_score = self.max_sub(score, ctx=ctx)                  # [S, 1, 1]
+        self.output_func(page_score, o, ctx=ctx)
+
+    def forward_cache(
+        self,
+        cache: Dict[str, torch.Tensor],
+        loc: torch.Tensor,
+        ctx: ContextBase,
+    ):
+        self.reduction(cache["latent"], cache["centroids"], loc=loc, ctx=ctx)
+
+    def create_cache(self, block_size: int, kv_lora_rank: int, qk_rope_head_dim: int):
+        # "latent" is auto-provided — declare only the per-sub-block centroids.
+        return {
+            "centroids": (block_size // self.SUB_BLOCK_SIZE, kv_lora_rank + qk_rope_head_dim),
+        }

@@ -25,4 +25,17 @@ from vortex_torch.engine.sgl.attention_backend.trtllm import (
     VortexTRTLLMBackend,
 )
 
-__all__ = ["VortexFlashInferBackend", "VortexTRTLLMBackend"]
+from vortex_torch.engine.sgl.attention_backend.trtllm_mla import (
+    VortexTRTLLMMLABackend,
+)
+
+from vortex_torch.engine.sgl.attention_backend.triton_mla import (
+    VortexTritonMLABackend,
+)
+
+__all__ = [
+    "VortexFlashInferBackend",
+    "VortexTRTLLMBackend",
+    "VortexTRTLLMMLABackend",
+    "VortexTritonMLABackend",
+]

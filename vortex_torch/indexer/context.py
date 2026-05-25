@@ -59,6 +59,7 @@ class Context(ContextBase):
         "op_to_input_tensor_list", "op_to_output_tensor_list",
         "side_effect_op_ids",
         "sparse_attention_name", "impl_backend", "tensor_id_to_tensor_name_map",
+        "query_arg_names",
         "compilation_header_lines", "auxilary_func_def_lines",
         "compilation_cache_dir",
         # ---- tensor-core (bf16-compute) codegen toggle ----
@@ -227,6 +228,10 @@ class Context(ContextBase):
         self.op_to_output_tensor_list = []
         self.side_effect_op_ids = []
         self.tensor_id_to_tensor_name_map = {}
+        # Query argument name(s) for the generated ``forward(...)`` entry point.
+        # MHA flows pass a single ``q``; MLA flows pass the absorbed pair
+        # ``q_nope_out``/``q_pe`` and set this to ["q_nope_out", "q_pe"].
+        self.query_arg_names = ["q"]
         self.compilation_header_lines = []
         self.auxilary_func_def_lines = []
         self.compilation_cache_dir = sa.vortex_compilation_cache_dir

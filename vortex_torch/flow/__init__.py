@@ -31,6 +31,7 @@ vFlows in downstream models and runtime systems.
 """
 
 from .flow import vFlow
+from .flow_mla import vFlowMLA
 from .registry import register
 from .loader import build_vflow
 from .verify import (
@@ -39,8 +40,10 @@ from .verify import (
     DEFAULT_PAGE_BLOCK_RATIOS, DEFAULT_PAGES_PER_WORKLOAD,
 )
 from . import algorithms
+from . import algorithms_mla
 __all__ = [
     "vFlow",
+    "vFlowMLA",
     "register",
     "build_vflow",
     "verify_flow_compilable",

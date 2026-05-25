@@ -38,31 +38,44 @@ def generate_reduce_interleave_impl(graph: Graph, op_id: int, ctx: Context) -> s
     y = f"tensor_{output_tensor_id}_block"
 
     # ``tl.reshape`` axis sizes must be pow2; the loaded block carries
-    # padded inner dims, so the (D0/k, k, D1) split must use the padded
-    # extents. Real-shape divisibility against ``k`` is still the
-    # correctness contract — generic non-pow2-divisible-by-k inputs
-    # require an inter-block repack we haven't implemented.
-    assert not (t_i.needs_padding() or t_o.needs_padding()), (
-        f"ReduceInterleave under non-pow2 inner dims is not yet supported "
-        f"(input {t_i.shape!r}, output {t_o.shape!r})."
-    )
+    # padded inner dims, so the (D0/k, k, D1) split must use the *padded*
+    # extents to match the loaded block's element count. Padding on the
+    # **non-reduced** carried axis is harmless — the load masks those lanes
+    # to 0 and the store masks them back out — so it is allowed (MLA's 576-d
+    # fused latent relies on this). Padding on the **reduced** axis is not:
+    # it would fold synthetic zero lanes into the k-groups, so that axis must
+    # be pow2 (real == padded). Real-shape divisibility against ``k`` remains
+    # the correctness contract.
     D0, D1 = t_i.shape[1], t_i.shape[2]
+    D0p, D1p = t_i.padded_shape[1], t_i.padded_shape[2]
     k = op.k
 
     # Build the (3D) reshape target and the axis along which the inner
     # group of k elements gets reduced. ``D0``/``D1`` and ``k`` are all
     # constexpr at codegen time, so the shape tuple is a static literal.
     if op.dim == 1:
+        # reduced axis = D0 (and its reduced result, out dim 1) must be pow2.
+        assert D0p == D0 and t_o.padded_shape[1] == t_o.shape[1], (
+            f"ReduceInterleave(dim=1): the reduced axis must be pow2 "
+            f"(input {t_i.shape!r}->{t_i.padded_shape!r}, "
+            f"output {t_o.shape!r}->{t_o.padded_shape!r})."
+        )
         assert D0 % k == 0, (
             f"reduce_interleave codegen: D0={D0} not divisible by k={k}"
         )
-        new_shape = f"({D0 // k}, {k}, {D1})"
+        new_shape = f"({D0 // k}, {k}, {D1p})"
         axis = 1
     else:  # op.dim == 2
+        # reduced axis = D1 (inner) must be pow2 (no zero-lane folding).
+        assert D1p == D1 and t_o.padded_shape[2] == t_o.shape[2], (
+            f"ReduceInterleave(dim=2): the reduced inner axis must be pow2 "
+            f"(input {t_i.shape!r}->{t_i.padded_shape!r}, "
+            f"output {t_o.shape!r}->{t_o.padded_shape!r})."
+        )
         assert D1 % k == 0, (
             f"reduce_interleave codegen: D1={D1} not divisible by k={k}"
         )
-        new_shape = f"({D0}, {D1 // k}, {k})"
+        new_shape = f"({D0p}, {D1 // k}, {k})"
         axis = 2
 
     x_grouped = f"tl.reshape({x}, {new_shape})"

@@ -546,7 +546,12 @@ class ModelRunnerKVCacheMixin:
                 end_layer=self.end_layer,
                 index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
             )
-        elif self.use_mla_backend and not self.mambaish_config:
+        elif (
+            self.use_mla_backend
+            and not self.mambaish_config
+            and not self.server_args.enable_vortex_sparsity
+        ):
+            # vortex+MLA falls through to the VortexMLACachePool branch below.
             assert not is_nsa_model
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 self.token_to_kv_pool = MLATokenToKVPoolFP4(
@@ -588,8 +593,25 @@ class ModelRunnerKVCacheMixin:
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
             )
+        elif self.server_args.enable_vortex_sparsity and self.use_mla_backend:
+            # MLA: single fused latent pool (kv_c | k_pe), no per-head K/V.
+            from vortex_torch.engine.sgl.memory_pool_mla import VortexMLACachePool
+            self.token_to_kv_pool = VortexMLACachePool(
+                self.max_total_num_tokens,
+                page_size=self.page_size,
+                dtype=self.kv_cache_dtype,
+                kv_lora_rank=self.model_config.kv_lora_rank,
+                qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                layer_num=self.num_effective_layers,
+                device=self.device,
+                enable_memory_saver=self.server_args.enable_memory_saver,
+                sparse_attention=self.sparse_attention,
+                model_runner=self,
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
+                )
         elif self.server_args.enable_vortex_sparsity:
-                    
+
             from vortex_torch.engine.sgl.memory_pool import VortexCachePool
             self.token_to_kv_pool = VortexCachePool(
                 self.max_total_num_tokens,

@@ -50,6 +50,9 @@ def create_flashinfer_backend(runner):
                 runner, init_new_workspace=runner.init_new_workspace
             )
     else:
+        # MLA + vortex sparsity is wired on the trtllm_mla backend (see
+        # create_trtllm_mla_backend) so prefill dispatches through the
+        # materialized MHA path. The flashinfer MLA path stays dense-only.
         from sglang.srt.layers.attention.flashinfer_mla_backend import (
             FlashInferMLAAttnBackend,
         )
@@ -61,6 +64,13 @@ def create_flashinfer_backend(runner):
 def create_trtllm_mla_backend(runner):
     if not runner.use_mla_backend:
         raise ValueError("trtllm_mla backend can only be used with MLA models.")
+    if runner.server_args.enable_vortex_sparsity:
+        # MLA + vortex sparsity. Use trtllm_mla (not flashinfer) so the model
+        # dispatches PREFILL through the materialized MHA path (192/128) — same
+        # as the dense baseline — and DECODE through absorb (the sparse path).
+        from vortex_torch.engine.sgl.attention_backend import VortexTRTLLMMLABackend
+
+        return VortexTRTLLMMLABackend(runner)
     from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
 
     return TRTLLMMLABackend(runner)
@@ -108,6 +118,13 @@ def create_triton_backend(runner):
         )
 
         return DoubleSparseAttnBackend(runner)
+    elif runner.use_mla_backend and runner.server_args.enable_vortex_sparsity:
+        # MLA + vortex on the Triton decode kernel (not geometry-locked like
+        # trtllm_mla; handles GLM-4.7-Flash's qk_nope=192 / v_head=256). Prefill
+        # + skipped-layer decode delegate to the dense TritonAttnBackend.
+        from vortex_torch.engine.sgl.attention_backend import VortexTritonMLABackend
+
+        return VortexTritonMLABackend(runner)
     else:
         from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 

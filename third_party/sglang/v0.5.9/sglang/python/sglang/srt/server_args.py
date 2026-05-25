@@ -2565,6 +2565,24 @@ class ServerArgs:
             )
 
     def _handle_pd_disaggregation(self):
+        # Vortex (PD disagg Option B) rebuilds its auxiliary cache on the decode
+        # side from the transferred K/V. That rebuild shares the cache-side
+        # compiled scratch with the live decode forward; the overlap scheduler
+        # would run them on different streams concurrently and corrupt it. Force
+        # overlap off on any vortex PD server — mirrors the non-PD engine helper
+        # in vortex_torch/engine/sgl/api.py, which hardcodes the same.
+        if self.enable_vortex_sparsity and self.disaggregation_mode in (
+            "prefill",
+            "decode",
+        ):
+            if not self.disable_overlap_schedule:
+                self.disable_overlap_schedule = True
+                logger.warning(
+                    "Overlap schedule is disabled for vortex sparsity under PD "
+                    "disaggregation (the decode-side aux rebuild shares cache "
+                    "scratch with the decode forward)."
+                )
+
         if self.disaggregation_mode == "decode":
             assert (
                 self.disaggregation_decode_tp is None

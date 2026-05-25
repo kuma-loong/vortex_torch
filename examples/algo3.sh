@@ -10,10 +10,10 @@ models=(
 MiniMaxAI/MiniMax-M2.7
 )
 trials=(
-32
+16
 )
 topk_val=(
-125
+61
 )
 for algo in "${sparse_algos[@]}"; do
   for model in "${models[@]}"; do
@@ -23,9 +23,9 @@ for algo in "${sparse_algos[@]}"; do
         python examples/verify_algo.py \
             --trials ${trial} \
             --topk-val ${k_val} \
-            --page-size 16 \
+            --page-size 32 \
             --workload-chunk-size 64 \
-            --block-size 16 \
+            --block-size 32 \
             --topk-ratio 0.00 \
             --vortex-module-name "${algo}" \
             --model-name  "${model}" \
@@ -37,7 +37,7 @@ for algo in "${sparse_algos[@]}"; do
             --vortex-attention-backend trtllm \
             --vortex-impl-backend triton \
             --vortex-use-tensor-core \
-            --vortex-layers-skip 0 \
+            --vortex-layers-skip \
             --summary-dir summary-MiniMax-M2.7-sglang-trtllm \
             --skip-already-finished-check
       done

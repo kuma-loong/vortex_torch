@@ -1,9 +1,11 @@
 # registry.py
-from typing import Dict, Type
+from typing import Dict, Type, Union
 from .flow import vFlow
+from .flow_mla import vFlowMLA
 
-# Global registry: key -> subclass of vFlow
-_REGISTRY: Dict[str, Type[vFlow]] = {}
+# Global registry: key -> subclass of vFlow (MHA) or vFlowMLA (latent attention)
+_FlowBase = (vFlow, vFlowMLA)
+_REGISTRY: Dict[str, Type[Union[vFlow, vFlowMLA]]] = {}
 
 class RegistryError(Exception):
     """Errors related to class registration and lookup."""
@@ -16,9 +18,9 @@ def register(name: str):
         @register("cls_a")
         class MyFlow(vFlow): ...
     """
-    def deco(cls: Type[vFlow]):
-        if not issubclass(cls, vFlow):
-            raise RegistryError(f"{cls.__name__} must inherit from vFlow")
+    def deco(cls):
+        if not issubclass(cls, _FlowBase):
+            raise RegistryError(f"{cls.__name__} must inherit from vFlow or vFlowMLA")
         if name in _REGISTRY:
             raise RegistryError(f"Registration name '{name}' already exists")
         _REGISTRY[name] = cls
