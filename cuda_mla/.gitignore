@@ -1,0 +1,7 @@
+# JIT build artifacts (torch cpp_extension / ninja output)
+build/
+build_*/
+spec/build_*/
+**/__pycache__/
+*.so
+*.o

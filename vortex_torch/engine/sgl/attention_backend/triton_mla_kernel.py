@@ -702,38 +702,38 @@ def decode_blocktable_mla_auto(
 # from host-known shape ints only, and is therefore stable across capture/replay
 # (a fixed kernel is captured for each (bs, block, H)).
 #
-# The rule is calibrated from the (H, bs, block) bandwidth sweep
-# (marks/mla/plan_study_report.md, sel=2048 on B200). Driver = program count
-# prog = bs * ceil(H/16):
-#   - block>=64: TMA wins once there is parallelism; kv-split only when starved.
-#     The crossover is lower for larger H (kv-split's fp32 mid-buffer ~ bs*H grows
-#     with H, so splitting stops paying sooner) — H<=16 splits up to prog<64,
-#     H>=32 only up to prog<16.
-#   - block<=32: kv-split (the smaller, less-coalesced tiles favor split
-#     parallelism over TMA's transpose cost; at very high prog kv-split's own
-#     nsplit collapses to 1, so it degrades gracefully toward single-pass).
+# Calibrated from the B200 (bs, block, H) bandwidth sweep at H=16/20, sel=2048
+# (marks/mla/plan_sweep2.jsonl). The candidate pool is the OPTIMIZED kernels
+# (kv_split_opt / single_pass_opt); the old single_pass / kv_split / tma are
+# dominated and no longer dispatched. Driver = optimized program count
+# prog = bs * ceil(H / BLOCK_H_opt(H)):
 #
-# Validated offline against the measured oracle (marks/mla/plan_study_report.md):
-# matches the best kernel in 36/40 cells and achieves 99.5% of oracle bandwidth;
-# every high-bandwidth cell (high bs, block=64) is matched exactly — the few
-# misses are in the low-BW high-H/block=32 corner (<=8% of peak).
+#   * kv_split_opt is the default. At these low head counts (16/20) a single-
+#     pass program count of prog<=128 leaves the 148-SM B200 under-filled, so
+#     the split's extra split-dimension wins almost everywhere; its BLOCK_H=32
+#     also removes the redundant 2nd head-block at H=20 (vs the old kv_split:
+#     +18..+72% at high bs).
+#   * single_pass_opt overtakes it only in the fully-saturated, bandwidth-bound
+#     corner — large pages (block>=64) AND enough programs to fill the GPU
+#     (prog>=128). There the split's fp32 mid-buffer round-trip costs more than
+#     its parallelism buys (H=16 bs=128 blk=64: 2688 vs 2273 GB/s, +18%).
+#
+# Validated against the measured oracle (marks/mla/plan_sweep2.jsonl): matches
+# the best kernel (within ~2%, i.e. measurement noise) in every swept cell.
 # ====================================================================== #
-_PLAN_BLOCK_H = 16
+_PLAN_SATURATE_PROG = 128   # prog at/above which single-pass fills the SMs (B200)
 
 
 def plan_select(bs, block_size, num_query_heads):
     """Pure pre-set dispatch rule → kernel name. No GPU, no seqlens, no profiling
     (cuda-graph-capture safe — decided from host-known shape ints only).
-    Calibrated from the B200 (H,bs,block) sweep."""
-    nhb = (num_query_heads + _PLAN_BLOCK_H - 1) // _PLAN_BLOCK_H
-    prog = bs * nhb
-    if block_size >= 64:
-        # TMA once there is parallelism; kv-split only when starved. Crossover is
-        # lower for larger H (kv-split's fp32 mid-buffer ~ bs*H stops paying sooner).
-        thresh = 64 if num_query_heads <= 16 else 16
-        return "kv_split" if prog < thresh else "tma"
-    # block_size <= 32: kv-split (collapses to ~single-pass via nsplit->1 at high prog)
-    return "kv_split"
+    Calibrated from the B200 (bs, block, H) sweep at H=16/20."""
+    bh = _opt_block_h(num_query_heads)
+    prog = bs * ((num_query_heads + bh - 1) // bh)
+    # single-pass only in the saturated + bandwidth-bound corner; else the split.
+    if block_size >= 64 and prog >= _PLAN_SATURATE_PROG:
+        return "single_pass_opt"
+    return "kv_split_opt"
 
 
 def decode_blocktable_mla_plan(
@@ -747,6 +747,383 @@ def decode_blocktable_mla_plan(
                          block_size, kv_lora_rank, o)
 
 
+# ====================================================================== #
+# OPTIMIZED single-pass + TMA kernels.
+#
+# Two changes over the baselines above, both grounded in the decode geometry:
+#
+#  (1) **Last-block-only masking (no masked LOADS, no separate tail).** The
+#      baseline applies the boundary mask ``valid = offs_n < seqlen`` on EVERY
+#      KV tile — masked K/V loads (``other=0``) plus a ``tl.where(..., -inf)``.
+#      Only the *last* tile can straddle ``seqlen``; for every full tile
+#      ``valid`` is all-true, so that work is wasted. We drop the LOAD masks
+#      entirely — each KV page is allocated full (``BLOCK_SIZE`` rows), so a
+#      whole-tile read is always in-bounds even when the request ends mid-page —
+#      and keep only a score-side ``tl.where(offs_n < seqlen, qk, -inf)`` that
+#      is a no-op except on the last tile and simply drops the over-read tokens
+#      out of the softmax. Crucially this stays a SINGLE loop: a peeled,
+#      duplicated masked *tail block* inflates the register/code footprint and
+#      collapses occupancy at small block_size (measured -14..-27%), wiping out
+#      the gain. The dim masks (``mask_d/dpe/dv``) are dropped too (``offs_d <
+#      576`` / ``offs_dv < 512`` are provably all-true), and invalid query-head
+#      rows need no per-tile ``where``: they load q=0 (finite softmax) and are
+#      discarded by the masked final store.
+#
+#  (2) **Larger query-head tile (``BLOCK_H``).** Each ``(batch, head_block)``
+#      program streams the request's ENTIRE selected KV. With ``H`` query heads
+#      that is ``ceil(H / BLOCK_H)`` independent re-reads of the same KV. The
+#      baseline's ``BLOCK_H=16`` therefore re-reads the KV 8x at the real MLA
+#      head count (H=128); raising ``BLOCK_H`` cuts the redundant traffic
+#      (H=128: 16->8 blocks, 32->4, 64->2) and feeds the tensor cores wider
+#      ``[BLOCK_H, *]`` MMA tiles. ``_opt_block_h`` picks it from H.
+# ====================================================================== #
+def _opt_block_h(H: int) -> int:
+    """Query-head tile. Bigger => fewer redundant full-KV re-reads across
+    head-blocks (H=128: 16->8 blocks, 32->4) and wider MMA. Capped at 32:
+    BLOCK_H=64 is non-viable here — acc=[64,512]fp32 + double-buffered K/V tiles
+    overflow B200 shared memory at block_size=64 (~352KB > 227KB) and trip a
+    Triton vectorized-gather misalignment at block_size=32. 32 is the measured
+    sweet spot (see report)."""
+    return 16 if H <= 16 else 32
+
+
+@triton.jit
+def _fwd_blocktable_mla_kernel_opt(
+    Q,
+    K_Buffer,
+    V_Buffer,
+    sm_scale,
+    Seqlens,
+    Block_Table,
+    O,
+    stride_qbs,
+    stride_qh,
+    stride_buf_kbs,
+    stride_buf_vbs,
+    stride_obs,
+    stride_oh,
+    stride_bt_b,
+    kv_group_num: tl.constexpr,
+    q_head_num: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DPE: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    Lk: tl.constexpr,
+    Lv: tl.constexpr,
+):
+    cur_batch = tl.program_id(0)
+    cur_head_id = tl.program_id(1)
+
+    if BLOCK_H < kv_group_num:
+        VALID_BLOCK_H: tl.constexpr = BLOCK_H
+    else:
+        VALID_BLOCK_H: tl.constexpr = kv_group_num
+    cur_head = cur_head_id * VALID_BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = (cur_head < (cur_head_id + 1) * VALID_BLOCK_H) & (cur_head < q_head_num)
+
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_dv = tl.arange(0, BLOCK_DV)
+    offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
+
+    seqlen = tl.load(Seqlens + cur_batch)
+
+    # query is loaded once; invalid head rows get 0 (=> finite softmax, dropped
+    # by the masked store). No dim mask: offs_d<576 / offs_dpe<576 are all-true.
+    offs_q = cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_d[None, :]
+    q = tl.load(Q + offs_q, mask=mask_h[:, None], other=0.0)
+    off_qpe = cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_dpe[None, :]
+    qpe = tl.load(Q + off_qpe, mask=mask_h[:, None], other=0.0)
+
+    e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
+    e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
+
+    bt_base = Block_Table + cur_batch * stride_bt_b
+    n_blocks = tl.cdiv(seqlen, BLOCK_N)
+
+    # SINGLE loop over ceil(seqlen / BLOCK_N) tiles. Loads are UNMASKED: every
+    # KV page is allocated full (BLOCK_SIZE rows), so reading a whole tile is
+    # always in-bounds even when the request ends mid-page. Only the SCORE is
+    # masked (``offs_n < seqlen``) — and that predicate is all-true for every
+    # tile EXCEPT the last (the "only the last block needs a mask" property),
+    # so it is a no-op in the steady state and just drops the partial tail's
+    # over-read tokens out of the softmax. There is deliberately NO separate
+    # masked tail block: duplicating the load/dot/softmax body inflates the
+    # register + code footprint and collapses occupancy at small block_size
+    # (measured -14..-27%); the in-loop predicate keeps the steady state intact.
+    for blk in range(0, n_blocks):
+        offs_n = blk * BLOCK_N + tl.arange(0, BLOCK_N)
+        page = tl.load(bt_base + (offs_n // BLOCK_SIZE))
+        kv_loc = page * BLOCK_SIZE + (offs_n % BLOCK_SIZE)
+
+        k = tl.load(K_Buffer + kv_loc[None, :] * stride_buf_kbs + offs_d[:, None])
+        qk = tl.dot(q, k.to(q.dtype))
+        kpe = tl.load(K_Buffer + kv_loc[None, :] * stride_buf_kbs + offs_dpe[:, None])
+        qk += tl.dot(qpe, kpe.to(qpe.dtype))
+        qk *= sm_scale
+        qk = tl.where(offs_n[None, :] < seqlen, qk, float("-inf"))
+
+        v = tl.load(V_Buffer + kv_loc[:, None] * stride_buf_vbs + offs_dv[None, :])
+        n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+        re_scale = tl.exp(e_max - n_e_max)
+        p = tl.exp(qk - n_e_max[:, None])
+        acc *= re_scale[:, None]
+        acc += tl.dot(p.to(v.dtype), v)
+        e_sum = e_sum * re_scale + tl.sum(p, 1)
+        e_max = n_e_max
+
+    offs_o = cur_batch * stride_obs + cur_head[:, None] * stride_oh + offs_dv[None, :]
+    tl.store(O + offs_o, acc / e_sum[:, None], mask=mask_h[:, None])
+
+
+def decode_blocktable_mla_opt(
+    q, latent, block_table, seqlens, sm_scale, block_size, kv_lora_rank, o=None,
+    block_n=None, block_h=None, num_warps=8, num_stages=2,
+) -> torch.Tensor:
+    bs, H, Lk = q.shape
+    Lv = kv_lora_rank
+    assert Lk == 576 and Lv == 512, f"MLA latent must be 512+64=576 (got Lk={Lk}, Lv={Lv})"
+    if o is None:
+        o = q.new_empty((bs, H, Lv))
+    kv_group_num = H
+    BLOCK_H = block_h if block_h is not None else _opt_block_h(H)
+    BLOCK_DMODEL, BLOCK_DPE = 512, 64
+    BLOCK_DV = triton.next_power_of_2(Lv)
+    BLOCK_N = block_n if block_n is not None else block_size
+    grid = (bs, triton.cdiv(H, min(BLOCK_H, kv_group_num)))
+
+    _fwd_blocktable_mla_kernel_opt[grid](
+        q, latent, latent, sm_scale, seqlens, block_table, o,
+        q.stride(0), q.stride(1), latent.stride(0), latent.stride(0),
+        o.stride(0), o.stride(1), block_table.stride(0),
+        kv_group_num=kv_group_num, q_head_num=H, BLOCK_SIZE=block_size,
+        BLOCK_DMODEL=BLOCK_DMODEL, BLOCK_DPE=BLOCK_DPE, BLOCK_DV=BLOCK_DV,
+        BLOCK_N=BLOCK_N, BLOCK_H=BLOCK_H, Lk=Lk, Lv=Lv,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+    return o
+
+
+@triton.jit
+def _fwd_blocktable_tma_kernel_opt(
+    Q, Latent, num_slots, latent_stride0, sm_scale, Seqlens, Block_Table, O,
+    stride_qbs, stride_qh, stride_obs, stride_oh, stride_bt_b,
+    kv_group_num: tl.constexpr, q_head_num: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr, BLOCK_DMODEL: tl.constexpr, BLOCK_DPE: tl.constexpr,
+    BLOCK_DV: tl.constexpr, BLOCK_H: tl.constexpr, Lk: tl.constexpr, Lv: tl.constexpr,
+):
+    desc_nope = tl.make_tensor_descriptor(
+        Latent, shape=[num_slots, BLOCK_DMODEL], strides=[latent_stride0, 1],
+        block_shape=[BLOCK_SIZE, BLOCK_DMODEL])
+    desc_rope = tl.make_tensor_descriptor(
+        Latent + BLOCK_DMODEL, shape=[num_slots, BLOCK_DPE], strides=[latent_stride0, 1],
+        block_shape=[BLOCK_SIZE, BLOCK_DPE])
+    cur_batch = tl.program_id(0)
+    cur_head_id = tl.program_id(1)
+    if BLOCK_H < kv_group_num:
+        VALID_BLOCK_H: tl.constexpr = BLOCK_H
+    else:
+        VALID_BLOCK_H: tl.constexpr = kv_group_num
+    cur_head = cur_head_id * VALID_BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = (cur_head < (cur_head_id + 1) * VALID_BLOCK_H) & (cur_head < q_head_num)
+
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_dv = tl.arange(0, BLOCK_DV)
+    offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
+
+    seqlen = tl.load(Seqlens + cur_batch)
+    n_blocks = tl.cdiv(seqlen, BLOCK_SIZE)
+
+    offs_q = cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_d[None, :]
+    q = tl.load(Q + offs_q, mask=mask_h[:, None], other=0.0)
+    off_qpe = cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_dpe[None, :]
+    qpe = tl.load(Q + off_qpe, mask=mask_h[:, None], other=0.0)
+
+    e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
+    e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
+
+    # SINGLE loop over all pages; TMA descriptor loads the full page (always
+    # in-bounds). Only the score is masked, and (offs_n < seqlen) is all-true
+    # except on the last page — no separate tail block (see single-pass note).
+    for blk in range(0, n_blocks):
+        page = tl.load(Block_Table + cur_batch * stride_bt_b + blk)
+        k_nope = tl.load_tensor_descriptor(desc_nope, [page * BLOCK_SIZE, 0])  # [BS, 512]
+        k_pe = tl.load_tensor_descriptor(desc_rope, [page * BLOCK_SIZE, 0])    # [BS, 64]
+        offs_n = blk * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        qk = tl.dot(q, tl.trans(k_nope).to(q.dtype))
+        qk += tl.dot(qpe, tl.trans(k_pe).to(qpe.dtype))
+        qk *= sm_scale
+        qk = tl.where(offs_n[None, :] < seqlen, qk, float("-inf"))
+        n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+        re_scale = tl.exp(e_max - n_e_max)
+        p = tl.exp(qk - n_e_max[:, None])   # p=0 for over-read cols => no contribution
+        acc *= re_scale[:, None]
+        acc += tl.dot(p.to(k_nope.dtype), k_nope)
+        e_sum = e_sum * re_scale + tl.sum(p, 1)
+        e_max = n_e_max
+
+    offs_o = cur_batch * stride_obs + cur_head[:, None] * stride_oh + offs_dv[None, :]
+    tl.store(O + offs_o, acc / e_sum[:, None], mask=mask_h[:, None])
+
+
+def decode_blocktable_mla_tma_opt(
+    q, latent, block_table, seqlens, sm_scale, block_size, kv_lora_rank, o=None,
+    block_h=None, num_warps=8, num_stages=2,
+):
+    import torch
+    global _tma_alloc_set
+    if not _tma_alloc_set:
+        triton.set_allocator(
+            lambda size, align, stream: torch.empty(size, dtype=torch.int8, device="cuda"))
+        _tma_alloc_set = True
+    bs, H, Lk = q.shape
+    Lv = kv_lora_rank
+    if o is None:
+        o = q.new_empty((bs, H, Lv))
+    BLOCK_H = block_h if block_h is not None else _opt_block_h(H)
+    grid = (bs, triton.cdiv(H, min(BLOCK_H, H)))
+    _fwd_blocktable_tma_kernel_opt[grid](
+        q, latent, latent.shape[0], latent.stride(0), sm_scale, seqlens, block_table, o,
+        q.stride(0), q.stride(1), o.stride(0), o.stride(1), block_table.stride(0),
+        kv_group_num=H, q_head_num=H, BLOCK_SIZE=block_size,
+        BLOCK_DMODEL=512, BLOCK_DPE=64, BLOCK_DV=triton.next_power_of_2(Lv),
+        BLOCK_H=BLOCK_H, Lk=Lk, Lv=Lv, num_warps=num_warps, num_stages=num_stages,
+    )
+    return o
+
+
+@triton.jit
+def _fwd_blocktable_split_stage1_opt(
+    Q, K_Buffer, V_Buffer, sm_scale,
+    Seqlens, Block_Table, num_kv_splits,
+    Mid_O, Mid_Lse,
+    stride_qbs, stride_qh,
+    stride_buf_kbs, stride_buf_vbs,
+    stride_mid_ob, stride_mid_oh, stride_mid_os,
+    stride_lse_b, stride_lse_h,
+    stride_bt_b,
+    kv_group_num: tl.constexpr, q_head_num: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr, BLOCK_DMODEL: tl.constexpr, BLOCK_DPE: tl.constexpr,
+    BLOCK_DV: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_H: tl.constexpr,
+    MIN_BLOCK_KV: tl.constexpr, Lk: tl.constexpr, Lv: tl.constexpr,
+):
+    # kv-split stage-1 with the opt kernels' two changes: adaptive BLOCK_H
+    # (merges the wasteful 2nd head-block at H in (16,32]) and last-block-only
+    # masking (unmasked full-page loads + a score-side `where` that only bites
+    # the split's final tile). Stage-2 reduction is shared (unchanged).
+    cur_batch = tl.program_id(0)
+    cur_head_id = tl.program_id(1)
+    split_kv_id = tl.program_id(2)
+
+    if BLOCK_H < kv_group_num:
+        VALID_BLOCK_H: tl.constexpr = BLOCK_H
+    else:
+        VALID_BLOCK_H: tl.constexpr = kv_group_num
+    cur_head = cur_head_id * VALID_BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = (cur_head < (cur_head_id + 1) * VALID_BLOCK_H) & (cur_head < q_head_num)
+
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_dv = tl.arange(0, BLOCK_DV)
+    offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
+
+    seqlen = tl.load(Seqlens + cur_batch)
+    kv_splits = tl.load(num_kv_splits + cur_batch)
+    kv_len_per_split = tl.cdiv(tl.cdiv(seqlen, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
+    split_kv_start = kv_len_per_split * split_kv_id
+    split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, seqlen)
+
+    e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
+    e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
+
+    if split_kv_end > split_kv_start:
+        offs_q = cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_d[None, :]
+        q = tl.load(Q + offs_q, mask=mask_h[:, None], other=0.0)
+        off_qpe = cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_dpe[None, :]
+        qpe = tl.load(Q + off_qpe, mask=mask_h[:, None], other=0.0)
+
+        for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            page = tl.load(Block_Table + cur_batch * stride_bt_b + (offs_n // BLOCK_SIZE))
+            kv_loc = page * BLOCK_SIZE + (offs_n % BLOCK_SIZE)
+
+            k = tl.load(K_Buffer + kv_loc[None, :] * stride_buf_kbs + offs_d[:, None])
+            qk = tl.dot(q, k.to(q.dtype))
+            kpe = tl.load(K_Buffer + kv_loc[None, :] * stride_buf_kbs + offs_dpe[:, None])
+            qk += tl.dot(qpe, kpe.to(qpe.dtype))
+            qk *= sm_scale
+            qk = tl.where(offs_n[None, :] < split_kv_end, qk, float("-inf"))
+
+            v = tl.load(V_Buffer + kv_loc[:, None] * stride_buf_vbs + offs_dv[None, :])
+            n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+            re_scale = tl.exp(e_max - n_e_max)
+            p = tl.exp(qk - n_e_max[:, None])
+            acc *= re_scale[:, None]
+            acc += tl.dot(p.to(v.dtype), v)
+            e_sum = e_sum * re_scale + tl.sum(p, 1)
+            e_max = n_e_max
+
+        offs_mid = (cur_batch * stride_mid_ob + cur_head[:, None] * stride_mid_oh
+                    + split_kv_id * stride_mid_os + offs_dv[None, :])
+        tl.store(Mid_O + offs_mid, acc / e_sum[:, None], mask=mask_h[:, None])
+        offs_lse = cur_batch * stride_lse_b + cur_head * stride_lse_h + split_kv_id
+        tl.store(Mid_Lse + offs_lse, e_max + tl.log(e_sum), mask=mask_h)
+
+
+def decode_blocktable_mla_split_opt(
+    q, latent, block_table, seqlens, sm_scale, block_size, kv_lora_rank, o=None,
+    block_h=None, num_warps=4,
+):
+    """kv-split (flash-decode) with the opt-kernel improvements. Wins across most
+    of the (bs, block) plane at H=16/20: the split's extra parallelism fills the
+    B200's 148 SMs (single-pass starves there), and BLOCK_H=32 removes the
+    redundant 2nd-head-block KV pass at H=20."""
+    import torch
+    bs, H, Lk = q.shape
+    Lv = kv_lora_rank
+    if o is None:
+        o = q.new_empty((bs, H, Lv))
+    kv_group_num = H
+    BLOCK_H = block_h if block_h is not None else _opt_block_h(H)
+    BLOCK_DMODEL, BLOCK_DPE = 512, 64
+    BLOCK_DV = triton.next_power_of_2(Lv)
+    BLOCK_N = block_size
+    n_head_blocks = triton.cdiv(H, min(BLOCK_H, kv_group_num))
+
+    sm_count = _get_sm_count(q.device)
+    nsplit = max(1, min(_MAX_KV_SPLITS, (4 * sm_count) // max(1, bs * n_head_blocks)))
+    num_kv_splits = torch.full((bs,), nsplit, dtype=torch.int32, device=q.device)
+
+    mid_o = q.new_empty((bs, H, _MAX_KV_SPLITS, Lv), dtype=torch.float32)
+    mid_lse = q.new_empty((bs, H, _MAX_KV_SPLITS), dtype=torch.float32)
+
+    _fwd_blocktable_split_stage1_opt[(bs, n_head_blocks, nsplit)](
+        q, latent, latent, sm_scale, seqlens, block_table, num_kv_splits,
+        mid_o, mid_lse,
+        q.stride(0), q.stride(1), latent.stride(0), latent.stride(0),
+        mid_o.stride(0), mid_o.stride(1), mid_o.stride(2),
+        mid_lse.stride(0), mid_lse.stride(1),
+        block_table.stride(0),
+        kv_group_num=kv_group_num, q_head_num=H, BLOCK_SIZE=block_size,
+        BLOCK_DMODEL=BLOCK_DMODEL, BLOCK_DPE=BLOCK_DPE, BLOCK_DV=BLOCK_DV,
+        BLOCK_N=BLOCK_N, BLOCK_H=BLOCK_H, MIN_BLOCK_KV=_MIN_BLOCK_KV, Lk=Lk, Lv=Lv,
+        num_warps=num_warps, num_stages=2,
+    )
+    _fwd_blocktable_split_stage2[(bs, H)](
+        mid_o, mid_lse, o, seqlens, num_kv_splits,
+        mid_o.stride(0), mid_o.stride(1), mid_o.stride(2),
+        mid_lse.stride(0), mid_lse.stride(1),
+        o.stride(0), o.stride(1),
+        MIN_BLOCK_KV=_MIN_BLOCK_KV, MAX_SPLITS=_MAX_KV_SPLITS, BLOCK_DV=BLOCK_DV, Lv=Lv,
+        num_warps=4, num_stages=2,
+    )
+    return o
+
+
 # registry for the microbenchmark (marks/mla/bench_triton_mla.py)
 KERNELS = {
     "single_pass": decode_blocktable_mla,
@@ -755,4 +1132,7 @@ KERNELS = {
     "tma": decode_blocktable_mla_tma,
     "tma_split": decode_blocktable_mla_tma_split,
     "plan": decode_blocktable_mla_plan,
+    "single_pass_opt": decode_blocktable_mla_opt,
+    "tma_opt": decode_blocktable_mla_tma_opt,
+    "kv_split_opt": decode_blocktable_mla_split_opt,
 }
