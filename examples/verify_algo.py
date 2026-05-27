@@ -32,6 +32,7 @@ mem: float = 0.8,
 data_path: str = "examples/amc23.jsonl",
 tp_size: int = 1,
 kv_cache_dtype: str = "auto",
+attention_backend: str = "flashinfer",
 vortex_attention_backend: str = "trtllm",
 vortex_impl_backend: str = "cuda",
 vortex_use_tensor_core: bool = False,
@@ -48,8 +49,8 @@ vortex_layers_skip: list = None,
                     vortex_max_topk_val=256,
                     tp_size=tp_size,
                     kv_cache_dtype=kv_cache_dtype,
-                    disable_overlap_schedule=False,
-                    attention_backend="flashinfer",
+                    disable_overlap_schedule=True,
+                    attention_backend=attention_backend,
                     vortex_attention_backend=vortex_attention_backend,
                     vortex_impl_backend=vortex_impl_backend,
                     vortex_use_tensor_core=vortex_use_tensor_core,
@@ -266,11 +267,21 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--attention-backend",
+        type=str,
+        default="flashinfer",
+        help="sglang attention backend selecting the decode path. For MLA + vortex "
+             "sparsity use 'cuda_mla' (hand-CUDA decode), 'triton' (Triton decode), "
+             "or 'trtllm_mla' (DeepSeek-only). 'flashinfer' is the dense MLA path "
+             "(use for the full_attention baseline).",
+    )
+
+    parser.add_argument(
         "--vortex-attention-backend",
         type=str,
         default="trtllm",
         choices=["flashinfer", "trtllm"],
-        help="Vortex sparse-attention backend (default: trtllm).",
+        help="Vortex sparse-attention block-table planner path (default: trtllm).",
     )
 
     parser.add_argument(
@@ -370,6 +381,7 @@ if __name__ == "__main__":
         data_path=args.data_path,
         tp_size=args.tp_size,
         kv_cache_dtype=args.kv_cache_dtype,
+        attention_backend=args.attention_backend,
         vortex_attention_backend=args.vortex_attention_backend,
         vortex_impl_backend=args.vortex_impl_backend,
         vortex_use_tensor_core=args.vortex_use_tensor_core,
@@ -398,6 +410,7 @@ if __name__ == "__main__":
         "data_path": args.data_path,
         "tp_size": args.tp_size,
         "kv_cache_dtype": args.kv_cache_dtype,
+        "attention_backend": args.attention_backend,
         "vortex_attention_backend": args.vortex_attention_backend,
         "vortex_impl_backend": args.vortex_impl_backend,
         "vortex_use_tensor_core": args.vortex_use_tensor_core,

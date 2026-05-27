@@ -186,3 +186,206 @@ Files: cuda_mla/spec/{mla_ldm.cuh, k_h20_bs128_blk64.cu, mma_unit.cu}
 - Parity (0.94-0.98x): bs64/128 x blk32/64 (Triton's strongest = single-pass big-tile distributed MMA).
 - Best kernel everywhere: NT=16 + ldmatrix + mma.sync.m16n16k16 + register-O + register-softmax +
   576->584 pad + split-KV (splits tuned per bs). All in cuda_mla/spec/mla_ldm.cuh.
+
+## ===== BREAKTHROUGH: ncu unlocked => the "parity corner" was OCCUPANCY-BOUND, not MMA-bound =====
+## (h20/bs128/blk64 flagship: 1898 "robust optimum" -> 2186 GB/s, +11% over Triton)
+The prior session declared bs128/blk{32,64} a "robust optimum" needing tcgen05, reasoning
+BLIND (perf counters were admin-locked). With ncu now available the diagnosis flipped:
+
+- **ncu on the old kernel**: DRAM 26%, Compute 27% (NOT near any ceiling); Issued/sched 0.30,
+  **No-Eligible 70%**, Active warps/sched **1.77**. Top stalls: `wait` 1.69 + `barrier` 1.59.
+  Theoretical occupancy **12.5%** (8 warps/SM) — capped at **2 CTAs/SM** by 254 regs AND 76KB smem.
+  => Verdict: latency-bound from LOW OCCUPANCY, not the m16 MMA shape. Profiling Triton's
+  single_pass_opt showed it sits in the SAME hole (12.5% occ, 0.86 wave, 80% no-eligible) —
+  both kernels were starved at bs=128, which is why they tied near ~1950.
+
+- **Lever 1 — force 3 CTAs/SM (`__launch_bounds__(128, MINB=3)`).** ptxas reschedules to 168 regs
+  with **ZERO spill** (b4=128regs DOES spill 200B -> tanks). 3 CTAs/SM = 18.75% occ = 12 warps/SM.
+  Only pays when paired with enough blocks to populate it => **splits=3** (384 blocks). MINBxsplits
+  sweep: b3/sp3 = 2023 vs b2/sp2 = 1972. (Variable-split-to-fill-the-wave: tried, the per-call
+  nsplits H2D + bigger MidO + empty-block prologue ate the gain -> reverted.)
+- **Lever 2 — bf16-PACKED O accumulator (`__nv_bfloat162 Oreg[..][4]`, 64 regs vs fp32 128).**
+  Halving O's register footprint gives ptxas headroom at MINB=3 -> DRAM 27.8%->28.4%, 2031->2059.
+  Accuracy ~2-5e-3 (<< 3e-2 bar; verified ragged/1-tok/non-multiple). The .f32 mma still writes a
+  fresh fp32 C per tile; it's folded into the bf16 running O via bf162 mul/add (pairs aligned to the
+  softmax-alpha rows). The 4-CTA/SM dream (bf16-O + STAGES=1, 55KB) LOSES (1819): lost cp.async
+  pipelining > the 4th block. STAGES=2 smem (74KB) caps at 3 CTAs => 3 is the real ceiling.
+- **Lever 3 — 128-bit (int4) vectorized Q gather** global->smem (was scalar bf16). Prologue-only but
+  free; also lifted the short-seq sel=1024 from 0.89x -> 0.98x of Triton. (K prefetch was already
+  16B cp.async.) MidO write now skips pad rows (>=H), stage2 only reads h<H.
+
+FINAL (empty B200, sel sweep, mine vs Triton single_pass_opt):
+  sel=1024 1809 / 1848 (0.98)   sel=2048 **2186 / 1963 (1.11)**
+  sel=3072 2351 / 2008 (1.17)   sel=4096 2413 / 2032 (1.19)   ragged 2300 / 1983 (1.16)
+Kernel ncu: DRAM 25.9%->30.2%, duration 156us->133us, 18.75% occ (was 12.5%). 3 CTAs/SM is the
+ceiling (regs AND smem both =3). Config: NT=16, NWARPS=4, STAGES=2, MINB=3, splits=3; all in
+cuda_mla/spec/mla_ldm.cuh (k_h20_bs128_blk64.cu::run is the delivered default). The "parity corner"
+the prior session called unbeatable-without-tcgen05 is now a clean +11% win — the wall was
+occupancy, reachable with launch_bounds + bf16-O, no tcgen05/tmem needed.
+
+## NWARPS probe (24 warps): fits but does NOT help — work-distribution wall, not warp count
+- B200 SM = 2048 thr / 64 warps / 65536 regs / 228KB. At 12 warps we used 18.75% of THREAD cap.
+- NWARPS=8 @ MINB=3 compiles to 80 regs, no spill => 3 CTAs x 8 warps = 24 warps = 37.5% occ
+  (achieved 30.9%, active warps/sched 1.77->4.96). But throughput DROPPED 2187->2086: DRAM stayed
+  ~flat (28.9%) while compute% rose. Root cause: GEMM1 score is done by only MTILES(=2) warps
+  (register-softmax: a warp owns a 16-head tile's full token range). NWARPS=8 => 6/8 warps idle in
+  GEMM1, adding barrier+prologue overhead with no extra score MMA. Feeding >2 warps needs a
+  cross-warp partial-score reduction (the S-smem round-trip the register-softmax removed for +43%);
+  measured net-negative. => NWARPS=4 (12 warps) is the sweet spot; occupancy is necessary not sufficient.
+
+## ===== plan()/run() class for RAGGED batches (work-queue scheduler, cuda-graph-safe) =====
+## (cuda_mla/spec/mla_decoder.cu: MLADecoder; kernels/launchers in mla_ldm.cuh)
+Uniform splits make the LONGEST request serialize the wave on ragged batches. Fix = a flashinfer-style
+load-balanced work queue, split init/plan/run so ONE plan() drives every layer's run() in a step:
+- **init (ctor)**: allocate the work queue (work_batch/kv_start/kv_end[target_ctas], work_offset[bs+1])
+  + split scratch (mid_o/m/l[target_ctas,M,*]) ONCE. target_ctas = max(3*bs,2*SM)+bs (one MINB=3 wave
+  + rounding margin). Fixed sizes => no per-step alloc.
+- **plan(seqlens)**: `schedule_wq` (one block) cuts each request into ceil-balanced equal-size KV
+  chunks (split count ~prop to seqlen => ~uniform work/CTA), packed contiguously into the queue;
+  records per-request offsets for stage2. Parallelized (reduction + fill across the block; only the
+  bs-length prefix is serial) => **5.4us** (a serial single-thread pack was 40us and dominated).
+- **run(q, latent, block_table, o, sm_scale)**: stage1 over the flat queue (1-D grid of target_ctas,
+  ~no idle CTAs, balanced regardless of skew) + stage2_wq (reduces each request's own chunks). Takes
+  NO seqlens (plan owns the schedule) => one plan(), many layer run()s.
+- **cuda-graph**: both plan() and run() are fixed-grid launches on the current stream, no host sync =>
+  capture [plan(); run() x N_layers] once; replay each step as seqlens change in place (plan's kernel
+  re-derives the balance during replay). Verified: 1 plan + 4 layers captured, replayed after seqlen
+  change, correct (6.7e-3). One plan + 8 distinct-q/latent layers also verified (9.3e-3).
+- Results (bs=128 blk=64, GB/s, mine/Triton single_pass): uniform 2079/1963 = 1.06x; ragged 2x
+  1737/1122 = **1.55x**; heavy skew (16 long, 112 short) 1407/374 = **3.76x**. run-only decode = 2164
+  (== standalone), plan adds 5.4us (amortized to ~0 across layers). Correctness incl. all-1-token
+  (exact) and graph replay all < 1.3e-2 (bf16-O floor).
+Files: mla_decoder.cu (class), mla_ldm.cuh (schedule_wq/stage2_wq/run_schedule_wq/run_wq + stage1
+work-queue branch), test_decoder.py (correctness + graph + ragged bench).
+
+## bs-GENERAL policy: init/plan adapt the schedule to bs; run() dispatches (block_size, MINB)
+The schedule is driven by ONE bs-independent invariant: fill one MINB=3 wave => target active CTAs
+~= 3*SM. The per-request split count then falls out as ~ target*seqlen_b/sum_seqlen, so:
+  * LOW bs (few requests) auto-gets MANY splits/request (fills the GPU);
+  * HIGH bs (bs >= target) gets ~1 split/request (one CTA each, scheduler load-balances).
+A chunk_min=128 floor avoids tiny-chunk prologue overhead; a per-request cap stops one long request
+starving others on skew. __init__ sizes the queue/scratch for the given bs (target_ctas = max(target,bs)+bs);
+run() dispatches the decode template by block_size (64/32/16) x MINB. All knobs (cap/chunk_min/minb)
+have auto defaults but are overridable.
+Sweep (bs x blk, GB/s, mine/Triton-best; one empty B200):
+  blk64 uniform: bs8 1.31x  bs32 1.15x  bs64 1.28x  bs128 1.06x  bs256 1.02x
+  blk64 ragged : bs8 1.38x  bs32 1.41x  bs64 1.69x  bs128 2.01x  bs256 1.79x
+  blk32 uniform: bs8 1.33x  bs32 0.98x  bs64 1.11x  bs128 1.52x  bs256 1.50x
+  blk32 ragged : bs8 1.16x  bs32 1.34x  bs64 1.67x  bs128 2.09x  bs256 2.21x
+Wins every cell except bs32/blk32 uniform (0.98x, parity). Correctness <= 9e-3 (bf16-O) everywhere.
+Sweep harness: cuda_mla/spec/bs_sweep.py.
+
+## Opt: VECTORIZED O / MidO epilogue store (+2-3%)
+The mma C-fragment lands columns (ec, ec+1) in the SAME head-row, and the bf16-O accumulator already
+holds them as a bf162 pair => the 8 scalar epilogue stores per (mt,t2) collapse to 4 vector stores:
+one 32-bit (bf16 O, float-precision rescale then pack) / one 64-bit float2 (the fp32 MidO that every
+split CTA writes). cols are even (ec even, dim0%16) => naturally aligned. Standalone h20/bs128/blk64
+sel=2048: 2180 -> **2228 GB/s**; decoder uniform 2083->2131, ragged 1768->1799, skew 1408->1465.
+Correctness unchanged (<=9.4e-3). In mla_ldm.cuh stage1 epilogue.
+
+## Considered: WARP SPECIALIZATION (producer/consumer) -- declined, wrong tool here (evidence-based)
+ncu stall breakdown of the final kernel (per issued instr): barrier 2.11, wait 1.80, short_scoreboard
+0.56, **long_scoreboard 0.49**, lg_throttle 0.00. Warp specialization (dedicate warps to cp.async
+loads vs MMA, decouple via mbarriers) targets GLOBAL-LOAD latency = long_scoreboard, which is only
+0.49 here -- the cp.async double-buffer ALREADY hides the load. The actual ceilings are barrier
+(real Psh/Kc smem data deps, not removable) and wait (MMA latency + the GEMM1-on-2-warps
+serialization). Worse, a clean producer/consumer split needs spare warps => >=6-8 warps/CTA, but more
+warps/CTA drops CTAs/SM (occupancy): the NWARPS=8 probe already measured 2086 < 2228, a strictly worse
+starting point. So warp-spec would start lower-occupancy, attack a 0.49 non-bottleneck, and only
+shave ~1 of 3 barriers -- net negative, consistent with the NWARPS=8 result. The real levers
+(distribute GEMM1 across warps via K-split; change the MMA shape) were both measured net-negative
+earlier. Not implemented.
+
+## Opt 2a: multi-accumulator GEMM1 (break the 36-deep mma chain) -- TRIED, NEGATIVE, reverted
+Wired a real NACC>1 GEMM1 (k-tiles round-robin across NACC independent accumulators, inner loop
+unrolled so the [a] index stays static -- a dynamic reg-array index would spill). Measured @ bs128/blk64
+sp3: NACC1 2227, NACC2 2206, NACC3 2191, NACC4 2174, NACC6 2190 -- monotonically WORSE. ptxas: all
+pinned at 168 regs (the __launch_bounds__(MINB=3) budget) with ~no spill, so extra accumulators don't
+gain registers -- they steal scheduling ILP, and at 3 CTAs/SM the mma latency is already hidden by the
+12 resident warps. The 168-reg budget is the wall, not intra-warp ILP. Reverted to single-accumulator.
+
+## Opt 2b: cut the barrier stall (2.11) -- structurally blocked at 3 CTAs/STAGES=2, not implemented
+The 3 __syncthreads/tile each guard a NECESSARY cross-warp smem hazard: (S1) visibility of the
+cooperatively-cp.async'd K tile; (S2) GEMM1(warps 0,1 write Psh/ash) -> GEMM2(all warps read) producer-
+consumer; (S3) free the K double-buffer before the loop's next prefetch reuses it. The only way to drop
+a barrier is compute pipelining (overlap GEMM1(t) with GEMM2(t-1)), which needs Kc[t-1] alive while
+loading Kc[t+1] => STAGES=3 => +18.7KB smem => 3->2 CTAs/SM. STAGES=3 is already measured at 1943
+(2 CTAs) vs 2229 (3 CTAs) -- a 33% occupancy deficit no pipelining can recover. K-split (balance GEMM1
+across the idle warps to shrink the S2 wait) reintroduces the S-matrix smem round-trip + extra syncs the
+register-softmax removed (net-negative). => barrier (2.11) + wait (1.80) are structural consequences of
+the smem/occupancy constraint, not cheaply removable within the 3-CTA design.
+
+## State: robust optimum for bf16-O / 3-CTA / STAGES=2 = 2229 GB/s (+13% Triton @ sel2048). The
+remaining headroom (30% DRAM) is gated by the 3-CTA smem ceiling; the one lever that breaks it is fp8
+latent (halves K smem -> 4+ CTAs AND halves the dominant HBM read) -- the recommended next step.
+
+## ===== H=16 settings (MTILES=1, no head padding) -- DONE: 4 CTAs/SM, ~3000-3021 GB/s =====
+H=16 => MTILES=ceil(16/16)=1 (vs 2 for H=20): NO padding waste. M=16 halves the Q smem (37->18.7KB)
+and the bf16 Oreg (64->32 regs), so smem/CTA ~= 55KB => **4 CTAs/SM** (smem-limited; vs 3 for H=20)
+=> 25% occupancy, **DRAM 44%** (vs 30%). GEMM1 now runs on only 1 warp (MTILES=1) but the higher
+occupancy hides it. Optimum (standalone, all blk): NWARPS=4, STAGES=2, **MINB=5, splits=4** -- MINB=5
+makes Block-Limit-Registers=5 while smem caps actual occupancy at 4, the lower reg target scheduling
+~1% better than MINB=4 (the tiny M=16 Oreg keeps it spill-free). Peak ~3000-3021 GB/s @ bs128.
+- Standalone vs Triton (bs128, sel2048, clean B200): blk16 3021/1574=**1.91x**, blk32 3015/2480=**1.22x**,
+  blk64 3023/2722=**1.11x** (Triton degrades hard at small blocks). Files: spec/k_h16.cu.
+
+## decoder POLICY generalized to any H (auto CTAs/SM from M) + FLOOR split fix
+- __init__ now computes ctas/SM from the run_wq smem footprint (M-dependent): H<=16 => 4, H<=32 => 3.
+  Sets minb=ctas and target=ctas*SM, and run() dispatches run_wq for MINB in {3,4,5}. So the SAME
+  decoder auto-tunes: H=16 -> 4 CTAs/splits~4, H=20 -> 3 CTAs/splits~3. (minb overridable; minb=5 adds
+  ~1% at H=16 but +1 spills at H=20, so the safe auto is minb=ctas.)
+- **FLOOR (not round) the proportional split** in schedule_wq: total active CTAs must stay just UNDER
+  one ctas/SM wave -- overshooting costs a long 2nd-wave tail far worse than idle SMs. round->5 splits
+  put H=16 bs128 on the bad point (~2450, a LOSS); floor->4 (512 CTAs, 0.86 wave) => 2934 (1.08x). The
+  fix ALSO smoothed the H=20 high-bs sawtooth: bs112/120 were 0.97-0.98x LOSSES (round overshot 1 wave),
+  now 1.08x WINS. No regression elsewhere.
+- decoder (plan+run, ragged-capable) vs Triton, clean B200 bs128 sel2048:
+  H=16: blk16 1.85x, blk32 1.18x, blk64 1.08x.  H=20: blk16 2.42x, blk32 1.55x, blk64 1.08x.
+  (work-queue ~3% under the 2D standalone peak due to plan + flat-grid overhead; amortized over layers.)
+
+## ===== INTEGRATION into vortex sglang backend + RULER verification =====
+Wired the CUDA kernel as a first-class sglang attention backend, sibling of the
+Triton one, with a clean in-package JIT (referencing the utils_sglang factory pattern):
+- `vortex_torch/engine/sgl/attention_backend/csrc/{mla_ldm.cuh, mla_cuda.cu}` — kernel
+  + a stateless `decode(q,latent,bt,sl,o,sm,block_size,splits)` op (dispatches BLK 16/32/64
+  and MINB from head count: M=16 -> MINB=5, else 3). Fixed launch geometry => graph-safe.
+- `cuda_mla_kernel.py` — `get_cuda_mla_module()` (process-cached load, mirrors
+  indexer/utils_sglang) + `decode_blocktable_mla_cuda(...)` drop-in (same signature as the
+  Triton `decode_blocktable_mla`). `csrc/build/` is gitignored.
+- `cuda_mla.py` — `VortexCudaMLABackend`, byte-identical to `triton_mla.py` except the decode
+  call. Registered as attention_backend `"cuda_mla"` (attention_registry.py + server_args
+  ATTENTION_BACKEND_CHOICES + attention_backend/__init__.py). Not in
+  FORWARD_ABSORB_CORE_ATTENTION_BACKENDS => model fuses q/k like the "triton" path.
+
+RULER (DeepSeek-V2-Lite-Chat, H=16, block=page=32, topk=29, module=lserve_centroid_mla,
+greedy, cuda-graph ON, B200): ALL THREE backends = **100.00% accuracy** (correctness verified).
+End-to-end tok/s (MLA decode is a small fraction of this MoE forward; numbers also sensitive
+to neighbor-GPU load): trtllm_mla (native absorbed path) ~1595 >> triton 376 ~= cuda_mla 378
+(splits=2). The CUDA backend is in the generic block-table FALLBACK class (like "triton",
+for non-DeepSeek geometry); within that class it matches Triton.
+- Split heuristic lesson: the microbench optimum (~MINB*SM/bs ~ 7 splits) is WRONG for the
+  full model — the per-layer stage2+MidO traffic dominates the tiny sparse decode. Corrected
+  the backend default to a modest fill (~1 CTA/SM, clamp(SM//bs,1,4)); splits=2 at the RULER
+  bs matches Triton (378 vs 376) vs 275 for the old aggressive default. Tunable via
+  VORTEX_CUDA_MLA_SPLITS.
+
+## ===== backend refactor to flashinfer-style plan()/run() (one plan drives all layers) =====
+Replaced the per-layer stateless decode in VortexCudaMLABackend with the MLADecoder
+plan/run idiom (like flashinfer's wrapper.plan()/run()), now merged into the package JIT
+(csrc/mla_cuda.cu exposes both `decode` and class `MLADecoder`):
+- init_forward_metadata / *_capture_cuda_graph / *_replay_cuda_graph: after plan_decode
+  fills sparse_seqlens, call dec.plan(sparse_seqlens) ONCE — builds the load-balanced work
+  queue shared by every layer. A per-bs decoder cache (mirrors flashinfer's
+  decode_cuda_graph_metadata[bs]); each captured bs creates its decoder at capture (outside
+  the graph region => fixed-address buffers), reused on replay.
+- forward_decode: self._cur_decoder.run(q, latent, block_table, o, sm) — per layer, no
+  seqlens. plan() (eager) + run() (captured) are both fixed-grid => cuda-graph-safe.
+RULER (DeepSeek-V2-Lite, H=16, block=32, topk=29, graph ON): 100.00% acc, 377 tok/s ==
+triton (377) == the prior stateless path. trtllm_mla (native absorbed path) still ~1595.
+- KEY FIX: the work-queue grid `target_ctas` must be TIGHT. The first cut used
+  max(target,bs)+bs (~SM padding CTAs at EVERY bs); at the low-bs decode tail (one long
+  prompt finishing at bs=1 for ~hundreds of steps) that launched ~150 CTAs/layer, ~146 of
+  them padding no-ops that STILL reserve smem on dispatch => MLA decode ~2x slower => 169
+  tok/s end-to-end (MLA decode is a large fraction of the generic-fallback forward, so it
+  halves throughput). Capping splits alone (4) did NOT help (168) — the grid was the issue.
+  Tightening to min(target, bs*cap)+bs (=> ~bs*splits, e.g. 5 at bs=1) restored 377 tok/s.

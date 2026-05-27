@@ -131,6 +131,20 @@ def create_triton_backend(runner):
         return TritonAttnBackend(runner)
 
 
+@register_attention_backend("cuda_mla")
+def create_cuda_mla_backend(runner):
+    # MLA + vortex sparsity on the hand-written CUDA block-table decode kernel
+    # (sibling of the "triton" path; geometry-agnostic, GLM/DeepSeek-capable).
+    # Prefill + skipped-layer decode delegate to the dense TritonAttnBackend.
+    if not runner.use_mla_backend or not runner.server_args.enable_vortex_sparsity:
+        raise ValueError(
+            "cuda_mla backend requires an MLA model with enable_vortex_sparsity=True."
+        )
+    from vortex_torch.engine.sgl.attention_backend import VortexCudaMLABackend
+
+    return VortexCudaMLABackend(runner)
+
+
 @register_attention_backend("torch_native")
 def create_torch_native_backend(runner):
     from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend

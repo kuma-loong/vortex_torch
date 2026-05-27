@@ -33,9 +33,14 @@ from vortex_torch.engine.sgl.attention_backend.triton_mla import (
     VortexTritonMLABackend,
 )
 
+from vortex_torch.engine.sgl.attention_backend.cuda_mla import (
+    VortexCudaMLABackend,
+)
+
 __all__ = [
     "VortexFlashInferBackend",
     "VortexTRTLLMBackend",
     "VortexTRTLLMMLABackend",
     "VortexTritonMLABackend",
+    "VortexCudaMLABackend",
 ]

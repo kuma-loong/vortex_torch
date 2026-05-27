@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-export CUDA_VISIBLE_DEVICES=5,6
+export CUDA_VISIBLE_DEVICES=4,7
 export HF_HOME=/raid/catalyst/models/
 set -e
 sparse_algos=(
-block_sparse_attention
+lserve_centroid_sparse_attention
 )
 
 models=(
@@ -15,7 +15,6 @@ trials=(
 # Sweep block_size (= page_size) while holding
 # (topk_val + 3) * block_size = 2048.
 block_sizes=(
-16
 32
 64
 )
@@ -23,7 +22,7 @@ for algo in "${sparse_algos[@]}"; do
   for model in "${models[@]}"; do
     for trial in "${trials[@]}"; do
       for block_size in "${block_sizes[@]}"; do
-        k_val=$((2048 / block_size - 3))
+        k_val=$((1024 / block_size - 3))
         echo ">>> Running verify_algo.py with --vortex-module-name ${algo} and --model-name ${model} for ${trial} trials (block_size=${block_size}, topk_val=${k_val})"
         python examples/verify_algo.py \
             --trials ${trial} \

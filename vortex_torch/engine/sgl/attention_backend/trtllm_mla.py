@@ -15,27 +15,18 @@ indexer compile. Differences from the MHA backend:
   - decode = `flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla` over the
     sparse block table the indexer produces.
 
-STATUS: `__init__` / `_compile` / `init_forward_metadata` (decode) / `forward_decode`
-are faithful first drafts (the indexer compile path is standalone-verified);
-`forward_extend` (dense MLA prefill) and the cuda-graph capture/replay metadata
-are drafts pending Phase-4 engine wiring + a live run. Prefill is always dense
-(no sparsity branch), matching trtllm.py.
+Prefill is always dense (no sparsity branch), delegated to the composed
+`TRTLLMMLABackend`; the cuda-graph capture/replay metadata is delegated too.
 """
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
-from .triton_mla_kernel import decode_blocktable_mla
-
 from vortex_torch.abs import as_vtensor, FORMAT
 from vortex_torch.indexer import Context, MetaData
 from vortex_torch.indexer.compiler.compile import compile as compile_indexer
-from vortex_torch.indexer.utils_sglang import (
-    get_decode_planner_trtllm,
-    get_prefill_planner,
-)
+from vortex_torch.indexer.utils_sglang import get_decode_planner_trtllm
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -125,11 +116,6 @@ class VortexTRTLLMMLABackend(AttentionBackend):
 
         # Planner (same factory as the MHA backend; num_kv_heads=1 in ctx) ----
         self.plan_decode = get_decode_planner_trtllm(sa.vortex_schedule_policy)
-
-        # Diagnostic: swap the trtllm decode kernel for the vortex triton
-        # block-table kernel (same write path + metadata + selection) to isolate
-        # whether the triton kernel is the source of the triton-vs-trtllm gap.
-        self._use_triton_kernel = os.environ.get("VORTEX_MLA_DECODE_KERNEL", "") == "triton"
 
         # Dense MLA helper (COMPOSITION, not inheritance) — used only for the
         # non-vortex parts: prefill (always dense), cuda-graph capture/replay,
@@ -286,20 +272,6 @@ class VortexTRTLLMMLABackend(AttentionBackend):
 
         # 3) MLA decode over the selected pages, on the fused latent.
         bs = q.shape[0]  # decode batch (one token/request); slice the preallocated metadata
-
-        if self._use_triton_kernel:
-            # Diagnostic path: same selection/metadata, vortex triton kernel.
-            latent = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
-                -1, self.kv_cache_dim
-            )
-            o = decode_blocktable_mla(
-                q=query, latent=latent,
-                block_table=md.sparse_block_tables[:bs], seqlens=md.sparse_seqlens[:bs],
-                sm_scale=layer.scaling, block_size=self.block_size,
-                kv_lora_rank=self.kv_lora_rank,
-            )
-            return o.view(-1, layer.tp_q_head_num * self.kv_lora_rank)
-
         kv_cache = forward_batch.token_to_kv_pool.get_fused_latent_buffer(layer.layer_id)
         k_scale = layer.k_scale_float if layer.k_scale_float is not None else 1.0
         bmm1_scale = layer.scaling * k_scale
