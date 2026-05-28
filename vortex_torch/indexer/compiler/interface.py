@@ -150,7 +150,7 @@ def generate_entry_point(full_graph: Graph, sub_graphs: list[Graph], ctx: Contex
     # Query arg name(s): a single "q" for MHA, or the absorbed pair
     # ("q_nope_out", "q_pe") for MLA flows. Driven by ctx so the generated
     # forward() signature matches the names the trace registered.
-    query_arg_names = list(getattr(ctx, "query_arg_names", ["q"]))
+    query_arg_names = list(getattr(ctx, "query_arg_names", None) or ["q"])
     entry_point_arg_list = query_arg_names + ["o", "cache", "ctx"]
     entry_point_arg_str = ",".join(entry_point_arg_list)
 

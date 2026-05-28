@@ -251,6 +251,10 @@ def _make_indexer_ctx(
     ctx.op_to_input_tensor_list = []
     ctx.op_to_output_tensor_list = []
     ctx.tensor_id_to_tensor_name_map = {}
+    # Entry-point query arg name(s); MHA default (matches Context.__init__).
+    # _blank_ctx() nulled this slot, so set it or codegen's interface.py trips
+    # on `list(None)`. MLA verify flows would override with the absorbed pair.
+    ctx.query_arg_names = ["q"]
     ctx.compilation_header_lines = []
     ctx.auxilary_func_def_lines = []
     ctx.sparse_attention_name = sparse_attention_name
