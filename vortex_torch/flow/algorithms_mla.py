@@ -3,7 +3,7 @@ from typing import Dict
 
 from .flow_mla import vFlowMLA
 from .registry import register
-from ..indexer import topK, GeMM, Mean, Max
+from ..indexer import topK, GeMM, Mean, Max, MaskSlice, Multiply
 from ..cache import Mean as CMean, MeanInterleave as CMeanInterleave
 from ..abs import ContextBase
 
@@ -149,6 +149,155 @@ class LServeCentroidMLA(vFlowMLA):
         self.reduction(cache["latent"], cache["centroids"], loc=loc, ctx=ctx)
 
     def create_cache(self, block_size: int, kv_lora_rank: int, qk_rope_head_dim: int):
+        # "latent" is auto-provided — declare only the per-sub-block centroids.
+        return {
+            "centroids": (block_size // self.SUB_BLOCK_SIZE, kv_lora_rank + qk_rope_head_dim),
+        }
+
+
+# ---------------------------------------------------------------------------
+# RoPE-UNAWARE variants
+# ---------------------------------------------------------------------------
+# The fused latent is ``[ kv_c (dims 0:kv_lora_rank) | k_pe (dims kv_lora_rank:) ]``
+# and the fused query is ``[ q_nope_out | q_pe ]``. The rope_aware flows above
+# score with the FULL dot ⟨q,c⟩ = ⟨q_nope,c_kv⟩ + ⟨q_pe,c_pe⟩, so the RoPE
+# (positional) term participates in routing.
+#
+# The rope_unaware flows below DROP the RoPE term: they route on the latent
+# (NoPE) component only,
+#
+#     score(p) = ⟨q_nope, c_kv_p⟩ ,
+#
+# i.e. the landmark/centroid is effectively built from the first ``kv_lora_rank``
+# dims and the last ``qk_rope_head_dim`` (= 64) dims are masked out. We realise
+# this by zeroing the query's RoPE dims before the GeMM: ``MaskSlice`` emits the
+# constant pattern ``[1]*kv_lora_rank ++ [0]*qk_rope_head_dim`` (it is a pure
+# position writer — input values are ignored), and ``Multiply`` applies it to the
+# query. With q's RoPE dims zeroed the 576-wide dot collapses to ⟨q_nope,c_kv⟩,
+# so the (unchanged, full-width) centroid's RoPE dims never affect the score —
+# mathematically identical to masking the centroid, but with GeMM widths still
+# aligned and using only cheap indexer ops. Compare against the rope_aware
+# baselines to measure what the RoPE term contributes to routing quality.
+#
+# NoPE width is the framework-fixed kv_lora_rank (512); create_cache asserts it.
+
+
+@register("rope_unaware_block_sparse_mla")
+class RopeUnawareBlockSparseMLA(vFlowMLA):
+    r"""
+    RoPE-unaware twin of :class:`RopeAwareBlockSparseMLA`: one centroid per page,
+    but routing uses only the latent (NoPE) component — the last
+    ``qk_rope_head_dim`` (64) query dims are masked to zero, so
+
+    .. math::
+
+        \operatorname{score}(p) = \langle \bar q_{\text{nope}},\, c^{\text{kv}}_p\rangle ,
+
+    dropping the RoPE term :math:`\langle \bar q_{\text{pe}}, c^{\text{pe}}_p\rangle`.
+    """
+    NOPE_DIM = 512  # kv_lora_rank; RoPE (k_pe) occupies dims [NOPE_DIM, latent_dim)
+
+    def __init__(self):
+        super().__init__()
+        # Indexer-side ops (run every decode step)
+        self.mean = Mean(dim=1)        # average the fused query over its H heads
+        # Position pattern [1]*NOPE_DIM ++ [0]*rope over the latent (dim=2) axis.
+        self.rope_mask = MaskSlice(start=0, end=self.NOPE_DIM, dim=2, alpha=1.0, beta=0.0)
+        self.mul = Multiply()          # zero the query's RoPE dims
+        self.gemm = GeMM()             # GeMM(x, y) = y @ xᵀ  → per-page score
+        self.output_func = topK()      # terminal: write selected page ids to o
+
+        # Cache-side op (run once per finished page)
+        self.reduction = CMean(dim=1)  # centroid = mean of the fused latent over the block
+
+    def forward_indexer(
+        self,
+        q: torch.Tensor,               # [B, H, latent_dim]  ([q_nope_out | q_pe])
+        o: torch.Tensor,
+        cache: Dict[str, torch.Tensor],
+        ctx: ContextBase,
+    ):
+        q_mean = self.mean(q, ctx=ctx)                              # [B, 1, latent_dim]
+        mask = self.rope_mask(q_mean, ctx=ctx)                     # [B, 1, latent_dim] 1s|0s
+        q_nope = self.mul(q_mean, mask, ctx=ctx)                   # RoPE dims zeroed
+        score = self.gemm(q_nope, cache["centroids"], ctx=ctx)     # [S, 1, 1]
+        self.output_func(score, o, ctx=ctx)
+
+    def forward_cache(
+        self,
+        cache: Dict[str, torch.Tensor],
+        loc: torch.Tensor,
+        ctx: ContextBase,
+    ):
+        self.reduction(cache["latent"], cache["centroids"], loc=loc, ctx=ctx)
+
+    def create_cache(self, block_size: int, kv_lora_rank: int, qk_rope_head_dim: int):
+        assert kv_lora_rank == self.NOPE_DIM, (
+            f"rope_unaware_block_sparse_mla assumes kv_lora_rank={self.NOPE_DIM}, "
+            f"got {kv_lora_rank}"
+        )
+        # "latent" is auto-provided — declare only the aux centroid (full width).
+        return {
+            "centroids": (1, kv_lora_rank + qk_rope_head_dim),
+        }
+
+
+@register("rope_unaware_lserve_centroid_mla")
+class RopeUnawareLServeCentroidMLA(vFlowMLA):
+    r"""
+    RoPE-unaware twin of :class:`LServeCentroidMLA`: per-sub-block centroids with
+    a max over sub-blocks, but routing uses only the latent (NoPE) component —
+    the last ``qk_rope_head_dim`` (64) query dims are masked to zero, so
+
+    .. math::
+
+        \operatorname{score}(p) = \max_{b}\,\langle \bar q_{\text{nope}},\, c^{\text{kv}}_{p,b}\rangle ,
+
+    dropping the per-sub-block RoPE term.
+    """
+    NOPE_DIM = 512        # kv_lora_rank; RoPE (k_pe) occupies dims [NOPE_DIM, latent_dim)
+    SUB_BLOCK_SIZE = 16
+
+    def __init__(self):
+        super().__init__()
+        # Indexer-side ops (run every decode step)
+        self.mean = Mean(dim=1)        # average the fused query over its H heads
+        self.rope_mask = MaskSlice(start=0, end=self.NOPE_DIM, dim=2, alpha=1.0, beta=0.0)
+        self.mul = Multiply()          # zero the query's RoPE dims
+        self.gemm = GeMM()             # GeMM(x, y) = y @ xᵀ  → per-sub-block score
+        self.max_sub = Max(dim=1)      # max over the block's sub-block centroids
+        self.output_func = topK()      # terminal: write selected block ids to o
+
+        # Cache-side op (run once per finished block): per-sub-block latent mean
+        self.reduction = CMeanInterleave(dim=1, k=self.SUB_BLOCK_SIZE)
+
+    def forward_indexer(
+        self,
+        q: torch.Tensor,               # [B, H, latent_dim]  ([q_nope_out | q_pe])
+        o: torch.Tensor,
+        cache: Dict[str, torch.Tensor],
+        ctx: ContextBase,
+    ):
+        q_mean = self.mean(q, ctx=ctx)                              # [B, 1, latent_dim]
+        mask = self.rope_mask(q_mean, ctx=ctx)                     # [B, 1, latent_dim] 1s|0s
+        q_nope = self.mul(q_mean, mask, ctx=ctx)                   # RoPE dims zeroed
+        score = self.gemm(q_nope, cache["centroids"], ctx=ctx)     # [S, n_b, 1]
+        page_score = self.max_sub(score, ctx=ctx)                  # [S, 1, 1]
+        self.output_func(page_score, o, ctx=ctx)
+
+    def forward_cache(
+        self,
+        cache: Dict[str, torch.Tensor],
+        loc: torch.Tensor,
+        ctx: ContextBase,
+    ):
+        self.reduction(cache["latent"], cache["centroids"], loc=loc, ctx=ctx)
+
+    def create_cache(self, block_size: int, kv_lora_rank: int, qk_rope_head_dim: int):
+        assert kv_lora_rank == self.NOPE_DIM, (
+            f"rope_unaware_lserve_centroid_mla assumes kv_lora_rank={self.NOPE_DIM}, "
+            f"got {kv_lora_rank}"
+        )
         # "latent" is auto-provided — declare only the per-sub-block centroids.
         return {
             "centroids": (block_size // self.SUB_BLOCK_SIZE, kv_lora_rank + qk_rope_head_dim),
