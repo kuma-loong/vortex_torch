@@ -79,13 +79,9 @@ class ModelRunnerKVCacheMixin:
                 )
                 cell_size += indexer_size_per_token * num_layers * element_size
         elif self.server_args.enable_vortex_sparsity:
-            cell_size = (
-                    self.model_config.get_num_kv_heads(get_attention_tp_size())
-                    * self.model_config.head_dim
-                    * num_layers
-                    * self.sparse_attention.get_token_ratio()
-                    * kv_size
-                )
+            # [VORTEX HOOK] sparse KV cell-size for the available-memory estimate.
+            import vortex_torch
+            cell_size = vortex_torch.integration.kv_cell_size(self, num_layers, kv_size)
         else:
             if self.model_config.is_hybrid_swa:
                 full_layers_num = len(self.model_config.full_attention_layer_ids)
@@ -593,40 +589,13 @@ class ModelRunnerKVCacheMixin:
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
             )
-        elif self.server_args.enable_vortex_sparsity and self.use_mla_backend:
-            # MLA: single fused latent pool (kv_c | k_pe), no per-head K/V.
-            from vortex_torch.engine.sgl.memory_pool_mla import VortexMLACachePool
-            self.token_to_kv_pool = VortexMLACachePool(
-                self.max_total_num_tokens,
-                page_size=self.page_size,
-                dtype=self.kv_cache_dtype,
-                kv_lora_rank=self.model_config.kv_lora_rank,
-                qk_rope_head_dim=self.model_config.qk_rope_head_dim,
-                layer_num=self.num_effective_layers,
-                device=self.device,
-                enable_memory_saver=self.server_args.enable_memory_saver,
-                sparse_attention=self.sparse_attention,
-                model_runner=self,
-                start_layer=self.start_layer,
-                end_layer=self.end_layer,
-                )
         elif self.server_args.enable_vortex_sparsity:
-
-            from vortex_torch.engine.sgl.memory_pool import VortexCachePool
-            self.token_to_kv_pool = VortexCachePool(
-                self.max_total_num_tokens,
-                page_size=self.page_size,
-                dtype=self.kv_cache_dtype,
-                head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
-                head_dim=self.model_config.head_dim,
-                layer_num=self.num_effective_layers,
-                device=self.device,
-                enable_memory_saver=self.server_args.enable_memory_saver,
-                sparse_attention=self.sparse_attention,
-                model_runner=self,
-                start_layer=self.start_layer,
-                end_layer=self.end_layer,
-                )
+            # [VORTEX HOOK] vortex KV pool — MLA (fused latent) or MHA, chosen
+            # inside make_kv_pool by self.use_mla_backend. The dense-MLA branch
+            # above keeps its `and not enable_vortex_sparsity` guard so MLA+vortex
+            # falls through to here.
+            import vortex_torch
+            self.token_to_kv_pool = vortex_torch.integration.make_kv_pool(self)
         else:
             if self.is_hybrid_swa:
                 kwargs = {}

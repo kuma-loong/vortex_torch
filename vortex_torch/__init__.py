@@ -7,13 +7,37 @@ from .utils import is_hopper_or_newer, is_hopper
 from .version import __version__
 
 __all__ = [
-        "indexer", 
+        "indexer",
         "cache",
         "flow",
         "abs",
         "is_hopper_or_newer",
         "is_hopper",
+        "integration",
         "__version__",
 ]
+
+
+# Eagerly install the ServerArgs flat-kwargs adapter so sgl.Engine(vortex_*=...)
+# keeps working (it must be active in the *parent* before ServerArgs is built).
+# Light: imports only sglang.srt.server_args, not the engine. Best-effort.
+try:
+    from .engine.sgl.config import install_serverargs_adapter as _vx_install_adapter
+    _vx_install_adapter()
+except Exception:
+    pass
+
+
+def __getattr__(name):
+    # Lazily expose ``vortex_torch.integration`` (the single sglang-integration
+    # module) without making a plain ``import vortex_torch`` pull in sglang/the
+    # engine. The sglang hooks call ``vortex_torch.integration.<fn>(...)``; the
+    # first such access here imports it (and ``build_sparse_flow`` then registers
+    # the vortex attention backends in the spawned worker). See
+    # vortex_torch/engine/sgl/integration.py.
+    if name == "integration":
+        from .engine.sgl import integration
+        return integration
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

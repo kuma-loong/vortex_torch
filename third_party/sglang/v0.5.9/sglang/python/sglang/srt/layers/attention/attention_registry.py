@@ -25,34 +25,19 @@ def create_flashinfer_backend(runner):
     import torch
 
     if not runner.use_mla_backend:
-        if runner.server_args.enable_vortex_sparsity:
-            if runner.server_args.vortex_attention_backend == "flashinfer":
-                from vortex_torch.engine.sgl.attention_backend import VortexFlashInferBackend
-                return VortexFlashInferBackend(runner)
-            elif runner.server_args.vortex_attention_backend == "trtllm":
-                from vortex_torch.engine.sgl.attention_backend import VortexTRTLLMBackend
-                return VortexTRTLLMBackend(runner)
-            else:
-                raise ValueError(
-                    f"Unsupported vortex attention backend {runner.server_args.vortex_attention_backend} for sparse attention. Supported backends are: flashinfer, trtllm."
-                )
-        else:
-            from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+        from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 
-            # Init streams
-            if runner.server_args.speculative_algorithm == "EAGLE":
-                if (
-                    not hasattr(runner, "plan_stream_for_flashinfer")
-                    or not runner.plan_stream_for_flashinfer
-                ):
-                    runner.plan_stream_for_flashinfer = torch.cuda.Stream()
-            return FlashInferAttnBackend(
-                runner, init_new_workspace=runner.init_new_workspace
-            )
+        # Init streams
+        if runner.server_args.speculative_algorithm == "EAGLE":
+            if (
+                not hasattr(runner, "plan_stream_for_flashinfer")
+                or not runner.plan_stream_for_flashinfer
+            ):
+                runner.plan_stream_for_flashinfer = torch.cuda.Stream()
+        return FlashInferAttnBackend(
+            runner, init_new_workspace=runner.init_new_workspace
+        )
     else:
-        # MLA + vortex sparsity is wired on the trtllm_mla backend (see
-        # create_trtllm_mla_backend) so prefill dispatches through the
-        # materialized MHA path. The flashinfer MLA path stays dense-only.
         from sglang.srt.layers.attention.flashinfer_mla_backend import (
             FlashInferMLAAttnBackend,
         )
@@ -64,13 +49,6 @@ def create_flashinfer_backend(runner):
 def create_trtllm_mla_backend(runner):
     if not runner.use_mla_backend:
         raise ValueError("trtllm_mla backend can only be used with MLA models.")
-    if runner.server_args.enable_vortex_sparsity:
-        # MLA + vortex sparsity. Use trtllm_mla (not flashinfer) so the model
-        # dispatches PREFILL through the materialized MHA path (192/128) — same
-        # as the dense baseline — and DECODE through absorb (the sparse path).
-        from vortex_torch.engine.sgl.attention_backend import VortexTRTLLMMLABackend
-
-        return VortexTRTLLMMLABackend(runner)
     from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
 
     return TRTLLMMLABackend(runner)
@@ -118,31 +96,10 @@ def create_triton_backend(runner):
         )
 
         return DoubleSparseAttnBackend(runner)
-    elif runner.use_mla_backend and runner.server_args.enable_vortex_sparsity:
-        # MLA + vortex on the Triton decode kernel (not geometry-locked like
-        # trtllm_mla; handles GLM-4.7-Flash's qk_nope=192 / v_head=256). Prefill
-        # + skipped-layer decode delegate to the dense TritonAttnBackend.
-        from vortex_torch.engine.sgl.attention_backend import VortexTritonMLABackend
-
-        return VortexTritonMLABackend(runner)
     else:
         from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
         return TritonAttnBackend(runner)
-
-
-@register_attention_backend("cuda_mla")
-def create_cuda_mla_backend(runner):
-    # MLA + vortex sparsity on the hand-written CUDA block-table decode kernel
-    # (sibling of the "triton" path; geometry-agnostic, GLM/DeepSeek-capable).
-    # Prefill + skipped-layer decode delegate to the dense TritonAttnBackend.
-    if not runner.use_mla_backend or not runner.server_args.enable_vortex_sparsity:
-        raise ValueError(
-            "cuda_mla backend requires an MLA model with enable_vortex_sparsity=True."
-        )
-    from vortex_torch.engine.sgl.attention_backend import VortexCudaMLABackend
-
-    return VortexCudaMLABackend(runner)
 
 
 @register_attention_backend("torch_native")

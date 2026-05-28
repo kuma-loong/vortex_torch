@@ -217,8 +217,10 @@ class VortexTRTLLMBackend(AttentionBackend):
         self.chunkwise_hn2nh_transpose = get_chunkwise_hn2nh_transpose()
 
         # Tell the indexer / topk codegen which decode kernel layout to use.
-        # Must be set BEFORE _compile (ctx.create reads it).
-        model_runner.server_args.vortex_attention_backend = "trtllm"
+        # Must be set BEFORE _compile (ctx.create reads it). Write the config
+        # object (single source of truth); the server_args.vortex_* shim is read-only.
+        if getattr(model_runner.server_args, "vortex", None) is not None:
+            model_runner.server_args.vortex.attention_backend = "trtllm"
 
         self.sparse_attention = model_runner.sparse_attention
         self.ctx = Context()

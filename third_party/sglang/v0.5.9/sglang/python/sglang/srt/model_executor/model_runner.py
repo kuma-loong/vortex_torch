@@ -587,31 +587,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Deduce KV cache dtype
         self.configure_kv_cache_dtype()
 
-        self.sparse_attention = None
-        if self.server_args.enable_vortex_sparsity:
-            import vortex_torch
-            self.sparse_attention = vortex_torch.flow.build_vflow(
-                self.server_args.vortex_module_name,
-                user_file=self.server_args.vortex_module_path
-            )
-            if isinstance(self.sparse_attention, vortex_torch.flow.vFlowMLA):
-                # MLA flow: latent geometry instead of a single head_dim.
-                self.sparse_attention.initialize(
-                    block_size=self.block_size,
-                    kv_lora_rank=self.model_config.kv_lora_rank,
-                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
-                    kv_cache_dtype=self.kv_cache_dtype,
-                    q_data_type=self.dtype,
-                    intermediate_dtype=self.server_args.vortex_dtype,
-                )
-            else:
-                self.sparse_attention.initialize(
-                    block_size=self.block_size,
-                    head_dim=self.model_config.head_dim,
-                    kv_cache_dtype=self.kv_cache_dtype,
-                    q_data_type=self.dtype,
-                    intermediate_dtype=self.server_args.vortex_dtype,
-                )
+        # [VORTEX HOOK] build sparse flow + register vortex attention backends
+        # in this (spawned) worker. Returns None when sparsity is disabled.
+        import vortex_torch
+        self.sparse_attention = vortex_torch.integration.build_sparse_flow(self)
 
         # Init memory pool and attention backends
         self.init_memory_pool(min_per_gpu_memory)

@@ -564,25 +564,12 @@ class ServerArgs:
     ds_sparse_decode_threshold: int = 4096
 
 
-    # Vortex Sparse Attention
-    enable_vortex_sparsity: bool = False
-    vortex_topk_val: int = 30
-    vortex_max_topk_val: int = None
-    vortex_layers_skip: Optional[List[int]] = None
-    vortex_block_reserved_bos: int = 1
-    vortex_block_reserved_eos: int = 1
-    vortex_max_seq_lens: int = -1
-    vortex_workload_chunk_size: int = 32
-    vortex_dtype: str = "bfloat16"
-    vortex_module_path: str = None
-    vortex_module_name: str = None
-    vortex_block_size: int = 16
-    vortex_topk_ratio: float = 0.0
-    vortex_compilation_cache_dir: str = None
-    vortex_schedule_policy: str = None
-    vortex_attention_backend: Optional[str] = "flashinfer"
-    vortex_impl_backend: Optional[str] = "triton"
-    vortex_use_tensor_core: bool = False
+    # Vortex Sparse Attention — all hyper-parameters live in a single,
+    # vortex_torch-owned config object (vortex_torch.engine.sgl.config.VortexConfig).
+    # The legacy flat `enable_vortex_sparsity` / `vortex_*` reads are served by
+    # __getattr__ below; flat kwargs (sgl.Engine(vortex_topk_val=...)) are folded
+    # into this field by vortex_torch's install_serverargs_adapter().
+    vortex: Optional[Any] = None
 
     # Offloading
     cpu_offload_gb: int = 0
@@ -721,6 +708,36 @@ class ServerArgs:
 
     # For forward hooks
     forward_hooks: Optional[List[dict[str, Any]]] = None
+
+    # --- Vortex backward-compat shim -------------------------------------
+    # Legacy default for each `vortex_<name>` (mirrors VortexConfig defaults).
+    # Plain literal so this file never imports vortex_torch (no layering flip).
+    _VORTEX_LEGACY_DEFAULTS = {
+        "topk_val": 30, "max_topk_val": None, "layers_skip": None,
+        "block_reserved_bos": 1, "block_reserved_eos": 1, "max_seq_lens": -1,
+        "workload_chunk_size": 32, "dtype": "bfloat16", "module_path": None,
+        "module_name": None, "block_size": 16, "topk_ratio": 0.0,
+        "compilation_cache_dir": None, "schedule_policy": None,
+        "attention_backend": "flashinfer", "impl_backend": "triton",
+        "use_tensor_core": False,
+    }
+
+    def __getattr__(self, name):
+        # Only fires for attributes not found normally (the flat vortex_* fields
+        # were removed). Map `enable_vortex_sparsity` and `vortex_<name>` onto the
+        # single `vortex` VortexConfig object, so existing read sites still work.
+        if name == "enable_vortex_sparsity":
+            return self.__dict__.get("vortex") is not None
+        if name.startswith("vortex_"):
+            key = name[len("vortex_"):]
+            vx = self.__dict__.get("vortex")
+            if vx is not None:
+                return getattr(vx, key)
+            if key in self._VORTEX_LEGACY_DEFAULTS:
+                return self._VORTEX_LEGACY_DEFAULTS[key]
+        raise AttributeError(
+            f"{type(self).__name__!r} object has no attribute {name!r}"
+        )
 
     def __post_init__(self):
         """
@@ -5105,97 +5122,13 @@ class ServerArgs:
             help="JSON-formatted forward hook specifications to attach to the model.",
         )
         parser.add_argument(
-            "--enable-vortex-sparsity",
-            action="store_true",
-        )
-        parser.add_argument(
-            "--vortex-topk-val",
-            type=int,
-            default=ServerArgs.vortex_topk_val,
-        )
-        parser.add_argument(
-            "--vortex-max-topk-val",
-            type=int,
-            default=ServerArgs.vortex_max_topk_val,
-        )
-        parser.add_argument(
-            "--vortex-block-size",
-            type=int,
-            default=ServerArgs.vortex_block_size,
-        )
-        parser.add_argument(
-            "--vortex-block-reserved-bos",
-            type=int,
-            default=ServerArgs.vortex_block_reserved_bos,
-        )
-        parser.add_argument(
-            "--vortex-block-reserved-eos",
-            type=int,
-            default=ServerArgs.vortex_block_reserved_eos,
-        )
-        parser.add_argument(
-            "--vortex-layers-skip",
-            type=int,
-            nargs="+",
-        )
-        parser.add_argument(
-            "--vortex-max-seq-lens",
-            type=int,
-            default=ServerArgs.vortex_max_seq_lens,
-        )
-        parser.add_argument(
-            "--vortex-workload-chunk-size",
-            type=int,
-            default=ServerArgs.vortex_workload_chunk_size,
-        )
-        parser.add_argument(
-            "--vortex-dtype",
+            "--vortex-config",
+            dest="vortex",
             type=str,
-            choices=["bfloat16", "float16", "float32", "fp8_e5m2", "fp8_e4m3fn"],
-            default=ServerArgs.vortex_dtype,
-        )
-        parser.add_argument(
-            "--vortex-module-path",
-            type=str,
-            default=ServerArgs.vortex_module_path,
-        )
-        parser.add_argument(
-            "--vortex-module-name",
-            type=str,
-            default=ServerArgs.vortex_module_name,
-        )
-        parser.add_argument(
-            "--vortex-compilation-cache-dir",
-            type=str,
-            default=ServerArgs.vortex_compilation_cache_dir,
-        )
-        parser.add_argument(
-            "--vortex-schedule-policy",
-            type=str,
-            default=ServerArgs.vortex_schedule_policy,
-        )
-        parser.add_argument(
-            "--vortex-topk-ratio",
-            type=float,
-            default=ServerArgs.vortex_topk_ratio,
-        )
-        parser.add_argument(
-            "--vortex-attention-backend",
-            type=str,
-            default=ServerArgs.vortex_attention_backend,
-        )
-        parser.add_argument(
-            "--vortex-impl-backend",
-            type=str,
-            choices=["triton", "cuda"],
-            default=ServerArgs.vortex_impl_backend,
-        )
-        parser.add_argument(
-            "--vortex-use-tensor-core",
-            action="store_true",
-            default=ServerArgs.vortex_use_tensor_core,
-            help="Triton indexer: keep compute blocks in bf16 (fp32 "
-                 "accumulation) and emit tl.dot for MMA-friendly GeMMs.",
+            default=None,
+            help="JSON of vortex sparse-attention hyper-parameters (see "
+                 "vortex_torch.engine.sgl.config.VortexConfig). Python callers "
+                 "pass vortex=VortexConfig(...) or flat vortex_* kwargs instead.",
         )
 
     @classmethod
