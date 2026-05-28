@@ -290,3 +290,8 @@ RLG
 RLG/
 scripts/
 vortex_torch/kernels/centroid_score
+
+# Local source-tree clones (flashinfer / flash-attention) used for reference;
+# not part of this repo. Anchored so only the root-level dirs are ignored.
+/flashinfer/
+/flash-attention/
