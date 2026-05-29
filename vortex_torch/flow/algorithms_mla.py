@@ -302,3 +302,109 @@ class RopeUnawareLServeCentroidMLA(vFlowMLA):
         return {
             "centroids": (block_size // self.SUB_BLOCK_SIZE, kv_lora_rank + qk_rope_head_dim),
         }
+
+
+# ---------------------------------------------------------------------------
+# WEIGHTED NoPE/RoPE block-sparse routing
+# ---------------------------------------------------------------------------
+# rope_aware scores with the full dot ⟨q,c⟩ = ⟨q_nope,c_kv⟩ + ⟨q_pe,c_pe⟩
+# (the NoPE and RoPE terms enter at a fixed 1:1 ratio); rope_unaware drops the
+# RoPE term. This flow makes the split a tunable convex blend:
+#
+#     score(p) = a · ⟨q_nope, c_kv_p⟩ + b · ⟨q_pe, c_pe_p⟩ ,     a + b = 1.
+#
+# Realised by scaling the query per-dimension before the (unchanged, full-width)
+# GeMM: a single MaskSlice emits the weight vector [a]*kv_lora_rank ++ [b]*rope
+# (alpha on [0, NOPE_DIM), beta elsewhere — MaskSlice is a pure position writer),
+# Multiply applies it to the head-averaged query, and
+# ⟨[a·q_nope | b·q_pe], c⟩ = a·⟨q_nope,c_kv⟩ + b·⟨q_pe,c_pe⟩ falls straight out.
+#
+# Because top-k ranks pages by score for one query, only the a:b RATIO affects
+# selection (a global scale is irrelevant). Hence the b knob interpolates:
+#   b = 0.0  -> NoPE only            (== rope_unaware_block_sparse_mla)
+#   b = 0.5  -> 1:1 NoPE:RoPE        (same ranking as rope_aware_block_sparse_mla)
+#   b -> 1.0 -> RoPE-dominated routing
+# Sweep b to recover the RoPE signal that pure-NoPE routing loses, without
+# letting the 64-d RoPE term swamp the 512-d latent term.
+
+
+class _WeightedRopeBlockSparseMLA(vFlowMLA):
+    r"""Base for the weighted NoPE/RoPE block-sparse flow; subclasses set the
+    blend weights :attr:`A` (NoPE) and :attr:`B` (RoPE), with ``A + B == 1``.
+    Not registered directly — use a ``rope_weighted_block_sparse_mla_b*`` name."""
+    NOPE_DIM = 512  # kv_lora_rank; RoPE (k_pe) occupies dims [NOPE_DIM, latent_dim)
+    A = 0.5         # NoPE-term weight
+    B = 0.5         # RoPE-term weight   (A + B must == 1)
+
+    def __init__(self):
+        super().__init__()
+        assert abs((self.A + self.B) - 1.0) < 1e-6, (
+            f"{type(self).__name__}: require A + B == 1, got A={self.A}, B={self.B}"
+        )
+        self.mean = Mean(dim=1)
+        # Per-dim blend weights: A on the NoPE dims [0, NOPE_DIM), B on the RoPE
+        # dims [NOPE_DIM, latent_dim). Pure position writer (q values unused).
+        self.weight = MaskSlice(start=0, end=self.NOPE_DIM, dim=2, alpha=self.A, beta=self.B)
+        self.mul = Multiply()          # scale q: a·q_nope | b·q_pe
+        self.gemm = GeMM()             # GeMM(x, y) = y @ xᵀ  → per-page score
+        self.output_func = topK()      # terminal: selected page ids
+        self.reduction = CMean(dim=1)  # centroid = mean of the fused latent
+
+    def forward_indexer(
+        self,
+        q: torch.Tensor,               # [B, H, latent_dim]  ([q_nope_out | q_pe])
+        o: torch.Tensor,
+        cache: Dict[str, torch.Tensor],
+        ctx: ContextBase,
+    ):
+        q_mean = self.mean(q, ctx=ctx)                              # [B, 1, latent_dim]
+        w = self.weight(q_mean, ctx=ctx)                           # [a]*nope ++ [b]*rope
+        q_w = self.mul(q_mean, w, ctx=ctx)                         # a·q_nope | b·q_pe
+        score = self.gemm(q_w, cache["centroids"], ctx=ctx)        # a·⟨q_nope,c_kv⟩ + b·⟨q_pe,c_pe⟩
+        self.output_func(score, o, ctx=ctx)
+
+    def forward_cache(
+        self,
+        cache: Dict[str, torch.Tensor],
+        loc: torch.Tensor,
+        ctx: ContextBase,
+    ):
+        self.reduction(cache["latent"], cache["centroids"], loc=loc, ctx=ctx)
+
+    def create_cache(self, block_size: int, kv_lora_rank: int, qk_rope_head_dim: int):
+        assert kv_lora_rank == self.NOPE_DIM, (
+            f"{type(self).__name__} assumes kv_lora_rank={self.NOPE_DIM}, got {kv_lora_rank}"
+        )
+        return {"centroids": (1, kv_lora_rank + qk_rope_head_dim)}
+
+
+@register("rope_weighted_block_sparse_mla_b10")
+class RopeWeightedBlockSparseMLA_B10(_WeightedRopeBlockSparseMLA):
+    A, B = 0.90, 0.10
+
+
+@register("rope_weighted_block_sparse_mla_b25")
+class RopeWeightedBlockSparseMLA_B25(_WeightedRopeBlockSparseMLA):
+    A, B = 0.75, 0.25
+
+
+@register("rope_weighted_block_sparse_mla_b50")
+class RopeWeightedBlockSparseMLA_B50(_WeightedRopeBlockSparseMLA):
+    # 1:1 NoPE:RoPE — same page ranking as rope_aware_block_sparse_mla.
+    A, B = 0.50, 0.50
+
+
+@register("rope_weighted_block_sparse_mla_b75")
+class RopeWeightedBlockSparseMLA_B75(_WeightedRopeBlockSparseMLA):
+    A, B = 0.25, 0.75
+
+
+@register("rope_weighted_block_sparse_mla_b90")
+class RopeWeightedBlockSparseMLA_B90(_WeightedRopeBlockSparseMLA):
+    A, B = 0.10, 0.90
+
+
+@register("rope_weighted_block_sparse_mla_b100")
+class RopeWeightedBlockSparseMLA_B100(_WeightedRopeBlockSparseMLA):
+    # Pure RoPE routing: drops the 512-d latent term entirely (mirror of unaware).
+    A, B = 0.00, 1.00

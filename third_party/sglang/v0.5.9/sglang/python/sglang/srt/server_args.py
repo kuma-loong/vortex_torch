@@ -1553,9 +1553,14 @@ class ServerArgs:
             # Flashinfer appears to degrade performance when sliding window attention
             # is used for the Olmo2 architecture. Olmo2 does not use sliding window attention
             # but Olmo3 does.
-            assert (
-                self.attention_backend != "flashinfer"
-            ), "FlashInfer backend can significantly degrade the performance of Olmo3 models."
+            # [VORTEX] relaxed: this is a PERF guard (flashinfer + sliding-window
+            # on Olmo3). Olmo2 has no SWA, and the vortex non-MLA path requires the
+            # flashinfer backend, so allow it (accuracy study; perf irrelevant).
+            if self.attention_backend == "flashinfer":
+                logger.warning(
+                    "FlashInfer may degrade Olmo3 perf (SWA); allowing for vortex "
+                    "channel study (Olmo2 has no SWA)."
+                )
 
             logger.info(
                 f"Using {self.attention_backend} as attention backend for {model_arch}."

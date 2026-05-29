@@ -37,12 +37,15 @@ vortex_attention_backend: str = "trtllm",
 vortex_impl_backend: str = "cuda",
 vortex_use_tensor_core: bool = False,
 vortex_layers_skip: list = None,
+vortex_module_path: str = None,
+disable_cuda_graph: bool = False,
 ):
     if vortex_layers_skip is None:
         vortex_layers_skip = [0]
 
     llm = sgl.Engine(model_path=model_name,
-                    disable_cuda_graph=False,
+                    disable_cuda_graph=disable_cuda_graph,
+                    vortex_module_path=vortex_module_path,
                     vortex_block_size=block_size,
                     page_size=page_size,
                     vortex_topk_val=topk_val,
@@ -311,6 +314,21 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--vortex-module-path",
+        type=str,
+        default=None,
+        help="Path to a .py file declaring @register(<vortex_module_name>) "
+             "(for custom flows like the channel-study variants).",
+    )
+
+    parser.add_argument(
+        "--disable-cuda-graph",
+        action="store_true",
+        help="Disable CUDA graph capture (eager decode). Use when a custom "
+             "flow trips graph capture.",
+    )
+
+    parser.add_argument(
         "--summary-dir",
         type=str,
         default="summary_ratio",
@@ -386,6 +404,8 @@ if __name__ == "__main__":
         vortex_impl_backend=args.vortex_impl_backend,
         vortex_use_tensor_core=args.vortex_use_tensor_core,
         vortex_layers_skip=args.vortex_layers_skip,
+        vortex_module_path=args.vortex_module_path,
+        disable_cuda_graph=args.disable_cuda_graph,
     )
     current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     os.makedirs(args.summary_dir, exist_ok=True)
