@@ -3,8 +3,13 @@ from typing import Dict
 
 from .flow_mla import vFlowMLA
 from .registry import register
-from ..indexer import topK, GeMM, Mean, Max, MaskSlice, Multiply
-from ..cache import Mean as CMean, MeanInterleave as CMeanInterleave
+from ..indexer import topK, GeMM, Mean, Max, MaskSlice, Multiply, Relu, Add
+from ..cache import (
+    Mean as CMean,
+    MeanInterleave as CMeanInterleave,
+    Min as CMin,
+    Max as CMax,
+)
 from ..abs import ContextBase
 
 # MLA flows (DeepSeek-V2/V3-style latent attention). The cache stores a single
@@ -180,6 +185,103 @@ class LServeCentroidMLA(vFlowMLA):
 # baselines to measure what the RoPE term contributes to routing quality.
 #
 # NoPE width is the framework-fixed kv_lora_rank (512); create_cache asserts it.
+
+
+@register("quest_mla")
+class QuestMLA(vFlowMLA):
+    r"""
+    **Quest** (Tang et al., 2024) query-aware page routing on the fused MLA latent.
+
+    Instead of one centroid per page, Quest keeps the **element-wise min and max**
+    of the page's key vectors and ranks a page by the *largest attention score any
+    key in it could possibly produce* for the current query — a per-channel upper
+    bound that is tight when the relevant key concentrates the query's mass, so a
+    page is selected whenever it *might* hold a high-scoring key.
+
+    **Cache.** :meth:`forward_cache` stores two full-width fused-latent summaries
+    per page — the channel-wise min and max over the block's tokens:
+
+    .. math::
+
+        m_p[d] = \min_{t\in p}\text{latent}_t[d], \qquad
+        M_p[d] = \max_{t\in p}\text{latent}_t[d],
+        \qquad \text{latent}_t = [\,\text{kv\_c}_t \,|\, \text{k\_pe}_t\,].
+
+    **Routing.** With the head-averaged fused query
+    :math:`\bar q = \tfrac1H\sum_h [\,q\_nope\_out_h \,|\, q\_pe_h\,]`, Quest scores
+    each page by the channel-wise maximal achievable logit
+
+    .. math::
+
+        \operatorname{score}(p)
+        = \sum_d \max\!\big(\bar q_d\, m_p[d],\; \bar q_d\, M_p[d]\big)
+        = \langle \operatorname{relu}(\bar q),\, M_p\rangle
+        + \langle \min(\bar q, 0),\, m_p\rangle ,
+
+    the standard sign-split identity (a channel takes :math:`M_p` where
+    :math:`\bar q_d \ge 0` and :math:`m_p` where :math:`\bar q_d < 0`), then
+    top-:math:`k`. Both RoPE and latent terms participate, since the bound is over
+    the full fused 576-d vector. ``relu`` is ``max(\cdot,0)`` and ``min(\bar q,0)``
+    is the affine residual :math:`\bar q - \operatorname{relu}(\bar q)`, so the whole
+    score is two GeMMs (one per summary) plus an add.
+
+    **Note — head-averaged query.** Canonical Quest is per-head; here routing must
+    emit a single shared page set per request (the MLA decode kernel reads one
+    ``sparse_block_tables`` across all heads), so the query is head-averaged first,
+    matching the other MLA flows in this module.
+
+    **Shapes.** ``q`` is ``[B, H, d_c+d_r]``; ``cache["cmin"]`` / ``cache["cmax"]``
+    are ``[S, 1, d_c+d_r]`` (indexer) / ``[B, 1, d_c+d_r]`` (cache).
+    """
+
+    def __init__(self):
+        super().__init__()
+        # Indexer-side ops (run every decode step)
+        self.mean = Mean(dim=1)        # average the fused query over its H heads
+        self.relu = Relu()             # q_pos = max(q, 0)            (alpha=0, beta=0)
+        self.neg = Add(alpha=1.0, beta=-1.0)  # q_neg = q - q_pos = min(q, 0)
+        self.gemm_max = GeMM()         # ⟨relu(q),  cmax⟩  → per-page partial score
+        self.gemm_min = GeMM()         # ⟨min(q,0), cmin⟩  → per-page partial score
+        self.add_score = Add()         # score = s_max + s_min
+        self.output_func = topK()      # terminal: write selected page ids to o
+
+        # Cache-side ops (run once per finished page): per-channel min / max of the
+        # fused latent over the block's tokens. Distinct op instances (one call site
+        # each), distinct cache fields.
+        self.red_max = CMax(dim=1)
+        self.red_min = CMin(dim=1)
+
+    def forward_indexer(
+        self,
+        q: torch.Tensor,               # [B, H, latent_dim]  ([q_nope_out | q_pe])
+        o: torch.Tensor,
+        cache: Dict[str, torch.Tensor],
+        ctx: ContextBase,
+    ):
+        q_mean = self.mean(q, ctx=ctx)                            # [B, 1, latent_dim]
+        q_pos = self.relu(q_mean, ctx=ctx)                       # max(q, 0)
+        q_neg = self.neg(q_mean, q_pos, ctx=ctx)                 # q - relu(q) = min(q, 0)
+        s_max = self.gemm_max(q_pos, cache["cmax"], ctx=ctx)     # ⟨relu(q),  cmax⟩  [S,1,1]
+        s_min = self.gemm_min(q_neg, cache["cmin"], ctx=ctx)     # ⟨min(q,0), cmin⟩  [S,1,1]
+        score = self.add_score(s_max, s_min, ctx=ctx)           # Quest upper bound  [S,1,1]
+        self.output_func(score, o, ctx=ctx)
+
+    def forward_cache(
+        self,
+        cache: Dict[str, torch.Tensor],
+        loc: torch.Tensor,
+        ctx: ContextBase,
+    ):
+        self.red_max(cache["latent"], cache["cmax"], loc=loc, ctx=ctx)
+        self.red_min(cache["latent"], cache["cmin"], loc=loc, ctx=ctx)
+
+    def create_cache(self, block_size: int, kv_lora_rank: int, qk_rope_head_dim: int):
+        # "latent" is auto-provided — declare the per-page min/max summaries (full width).
+        latent_dim = kv_lora_rank + qk_rope_head_dim
+        return {
+            "cmin": (1, latent_dim),
+            "cmax": (1, latent_dim),
+        }
 
 
 @register("rope_unaware_block_sparse_mla")

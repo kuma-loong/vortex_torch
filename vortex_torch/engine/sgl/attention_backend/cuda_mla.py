@@ -50,7 +50,7 @@ from vortex_torch.indexer.utils_sglang import get_decode_planner_trtllm
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-from .cuda_mla_kernel import make_mla_decoder
+from .cuda_mla_kernel import allocate_mla_buffers, make_mla_decoder
 from .mla_prefill import MLAPrefill
 
 if TYPE_CHECKING:
@@ -155,6 +155,20 @@ class VortexCudaMLABackend(AttentionBackend):
         # lazily; cuda-graph captures create their bs's decoder at capture time and
         # reuse it on replay — buffers stay at fixed addresses). `plan()` runs once
         # per step in init_forward_metadata*, `run()` per layer in forward_decode.
+        #
+        # The work-queue + split-reduction scratch (work_*, mid_*) is allocated ONCE
+        # here, sized for the MAX decode batch size, and shared across every per-bs
+        # decoder (each slices it to its own target_ctas). target_ctas is monotone in
+        # bs, so the max-bs buffers cover every smaller bs. Previously each captured
+        # cuda-graph bs built a decoder that allocated its own full
+        # target_ctas*M*512 fp32 mid_o + work queue => O(#graph-bs) redundant scratch;
+        # now there is exactly one copy. max_bs = req_to_token_pool.size (the running
+        # request cap, set on ctx during _compile) — a safe upper bound on decode bs.
+        self._max_bs = int(self.ctx.max_bs)
+        max_blocks = self.ctx.metadata.sparse_block_tables.size(1)
+        self._mla_buffers = allocate_mla_buffers(
+            self._max_bs, self.num_qo_heads, self.block_size, max_blocks, self.device,
+        )
         self._decoders: dict = {}
         self._cur_decoder = None
 
@@ -201,8 +215,14 @@ class VortexCudaMLABackend(AttentionBackend):
     def _decoder_for(self, bs: int):
         dec = self._decoders.get(bs)
         if dec is None:
+            assert bs <= self._max_bs, (
+                f"decode bs {bs} exceeds max_bs {self._max_bs} the MLA scratch was "
+                f"sized for (req_to_token_pool.size)."
+            )
             max_blocks = self.ctx.metadata.sparse_block_tables.size(1)
-            dec = make_mla_decoder(bs, self.num_qo_heads, self.block_size, max_blocks)
+            dec = make_mla_decoder(
+                bs, self.num_qo_heads, self.block_size, max_blocks, self._mla_buffers,
+            )
             self._decoders[bs] = dec
         return dec
 

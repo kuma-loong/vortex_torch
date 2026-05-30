@@ -33,18 +33,18 @@
 # No GPUs are excluded by default; set $EXCLUDE_GPUS (space-separated indices)
 # to skip known-bad/busy ones. Parallelism is capped at 4 even if more are free.
 set -uo pipefail
-export HF_HOME=/raid/catalyst/models/
+#export HF_HOME=/raid/catalyst/models/
 
-MODEL="zai-org/GLM-4.7-Flash"
+MODEL="GLM-4.7-Flash"
 DATA="examples/aime26_glm.jsonl"
 SUMMARY_DIR="summary-glm4.7-flash"
 RESULTS_MD="examples/algo2_blocksize_results.md"
 TRIALS=16
-SPARSE_MODULES=(rope_aware_block_sparse_mla lserve_centroid_mla)
+SPARSE_MODULES=(rope_aware_block_sparse_mla)
 BLOCK_SIZES=(32 64)
 BUDGETS=(2048 4096)
 RESERVED=3                 # vortex_block_reserved_bos(1) + eos(2); the +3 in the formula
-MAX_PARALLEL=4
+MAX_PARALLEL=1
 EXCLUDE_GPUS="${EXCLUDE_GPUS:-}"
 
 # block/page are set per job (they vary), so they are NOT in COMMON.

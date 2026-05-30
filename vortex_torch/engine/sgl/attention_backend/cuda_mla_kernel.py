@@ -51,14 +51,68 @@ def _sm_count(device) -> int:
     return _SM_COUNT[idx]
 
 
-def make_mla_decoder(bs: int, H: int, block_size: int, max_blocks: int,
-                     max_split_cap: int = -1, chunk_min: int = -1, minb: int = -1):
-    """flashinfer-style plan/run decoder. Allocate ONCE per (bs) for a fixed launch
-    geometry; ``plan(seqlens)`` builds the load-balanced work queue (once per decode
-    step, shared by all layers), ``run(q, latent, block_table, o, sm_scale)`` does the
-    per-layer decode. Both are fixed-grid => cuda-graph-capturable."""
-    return get_cuda_mla_module().MLADecoder(
+# kv_lora_rank — the latent width the kernel reduces over (ldm::CKV). Constant for
+# MLA; mid_o is [target_ctas, M, CKV]. The decode path asserts Lk==576, Lv==512.
+CKV = 512
+
+
+def mla_decoder_geometry(bs: int, H: int, block_size: int, max_blocks: int,
+                         max_split_cap: int = -1, chunk_min: int = -1, minb: int = -1):
+    """Host-only launch geometry for a decode batch size — NO allocation. Returns a
+    dict with ``target_ctas`` (run_wq grid / work-queue length) and ``M`` (=ceil(H/16)*16,
+    the mid-buffer head-pad). Used to size the shared scratch at the max decode bs."""
+    tc, M, minb_, target, cap, cmin = get_cuda_mla_module().mla_decoder_geometry(
         bs, H, block_size, max_blocks, max_split_cap, chunk_min, minb)
+    return {"target_ctas": tc, "M": M, "minb": minb_,
+            "target": target, "max_split_cap": cap, "chunk_min": cmin}
+
+
+def allocate_mla_buffers(max_bs: int, H: int, block_size: int, max_blocks: int,
+                         device, max_split_cap: int = -1, chunk_min: int = -1,
+                         minb: int = -1) -> dict:
+    """Allocate the work-queue + split-reduction scratch ONCE, sized for the maximum
+    decode batch size. ``target_ctas`` grows monotonically with bs, so these buffers
+    cover every smaller bs; all per-bs ``MLADecoder``s slice into them. This replaces
+    the old one-scratch-allocation-per-cuda-graph-bs behaviour, which duplicated the
+    (largest) ``target_ctas*M*512`` fp32 ``mid_o`` for every captured batch size."""
+    g = mla_decoder_geometry(max_bs, H, block_size, max_blocks,
+                             max_split_cap, chunk_min, minb)
+    tc, M = g["target_ctas"], g["M"]
+    i32 = {"dtype": torch.int32, "device": device}
+    f32 = {"dtype": torch.float32, "device": device}
+    # Uninitialised (torch.empty) is correct: the contract is plan -> run. Every decode
+    # step, plan() (schedule_wq) repopulates the whole work queue (work_*), and run()'s
+    # stage1 writes the mid_* scratch for exactly the active work items
+    # [0, sum(nsplits)) that stage2_wq then reduces. The schedule keeps
+    # sum(nsplits) <= target_ctas (the +bs margin), and every slot a reduction reads,
+    # [WorkOffset[b], WorkOffset[b+1]), is an active item stage1 wrote — so nothing here
+    # is ever read before being written, even with one scratch shared across batch
+    # sizes / steps. (Verified: full-scratch poison does not leak into the output.)
+    return {
+        "work_batch": torch.empty(tc, **i32),
+        "work_kv_start": torch.empty(tc, **i32),
+        "work_kv_end": torch.empty(tc, **i32),
+        "work_offset": torch.empty(max_bs + 1, **i32),
+        "mid_o": torch.empty((tc, M, CKV), **f32),
+        "mid_m": torch.empty((tc, M), **f32),
+        "mid_l": torch.empty((tc, M), **f32),
+    }
+
+
+def make_mla_decoder(bs: int, H: int, block_size: int, max_blocks: int, buffers: dict,
+                     max_split_cap: int = -1, chunk_min: int = -1, minb: int = -1):
+    """flashinfer-style plan/run decoder. The launch geometry is fixed per (bs), but
+    the work-queue / split scratch is NOT allocated here — pass ``buffers`` from
+    ``allocate_mla_buffers(max_bs, ...)`` (sized for the max decode bs) and the decoder
+    slices them to this bs's ``target_ctas``. ``plan(seqlens)`` builds the load-balanced
+    work queue (once per decode step, shared by all layers); ``run(q, latent,
+    block_table, o, sm_scale)`` does the per-layer decode. Both are fixed-grid =>
+    cuda-graph-capturable."""
+    return get_cuda_mla_module().MLADecoder(
+        bs, H, block_size, max_blocks,
+        buffers["work_batch"], buffers["work_kv_start"], buffers["work_kv_end"],
+        buffers["work_offset"], buffers["mid_o"], buffers["mid_m"], buffers["mid_l"],
+        max_split_cap, chunk_min, minb)
 
 
 def decode_blocktable_mla_cuda(

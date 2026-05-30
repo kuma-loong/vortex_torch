@@ -29,15 +29,15 @@
 # to skip known-bad/busy ones, e.g. EXCLUDE_GPUS="0 2" ./algo2.sh. Parallelism
 # is capped at 4 even if more GPUs are free.
 set -uo pipefail
-export HF_HOME=/raid/catalyst/models/
+#export HF_HOME=/raid/catalyst/models/
 
-MODEL="zai-org/GLM-4.7-Flash"
+MODEL="GLM-4.7-Flash"
 DATA="examples/aime26_glm.jsonl"
 SUMMARY_DIR="summary-glm4.7-flash"
 TRIALS=16
 TOPK_VAL=(61 93 125 157 253)
-SPARSE_MODULES=(rope_unaware_block_sparse_mla)
-MAX_PARALLEL=4
+SPARSE_MODULES=(rope_aware_block_sparse_mla)
+MAX_PARALLEL=1
 EXCLUDE_GPUS="${EXCLUDE_GPUS:-}"
 
 COMMON=(
@@ -85,7 +85,7 @@ JOBS=()
 # 2/3. sparse modules: triton + tensor-core indexer, all layers sparse.
 for algo in "${SPARSE_MODULES[@]}"; do
   for k in "${TOPK_VAL[@]}"; do
-    JOBS+=("--vortex-module-name $algo --topk-val $k --attention-backend triton --vortex-impl-backend triton --vortex-use-tensor-core --vortex-layers-skip")
+    JOBS+=("--vortex-module-name $algo --topk-val $k --attention-backend cuda_mla  --vortex-impl-backend triton --vortex-use-tensor-core --vortex-layers-skip")
   done
 done
 
