@@ -2,7 +2,13 @@ FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-ARG TORCH_CUDA_ARCH_LIST="9.0"
+# Architectures the JIT/AOT CUDA extensions are built for.
+#   9.0    = H100/H200 (sm_90)
+#   10.0a  = B200 (sm_100a, the arch-specific variant the cuda_mla kernel needs;
+#            see vortex_torch/engine/sgl/attention_backend/cuda_mla_kernel.py).
+# Override at build time, e.g.  --build-arg TORCH_CUDA_ARCH_LIST="10.0a"  for
+# a Blackwell-only image, or  "9.0"  for Hopper-only.
+ARG TORCH_CUDA_ARCH_LIST="9.0;10.0a"
 ENV TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}"
 
 SHELL ["/bin/bash", "-c"]
@@ -31,20 +37,36 @@ ENV VIRTUAL_ENV="/opt/venv"
 
 RUN python -m pip install --upgrade pip setuptools wheel
 
-ARG VORTEX_TORCH_REF=v0.3
+# Default to v0.6 (the current vortex_torch release line). Override via
+#   --build-arg VORTEX_TORCH_REF=<branch-or-tag>.
+ARG VORTEX_TORCH_REF=v0.6
 
 WORKDIR /workspace
 
 RUN git clone -b "${VORTEX_TORCH_REF}" --recursive \
     https://github.com/Infini-AI-Lab/vortex_torch.git
 
-WORKDIR /workspace/vortex_torch/third_party/sglang/v0.4.9/sglang
+# Install the vendored sglang from source. sglang v0.5.9 does NOT ship an
+# install.sh; the README's "Method 2: From source"
+# (third_party/sglang/v0.5.9/sglang/docs/get_started/install.md, also
+# https://docs.sglang.io/get_started/install.html) is just
+#     pip install -e "python"
+# which pulls torch 2.9.1 (cu128 wheel from PyPI), flashinfer_python/cubin
+# 0.6.3, sgl-kernel 0.3.21, transformers 4.57.1, and the rest of the runtime
+# tree.
+WORKDIR /workspace/vortex_torch/third_party/sglang/v0.5.9/sglang
 
-RUN bash install.sh
+RUN pip install --no-cache-dir -e "python"
 
 WORKDIR /workspace/vortex_torch
 
 RUN pip install --no-cache-dir -e .
+
+# GLM-4.7-Flash note: this image ships transformers 4.57.1 (sglang's pin), which
+# does NOT recognize the `glm4_moe_lite` architecture. If you need GLM-4.7-Flash,
+# override transformers with the pinned commit (see install_vortex_glm.bash):
+#   pip install --upgrade \
+#     "git+https://github.com/huggingface/transformers.git@76732b4e7120808ff989edbd16401f61fa6a0afa"
 
 RUN which python && python --version && which pip && pip --version
 
