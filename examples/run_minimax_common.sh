@@ -10,20 +10,23 @@
 #     source "$(dirname "${BASH_SOURCE[0]}")/run_minimax_common.sh"
 #     mm_run_chunk <start> <count>
 #
-# Positional $1 of the SOURCING script is the HF model id (default
-# MiniMaxAI/MiniMax-M2.7); env overrides: $DATA, $SUMMARY_DIR, $RESULTS_MD,
-# $GPUS, $EXCLUDE_GPUS. Wave width is 2 (8 GPUs / tp=4). See examples/
-# run_minimax.sh for the all-in-one version and full design rationale.
+# Positional $1 of the SOURCING script is the summary dir (default
+# summary-<model-slug>); $SUMMARY_DIR env is an equivalent override. Positional
+# $2 is the HF model id (default MiniMaxAI/MiniMax-M2.7); $MODEL env is an
+# equivalent override. Other env overrides: $DATA, $RESULTS_MD, $GPUS,
+# $EXCLUDE_GPUS. Wave width is 2 (8 GPUs / tp=4). See examples/run_minimax.sh
+# for the all-in-one version and full design rationale.
 
 set -uo pipefail
 
-# $1: HF model id (positional, optional). Default keeps the original MiniMax run.
-MODEL="${1:-MiniMaxAI/MiniMax-M2.7}"
+# $2 (model) wins, then $MODEL env, then the original MiniMax default.
+MODEL="${2:-${MODEL:-MiniMaxAI/MiniMax-M2.7}}"
 DATA="${DATA:-examples/aime26_minimax.jsonl}"
 
 # Per-model output paths so different models don't clobber each other.
 MODEL_SLUG="$(echo "$MODEL" | tr '[:upper:]/' '[:lower:]-')"
-SUMMARY_DIR="${SUMMARY_DIR:-summary-${MODEL_SLUG}}"
+# $1 (summary dir) wins, then $SUMMARY_DIR env, then the per-model default.
+SUMMARY_DIR="${1:-${SUMMARY_DIR:-summary-${MODEL_SLUG}}}"
 RESULTS_MD="${RESULTS_MD:-examples/run_minimax_results_${MODEL_SLUG}.md}"
 
 TRIALS=16
