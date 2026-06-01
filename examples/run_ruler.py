@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import sglang as sgl
+import vortex_torch
 from transformers import AutoTokenizer
 def main():
     # $1: HF model id (positional, optional). Default: Qwen/Qwen3-4B.
