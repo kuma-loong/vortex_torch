@@ -13,15 +13,18 @@
 # Positional $1 of the SOURCING script is the summary dir (default
 # summary-<model-slug>); $SUMMARY_DIR env is an equivalent override. Positional
 # $2 is the HF model id (default MiniMaxAI/MiniMax-M2.7); $MODEL env is an
-# equivalent override. Other env overrides: $DATA, $RESULTS_MD, $GPUS,
-# $EXCLUDE_GPUS. Wave width is 2 (8 GPUs / tp=4). See examples/run_minimax.sh
-# for the all-in-one version and full design rationale.
+# equivalent override. Positional $3 is the data path (default
+# examples/aime26_minimax.jsonl); $DATA env is an equivalent override. Other
+# env overrides: $RESULTS_MD, $GPUS, $EXCLUDE_GPUS. Wave width is 2 (8 GPUs /
+# tp=4). See examples/run_minimax.sh for the all-in-one version and full design
+# rationale.
 
 set -uo pipefail
 
 # $2 (model) wins, then $MODEL env, then the original MiniMax default.
 MODEL="${2:-${MODEL:-MiniMaxAI/MiniMax-M2.7}}"
-DATA="${DATA:-examples/aime26_minimax.jsonl}"
+# $3 (data path) wins, then $DATA env, then the default AIME26 set.
+DATA="${3:-${DATA:-examples/aime26_minimax.jsonl}}"
 
 # Per-model output paths so different models don't clobber each other.
 MODEL_SLUG="$(echo "$MODEL" | tr '[:upper:]/' '[:lower:]-')"
