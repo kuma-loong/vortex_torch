@@ -19,11 +19,13 @@
 #       block=32: budget 2048 -> topk 61 ; budget 4096 -> topk 125
 #       block=64: budget 2048 -> topk 29 ; budget 4096 -> topk  61
 #
-#   Total: 2 modules × (5 topk + 4 (block,budget)) = 18 sparse runs. No full-attn
-#   baseline here — MiniMax dense ran separately; this sweep focuses on sparse.
+#   Total: 1 full-attn baseline + 2 modules × (5 topk + 4 (block,budget))
+#        = 1 dense + 18 sparse = 19 runs. The baseline runs FIRST so it shares
+#        wave 1 with the first sparse job.
 #
-# Each run uses sglang's flashinfer attention backend (MiniMax is NOT MLA) and the
-# vortex flashinfer indexer; NO layer skip (every layer sparse).
+# Sparse runs use sglang's flashinfer attention backend (MiniMax is NOT MLA) +
+# the vortex trtllm indexer (2D block-table); NO layer skip (every layer sparse).
+# The dense baseline uses sglang's trtllm_mha kernel (vortex sparsity disabled).
 #
 # Results -> examples/run_minimax_results.md (raw summaries embedded).
 #
@@ -72,7 +74,7 @@ COMMON=(
   --workload-chunk-size 64 --topk-ratio 0.00
   --model-name "$MODEL" --data-path "$DATA" --mem 0.9
   --generation-max-new-tokens 32768 --max-input-length 4096 --tp-size "$TP_SIZE"
-  --summary-dir "$SUMMARY_DIR" --skip-already-finished-check
+  --summary-dir "$SUMMARY_DIR"
 )
 
 # Fixed per-job knobs for MiniMax sparse runs:
@@ -115,6 +117,15 @@ echo "=== GPU pool: ${GPU_POOL[*]}  (tp=$TP_SIZE, parallel=$PARALLEL jobs/wave) 
 
 # --- build the job list -------------------------------------------------------
 JOBS=()
+# Job 0: full-attention dense baseline (run ONCE; topk ignored). verify_algo.py
+# special-cases `--vortex-module-name full_attention` to enable_vortex_sparsity=
+# False, so this runs sglang's plain trtllm_mha dense path — the reference
+# accuracy against which every sparse run below is judged. Prepended so it
+# always lands in the first wave alongside the first sparse job (the only ones
+# truly "prioritised" here, since the wave width is 2). block=page=32 for trtllm
+# kernel compatibility; the sparse SPARSE_FLAGS (vortex-impl-backend, layers-skip,
+# vortex-attention-backend, tensor-core) don't apply and are intentionally omitted.
+JOBS+=("--vortex-module-name full_attention --attention-backend trtllm_mha --topk-val 253 --block-size 32 --page-size 32")
 # Sweep 1: fixed block=16, topk sweep
 for algo in "${SPARSE_MODULES[@]}"; do
   for k in "${TOPK_VAL_BLK16[@]}"; do

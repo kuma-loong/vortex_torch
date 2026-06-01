@@ -4,7 +4,8 @@ import sys
 import sglang as sgl
 from transformers import AutoTokenizer
 def main():
-    model_name = "Qwen/Qwen3-4B"
+    # $1: HF model id (positional, optional). Default: Qwen/Qwen3-4B.
+    model_name = sys.argv[1] if len(sys.argv) > 1 else "Qwen/Qwen3-4B"
 
     # Baseline toggle: ENABLE_VORTEX_SPARSITY=0 runs dense sglang (no vortex
     # sparse path) to confirm the reference accuracy; default (1) is sparse.
