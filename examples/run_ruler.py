@@ -1,17 +1,46 @@
 import json
 import os
 import sys
-import sglang as sgl
-import vortex_torch
 from transformers import AutoTokenizer
+
+
+def _generate_server(url, prompts, sampling_params):
+    """Server mode: POST the batch to a running sglang server's native
+    ``/generate`` endpoint (the HTTP analogue of ``Engine.generate``).
+    Returns a list of ``{"text": ...}`` dicts, same shape as the offline
+    engine, so the accuracy loop below is identical for both modes."""
+    import requests
+
+    url = url.rstrip("/")
+    resp = requests.post(
+        f"{url}/generate",
+        json={"text": prompts, "sampling_params": sampling_params},
+        timeout=3600,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
 def main():
     # $1: HF model id (positional, optional). Default: Qwen/Qwen3-4B.
     model_name = sys.argv[1] if len(sys.argv) > 1 else "Qwen/Qwen3-4B"
 
+    # Server mode: when RULER_SERVER_URL is set, skip building an in-process
+    # Engine and drive an already-running sglang server (e.g. the one started
+    # by examples/server_launch.sh) over HTTP. The server's own launch flags
+    # (topk_val, block_size, module, etc.) define the sparse-attention config;
+    # this script only feeds prompts and scores the answers.
+    server_url = os.environ.get("RULER_SERVER_URL")
+
     # Baseline toggle: ENABLE_VORTEX_SPARSITY=0 runs dense sglang (no vortex
     # sparse path) to confirm the reference accuracy; default (1) is sparse.
+    # (Offline-engine mode only — server mode inherits the server's config.)
     enable_vortex_sparsity = os.environ.get("ENABLE_VORTEX_SPARSITY", "1") == "1"
-    print(f"[run_ruler] enable_vortex_sparsity={enable_vortex_sparsity}", flush=True)
+    if server_url:
+        print(f"[run_ruler] SERVER mode via {server_url}", flush=True)
+    else:
+        print(f"[run_ruler] OFFLINE engine mode, "
+              f"enable_vortex_sparsity={enable_vortex_sparsity}", flush=True)
 
     default_policy = r"""
 const int static_kv_budget = topk_val + block_reserved_bos + block_reserved_eos;
@@ -19,7 +48,11 @@ const int dynamic_kv_budget = int(cached_block_len * topk_ratio);
 return max(static_kv_budget, dynamic_kv_budget);
 """
 
-    llm = sgl.Engine(model_path=model_name, 
+    llm = None
+    if not server_url:
+        import sglang as sgl
+        import vortex_torch  # noqa: F401  (wires sglang integration)
+        llm = sgl.Engine(model_path=model_name,
                     disable_cuda_graph=False,
                     page_size=16,
                     vortex_block_size=16,
@@ -69,7 +102,10 @@ return max(static_kv_budget, dynamic_kv_budget);
     sampling_params = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "max_new_tokens": 1024}
     accuracy = 0
     with open("examples/ruler_output.jsonl", "w", encoding="utf-8") as f:
-            o = llm.generate(prompts, sampling_params)
+            if server_url:
+                o = _generate_server(server_url, prompts, sampling_params)
+            else:
+                o = llm.generate(prompts, sampling_params)
             for res, answer in zip(o, ruler_outputs):
                     json.dump(res, f, ensure_ascii=False)
                     f.write("\n")
