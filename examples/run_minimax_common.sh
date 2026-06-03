@@ -46,7 +46,7 @@ COMMON=(
   --summary-dir "$SUMMARY_DIR"
 )
 
-SPARSE_FLAGS="--attention-backend flashinfer --vortex-attention-backend trtllm --vortex-impl-backend triton --vortex-layers-skip"
+SPARSE_FLAGS="--attention-backend flashinfer --vortex-attention-backend trtllm --vortex-impl-backend triton --vortex-layers-skip --vortex-use-tensor-core"
 
 # --- resolve the GPU pool -----------------------------------------------------
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
