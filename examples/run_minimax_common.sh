@@ -32,7 +32,7 @@ MODEL_SLUG="$(echo "$MODEL" | tr '[:upper:]/' '[:lower:]-')"
 SUMMARY_DIR="${1:-${SUMMARY_DIR:-summary-${MODEL_SLUG}}}"
 RESULTS_MD="${RESULTS_MD:-examples/run_minimax_results_${MODEL_SLUG}.md}"
 
-TRIALS=16
+TRIALS=32
 TP_SIZE=4
 JOBS_PER_WAVE=2                    # 8 GPUs / TP_SIZE = 2 parallel jobs per wave
 EXCLUDE_GPUS="${EXCLUDE_GPUS:-}"

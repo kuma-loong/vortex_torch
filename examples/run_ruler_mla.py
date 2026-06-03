@@ -81,7 +81,7 @@ def main() -> None:
         trust_remote_code=True,
         tp_size=args.tp,
         page_size=args.block,                       # page == block (one block per page)
-        attention_backend="cuda_mla",               # vortex CUDA MLA decode kernel
+        attention_backend="trtllm_mla",               # vortex CUDA MLA decode kernel
         kv_cache_dtype="auto",
         mem_fraction_static=args.mem_fraction,
         disable_cuda_graph=args.disable_cuda_graph,
