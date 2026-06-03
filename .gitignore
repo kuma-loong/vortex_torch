@@ -298,3 +298,6 @@ vortex_torch/kernels/centroid_score
 /flashinfer/
 /flash-attention/
 /cpu_kernels/
+vortex_paper.zip
+vortex_paper/
+algorithm_scientist/research/traces
