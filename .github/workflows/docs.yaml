@@ -2,7 +2,7 @@ name: docs
 
 on:
   push:
-    branches: [ v0.5 ]
+    branches: [ v0.6 ]
     paths:
       - "docs/**"
       - "vortex_torch/**"
