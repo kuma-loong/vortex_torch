@@ -70,7 +70,7 @@ source_suffix = {".rst": "restructuredtext", ".md": "markdown"}
 myst_enable_extensions = ["deflist", "linkify", "substitution", "tasklist"]
 
 templates_path = ["_templates"]
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
+exclude_patterns = ["_build", "landing", "Thumbs.db", ".DS_Store"]
 language = "en"
 
 # -- HTML --------------------------------------------------------------------

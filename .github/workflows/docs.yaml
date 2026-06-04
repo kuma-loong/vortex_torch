@@ -6,6 +6,7 @@ on:
     paths:
       - "docs/**"
       - "vortex_torch/**"
+      - "assets/**"
       - ".github/workflows/docs.yaml"
 
 jobs:
@@ -26,8 +27,19 @@ jobs:
         run: |
           make -C docs html
 
+      - name: Assemble site (landing page at root, Sphinx docs under /docs)
+        run: |
+          rm -rf public
+          mkdir -p public/docs public/assets
+          # Sphinx HTML -> /docs
+          cp -r docs/_build/html/. public/docs/
+          # Welcome / landing page -> root
+          cp docs/landing/index.html public/index.html
+          # Assets referenced by the landing page (logo, etc.)
+          cp assets/vortex_logo_flat.png public/assets/ || true
+
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: docs/_build/html
+          publish_dir: public

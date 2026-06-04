@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Vortex — A Flexible and Efficient Sparse Attention Framework</title>
+  <meta name="description" content="Vortex is a JIT-compiled sparse-attention framework for fast LLM decoding. Describe a sparse-attention flow in a few lines of Python and compile it into fused Triton kernels for SGLang." />
+  <style>
+    :root {
+      --bg: #0b0d12;
+      --bg-soft: #12151d;
+      --card: #161a24;
+      --border: #232838;
+      --fg: #e8ecf4;
+      --muted: #9aa4b8;
+      --accent: #6ea8fe;
+      --accent-2: #b88cff;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+    body {
+      background: radial-gradient(1200px 600px at 50% -10%, #1a2030 0%, var(--bg) 60%);
+      color: var(--fg);
+      font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      min-height: 100vh;
+    }
+    .wrap { max-width: 880px; margin: 0 auto; padding: 72px 24px 96px; }
+    header { text-align: center; }
+    .logo { width: min(360px, 70%); height: auto; margin: 0 auto 12px; display: block; }
+    h1 { font-size: 2.6rem; margin: 8px 0 4px; letter-spacing: -0.02em; }
+    .tagline { color: var(--muted); font-size: 1.15rem; margin: 0 auto 8px; max-width: 620px; }
+    .badges { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; margin: 20px 0 0; }
+    .badge {
+      font-size: 0.82rem; color: var(--muted); border: 1px solid var(--border);
+      border-radius: 999px; padding: 4px 12px; background: var(--bg-soft);
+    }
+    .cta { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; margin: 36px 0 8px; }
+    .btn {
+      display: inline-flex; align-items: center; gap: 9px; text-decoration: none;
+      padding: 12px 22px; border-radius: 12px; font-weight: 600; font-size: 1rem;
+      border: 1px solid var(--border); color: var(--fg); background: var(--card);
+      transition: transform .12s ease, border-color .12s ease, background .12s ease;
+    }
+    .btn:hover { transform: translateY(-2px); border-color: var(--accent); }
+    .btn.primary {
+      background: linear-gradient(120deg, var(--accent), var(--accent-2));
+      color: #0b0d12; border-color: transparent;
+    }
+    .btn svg { width: 18px; height: 18px; }
+
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; margin: 48px 0 0; }
+    .card {
+      display: block; text-decoration: none; color: inherit;
+      background: var(--card); border: 1px solid var(--border); border-radius: 16px;
+      padding: 22px; transition: transform .12s ease, border-color .12s ease;
+    }
+    .card:hover { transform: translateY(-3px); border-color: var(--accent); }
+    .card h3 { margin: 0 0 6px; font-size: 1.12rem; }
+    .card p { margin: 0; color: var(--muted); font-size: 0.95rem; }
+    .card .arrow { color: var(--accent); font-weight: 700; }
+
+    section.snippet { margin: 56px 0 0; }
+    section.snippet h2 { font-size: 1.05rem; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .08em; margin: 0 0 12px; }
+    pre {
+      background: var(--bg-soft); border: 1px solid var(--border); border-radius: 14px;
+      padding: 18px 20px; overflow-x: auto; font-size: 0.9rem; line-height: 1.55;
+      color: #d7def0;
+    }
+    code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; }
+    footer { text-align: center; color: var(--muted); font-size: 0.88rem; margin-top: 64px; }
+    footer a { color: var(--accent); text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <img class="logo" src="assets/vortex_logo_flat.png" alt="Vortex" onerror="this.style.display='none'" />
+      <h1>Vortex</h1>
+      <p class="tagline">A flexible and efficient <strong>sparse-attention</strong> framework for fast LLM decoding. Describe a flow in a few lines of Python — Vortex JIT-compiles it into fused Triton kernels that plug straight into SGLang.</p>
+      <div class="badges">
+        <span class="badge">JIT-compiled</span>
+        <span class="badge">Triton kernels</span>
+        <span class="badge">SGLang backend</span>
+        <span class="badge">PyTorch-like frontend</span>
+      </div>
+      <div class="cta">
+        <a class="btn primary" href="docs/">
+          📖 Read the Docs
+        </a>
+        <a class="btn" href="https://github.com/Infini-AI-Lab/vortex_torch">
+          <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+          GitHub
+        </a>
+      </div>
+    </header>
+
+    <div class="cards">
+      <a class="card" href="docs/">
+        <h3>Documentation <span class="arrow">→</span></h3>
+        <p>API reference, tutorials, and the full op set for building custom sparse-attention flows.</p>
+      </a>
+      <a class="card" href="https://github.com/Infini-AI-Lab/vortex_torch">
+        <h3>Source on GitHub <span class="arrow">→</span></h3>
+        <p>Clone the repo, file issues, and contribute. Includes vendored SGLang and example flows.</p>
+      </a>
+      <a class="card" href="docs/#quick-example">
+        <h3>Quick Example <span class="arrow">→</span></h3>
+        <p>Centroid-based block-sparse routing in a dozen lines of high-level Python ops.</p>
+      </a>
+      <a class="card" href="https://openhands.dev/">
+        <h3>AI-Generated Attention <span class="arrow">→</span></h3>
+        <p>Use SOTA agents like OpenHands to generate and benchmark sparse-attention algorithms.</p>
+      </a>
+    </div>
+
+    <section class="snippet">
+      <h2>Install</h2>
+      <pre><code>git clone --recursive https://github.com/Infini-AI-Lab/vortex_torch.git
+cd vortex_torch
+
+# SGLang dependency (vendored)
+cd third_party/sglang/v0.5.9/sglang
+pip install -e "python"
+cd ../../../../
+
+# Vortex
+pip install -e .</code></pre>
+    </section>
+
+    <footer>
+      <p>Vortex — Infini-AI-Lab · <a href="https://github.com/Infini-AI-Lab/vortex_torch">GitHub</a> · <a href="docs/">Docs</a></p>
+    </footer>
+  </div>
+</body>
+</html>
