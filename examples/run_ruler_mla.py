@@ -53,6 +53,10 @@ def parse_args() -> argparse.Namespace:
                    help="Enable GLM thinking mode (default off; needles answer directly).")
     p.add_argument("--disable-cuda-graph", action="store_true",
                    help="Run eager (no cuda graph capture).")
+    p.add_argument("--dense", action="store_true",
+                   help="Disable vortex sparsity: run plain dense trtllm_mla.")
+    p.add_argument("--kv-cache-dtype", default="auto",
+                   help="sglang kv_cache_dtype (auto|fp8_e4m3|bfloat16).")
     p.add_argument("--online", action="store_true",
                    help="Allow HF hub access (default: HF_HUB_OFFLINE=1).")
     p.add_argument("--dump", action="store_true",
@@ -70,36 +74,42 @@ def main() -> None:
     import vortex_torch  # noqa: F401  -- installs the ServerArgs / VortexConfig adapter
     from transformers import AutoTokenizer
 
-    print(f"[run_ruler_mla] model={args.model} module={args.module} "
+    mode = "dense" if args.dense else "sparse"
+    print(f"[run_ruler_mla] model={args.model} mode={mode} module={args.module} "
           f"block={args.block} topk={args.topk} n={args.n} "
+          f"kv_cache_dtype={args.kv_cache_dtype} "
           f"cuda_graph={'off' if args.disable_cuda_graph else 'on'}", flush=True)
 
-    # Flat vortex_* kwargs; the adapter folds them into one VortexConfig and ships
-    # them across the spawn boundary. These reproduce the known-good GLM run.
-    llm = sgl.Engine(
+    engine_kwargs = dict(
         model_path=args.model,
         trust_remote_code=True,
         tp_size=args.tp,
         page_size=args.block,                       # page == block (one block per page)
         attention_backend="trtllm_mla",               # vortex CUDA MLA decode kernel
-        kv_cache_dtype="auto",
+        kv_cache_dtype=args.kv_cache_dtype,
         mem_fraction_static=args.mem_fraction,
         disable_cuda_graph=args.disable_cuda_graph,
-        enable_vortex_sparsity=True,
-        vortex_module_name=args.module,
-        vortex_attention_backend="trtllm",          # 2D block-table indexer
-        vortex_impl_backend="triton",               # tensor-core indexer GeMM
-        vortex_use_tensor_core=True,
-        vortex_block_size=args.block,
-        vortex_topk_val=args.topk,
-        vortex_topk_ratio=0.0,
-        vortex_block_reserved_bos=1,
-        vortex_block_reserved_eos=2,
-        vortex_dtype="bfloat16",
-        vortex_layers_skip=[],
-        vortex_max_seq_lens=8192,
-        vortex_workload_chunk_size=64,
     )
+    if not args.dense:
+        # Flat vortex_* kwargs; the adapter folds them into one VortexConfig and ships
+        # them across the spawn boundary. These reproduce the known-good GLM run.
+        engine_kwargs.update(
+            enable_vortex_sparsity=True,
+            vortex_module_name=args.module,
+            vortex_attention_backend="trtllm",          # 2D block-table indexer
+            vortex_impl_backend="triton",               # tensor-core indexer GeMM
+            vortex_use_tensor_core=True,
+            vortex_block_size=args.block,
+            vortex_topk_val=args.topk,
+            vortex_topk_ratio=0.0,
+            vortex_block_reserved_bos=1,
+            vortex_block_reserved_eos=2,
+            vortex_dtype="bfloat16",
+            vortex_layers_skip=[],
+            vortex_max_seq_lens=8192,
+            vortex_workload_chunk_size=64,
+        )
+    llm = sgl.Engine(**engine_kwargs)
 
     with open(args.data, encoding="utf-8") as f:
         rows = [json.loads(line) for line in f][: args.n]
@@ -125,7 +135,8 @@ def main() -> None:
             print(f"GEN: {outs[i]['text'][:400]!r}", flush=True)
 
     acc = sum(hits)
-    print(f"\n>>> RULER {args.model.split('/')[-1]} | cuda_mla | {args.module}: "
+    tag = "dense trtllm_mla" if args.dense else f"sparse {args.module}"
+    print(f"\n>>> RULER {args.model.split('/')[-1]} | {tag} | kv={args.kv_cache_dtype}: "
           f"{acc}/{len(rows)} = {acc / len(rows) * 100:.1f}%", flush=True)
     llm.shutdown()
 
