@@ -36,7 +36,8 @@ jobs:
           # Welcome / landing page -> root
           cp docs/landing/index.html public/index.html
           # Assets referenced by the landing page (logo, etc.)
-          cp assets/vortex_logo_flat.png public/assets/ || true
+          cp assets/vortex_mark.png assets/vortex_mark.svg \
+             assets/vortex_logo_flat.png assets/vortex_logo.svg public/assets/ || true
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3
