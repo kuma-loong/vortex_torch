@@ -46,6 +46,9 @@ This makes Vortex a platform for **autonomous algorithm discovery**: AI agents g
 - **High Performance**  
   Built to work with FlashInfer & CUDA Graph & Radix Attention for efficient LLM inference.
 
+- **Agent Native**  
+  Designed for autonomous algorithm discovery — AI agents generate, benchmark, and refine sparse attention end-to-end, with a Claude Code workspace and OpenHands demo built in.
+
 ---
 
 ## 🚀 Installation
