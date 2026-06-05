@@ -305,6 +305,141 @@ Prefer the explicit `VortexConfig(...)` object above. The legacy flat form
 
 ---
 
+## 🧬 MLA Models (DeepSeek-V3 / GLM-4.7 / Kimi-style)
+
+Models with **Multi-head Latent Attention** (DeepSeek-V2/V3, GLM-4.7-Flash,
+Kimi, …) compress the KV cache into a single shared low-rank *latent*
+instead of per-head K/V. Vortex supports them with a parallel base class,
+**`vFlowMLA`**. The shape of a flow is the same — `create_cache` /
+`forward_cache` / `forward_indexer` — but with MLA conventions:
+
+- The cache exposes **one auto-provided field, `cache["latent"]`**
+  (the fused `[ kv_c | k_pe ]`, inner dim `kv_lora_rank + qk_rope_head_dim`)
+  — there is no `"k"` / `"v"`.
+- `create_cache(block_size, kv_lora_rank, qk_rope_head_dim)` declares only
+  your aux tensors (e.g. centroids).
+- `forward_indexer` receives the **fused absorbed query**
+  `q = [ q_nope_out | q_pe ]`. Because both query and latent are the
+  concatenations, a *single* dot `⟨q, centroid⟩` already equals the full
+  decode logit `⟨q_nope, kv_c⟩ + ⟨q_pe, k_pe⟩` — RoPE included.
+
+```python
+from typing import Dict
+import torch
+
+from vortex_torch.flow import vFlowMLA, register
+from vortex_torch.indexer import GeMM, Mean, topK
+from vortex_torch.cache import Mean as CMean
+from vortex_torch.abs import ContextBase
+
+
+@register("rope_aware_block_sparse_mla")
+class RopeAwareBlockSparseMLA(vFlowMLA):
+
+    def __init__(self):
+        super().__init__()
+        self.mean = Mean(dim=1)        # average the fused query over its H heads
+        self.gemm = GeMM()             # GeMM(x, y) = y @ xᵀ → per-page score
+        self.output_func = topK()      # terminal: write selected page ids to o
+        self.reduction = CMean(dim=1)  # centroid = mean of the fused latent per page
+
+    def forward_indexer(
+        self,
+        q: torch.Tensor,                 # [B, H, latent_dim]  ([q_nope_out | q_pe])
+        o: torch.Tensor,
+        cache: Dict[str, torch.Tensor],
+        ctx: ContextBase,
+    ):
+        q_mean = self.mean(q, ctx=ctx)                          # [B, 1, latent_dim]
+        score = self.gemm(q_mean, cache["centroids"], ctx=ctx)  # [S, 1, 1] — FULL logit
+        self.output_func(score, o, ctx=ctx)
+
+    def forward_cache(
+        self,
+        cache: Dict[str, torch.Tensor],  # cache["latent"] auto-provided: [B, 1, latent_dim]
+        loc: torch.Tensor,
+        ctx: ContextBase,
+    ):
+        self.reduction(cache["latent"], cache["centroids"], loc=loc, ctx=ctx)
+
+    def create_cache(self, block_size: int, kv_lora_rank: int, qk_rope_head_dim: int):
+        # "latent" is auto-provided — declare only the aux centroid (full width).
+        return {
+            "centroids": (1, kv_lora_rank + qk_rope_head_dim),
+        }
+```
+
+Launching is the same `VortexConfig` flow, with the **MLA decode backend**
+selected on the engine (`attention_backend="trtllm_mla"`) and the
+tensor-core indexer enabled:
+
+```python
+import sglang as sgl
+import vortex_torch  # noqa: F401
+from vortex_torch.engine.sgl.config import VortexConfig
+
+llm = sgl.Engine(
+    model_path="zai-org/GLM-4.7-Flash",   # any MLA model (DeepSeek-V3, Kimi, …)
+    trust_remote_code=True,
+    page_size=32,
+    attention_backend="trtllm_mla",       # vortex CUDA MLA decode kernel
+    kv_cache_dtype="auto",
+    mem_fraction_static=0.9,
+    vortex=VortexConfig(
+        module_name="rope_aware_block_sparse_mla",
+        attention_backend="trtllm",       # 2D block-table indexer
+        impl_backend="triton",
+        use_tensor_core=True,             # tensor-core indexer GeMM
+        block_size=32,
+        topk_val=61,
+        block_reserved_bos=1,
+        block_reserved_eos=2,
+        max_seq_lens=8192,
+    ),
+)
+```
+
+A runnable, single-GPU MLA demo (RULER scoring, dense-vs-sparse) lives in
+[`examples/run_ruler_mla.py`](examples/run_ruler_mla.py).
+
+---
+
+## 🌐 Server Mode (OpenAI-compatible endpoint)
+
+To serve vortex sparse attention over HTTP instead of driving the engine
+in-process, use [`examples/server_launch.sh`](examples/server_launch.sh).
+It boots an sglang server with an **OpenAI-compatible API** on
+`127.0.0.1:30000`:
+
+```bash
+# ./server_launch.sh <MODEL_NAME> <TP_SIZE>
+examples/server_launch.sh Qwen/Qwen3-4B 1
+```
+
+Two details make server mode work:
+
+1. **`import vortex_torch` must run first.** The script doesn't call
+   `python -m sglang.launch_server` directly — that builds `ServerArgs` in
+   the parent before vortex is imported, so the adapter that folds the
+   config wouldn't be installed yet. Instead it imports `vortex_torch`,
+   then calls sglang's `run_server`, so the `ServerArgs` ↔ `VortexConfig`
+   adapter is in place before the args are pickled to the scheduler worker.
+2. **Knobs are passed as JSON via `--vortex-config`.** The per-knob
+   `--vortex-*` CLI flags no longer exist; the script writes the
+   `VortexConfig` fields (prefix stripped) to a temp JSON file and feeds it
+   through `--vortex-config '<json>'`. Providing a non-null config
+   implicitly enables sparsity. Edit the JSON block in the script to retune.
+
+Once up, query it like any OpenAI endpoint:
+
+```bash
+curl http://127.0.0.1:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "Qwen/Qwen3-4B", "messages": [{"role": "user", "content": "Hello!"}]}'
+```
+
+---
+
 
 ## 📘 API Reference
 
