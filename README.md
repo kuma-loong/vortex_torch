@@ -63,7 +63,7 @@ Our demo shows how to use SOTA agents OpenHands (https://openhands.dev/) to gene
 
 ```bash
 export LLM_API_KEY=YOUR_API_KEY
-python openhands_gen.py
+python AI/openhands_gen.py
 
 ```
 
