@@ -244,14 +244,59 @@ ordinary dense attention.
 | `workload_chunk_size` | Planner granularity — how many blocks are grouped into one indexer workload. Positive power of 2; a throughput-tuning knob. | `32` |
 | `dtype` | dtype for **intermediate** indexer tensors. `"bfloat16"` is the tested default; `"float16"`/`"float32"`/`"fp8_e4m3"`/`"fp8_e5m2"` are accepted. | `"bfloat16"` |
 | `compilation_cache_dir` | Directory for the JIT-compiled kernel cache. `None` → next to the compiler module. | `"/tmp/vortex_cache"` |
-| `schedule_policy` | Decode scheduling policy for the `trtllm` planner. `None` → framework default. | `None` |
+| `schedule_policy` | **A CUDA C++ snippet that computes each sequence's page budget** (see below). `None` → the default budget formula. | `None` |
 | `attention_backend` | Sparse-attention kernel family: `"flashinfer"` (default) or `"trtllm"`. | `"flashinfer"` |
 | `impl_backend` | Indexer op implementation backend: `"triton"` (default) or `"cuda"`. | `"triton"` |
 | `use_tensor_core` | Enable tensor-core (bf16 `tl.dot`) codegen in the triton kernel. Only valid with `impl_backend="triton"`. | `False` |
 
-> **Budget recap:** pages attended per sequence ≈
-> `min(num_pages, max(topk_val + bos + eos, topk_ratio × num_pages))`.
-> `topk_val` dominates on short sequences, `topk_ratio` on long ones.
+### Programmable budget — the `schedule_policy`
+
+`schedule_policy` is the most interesting knob: instead of a fixed
+formula, the per-sequence **page budget is computed by a CUDA C++ snippet
+you provide**. Vortex injects it as the body of a `__device__` function,
+JIT-compiles it into the decode planner (cached by content hash), and runs
+it for every sequence on every backend (flashinfer *and* trtllm/MLA) —
+not just trtllm. When you leave it `None`, vortex uses this default body,
+which is exactly the standard budget formula:
+
+```cpp
+// default schedule_policy — returns the number of pages to attend to.
+const int static_kv_budget  = topk_val + block_reserved_bos + block_reserved_eos;
+const int dynamic_kv_budget = int(cached_block_len * topk_ratio);
+return max(static_kv_budget, dynamic_kv_budget);   // topk_val dominates short seqs, ratio long ones
+```
+
+The snippet must `return` an `int` (the page budget). The variables in
+scope are the live per-sequence values:
+
+| Variable | Meaning |
+| --- | --- |
+| `cached_block_len` | Number of cached KV pages currently in this sequence (its length, in pages). |
+| `topk_val` | The configured static budget. |
+| `topk_ratio` | The configured dynamic ratio. |
+| `block_reserved_bos` / `block_reserved_eos` | Reserved sink / recent pages. |
+
+Because it's real device code, you can express **budget policies the two
+scalar knobs can't** — e.g. a length-adaptive budget that grows slowly
+with context and then caps:
+
+```python
+vortex=VortexConfig(
+    module_name="custom_sparse_attention",
+    topk_val=32,
+    schedule_policy=r"""
+        // base budget + 1 extra page per 64 cached pages, capped at 256
+        const int base  = topk_val + block_reserved_bos + block_reserved_eos;
+        const int extra = cached_block_len / 64;
+        return min(base + extra, 256);
+    """,
+)
+```
+
+Other natural uses: a hard ceiling on long contexts, a step function that
+jumps the budget past a length threshold, or a `sqrt(cached_block_len)`-style
+sublinear schedule. The planner is JIT-compiled once per distinct snippet,
+so there's no per-step overhead.
 
 Prefer the explicit `VortexConfig(...)` object above. The legacy flat form
 — `sgl.Engine(enable_vortex_sparsity=True, vortex_topk_val=30, vortex_module_name=..., ...)`
