@@ -110,6 +110,23 @@ protocol live under [`AI/`](AI/) (start with
 
 ## 🧩 Quick Example: Custom Sparse Attention
 
+A working setup is **two files**:
+
+1. **The flow module** (this section) — a `.py` file that *defines* your
+   sparse-attention algorithm as a `vFlow` subclass and `@register`s it
+   under a name. It contains only vortex ops; it never imports sglang.
+2. **The launch script** ([next section](#-launch-it-with-sglang)) —
+   imports `sglang` + `vortex_torch` and starts the engine pointing at
+   the flow by its registered name.
+
+### 1. Define the flow — `custom_sparse_attention.py`
+
+A `vFlow` declares its cache layout in `create_cache`, refreshes
+per-page state in `forward_cache`, and scores/selects pages every decode
+step in `forward_indexer`. Save the snippet below anywhere on disk (e.g.
+`custom_sparse_attention.py`) — you'll point the engine at it by path +
+registered name.
+
 ```python
 from typing import Dict
 import torch
@@ -163,28 +180,70 @@ class CustomSparseAttention(vFlow):
 
 ---
 
-## 🏃 Using Your Sparse Attention with SGLang
+## 🏃 Launch it with SGLang
+
+The launch script is a **separate file** from the flow. It imports
+sglang and vortex_torch, then starts the engine. Importing `vortex_torch`
+is what wires vortex into sglang's decode loop (it installs the
+`ServerArgs` ↔ `VortexConfig` adapter), so the import is required even
+though you don't call it directly.
 
 ```python
+import sglang as sgl
+import vortex_torch  # noqa: F401 — import for side effect: installs the VortexConfig adapter
+from vortex_torch.engine.sgl.config import VortexConfig
+
 llm = sgl.Engine(
+    # --- standard sglang engine args ---
     model_path="Qwen/Qwen3-0.6B",
-    disable_cuda_graph=False,
-    page_size=16,
-    vortex_topk_val=30,
-    disable_overlap_schedule=True,    # Mandatory
+    page_size=16,                     # KV page size (pages are vortex's unit of sparsity)
     attention_backend="flashinfer",   # Mandatory
-    enable_vortex_sparsity=True,      # Otherwise full attention is used
-    vortex_block_reserved_bos=1,
-    vortex_block_reserved_eos=1,
-    vortex_layers_skip=list(range(1)),  # Full attention for layer 0
-    vortex_module_path="path/to/custom_sparse_attention.py",
-    vortex_module_name="custom_sparse_attention", # the registered name for your algorithm
-    vortex_max_seq_lens=8192,
-    mem_fraction_static=0.85,
+    disable_overlap_schedule=True,    # Mandatory
+    disable_cuda_graph=False,
+    mem_fraction_static=0.85,         # turn down if you hit CUDA OOM
+
+    # --- all vortex knobs live in one object ---
+    # Passing `vortex=` turns sparsity ON (no separate enable flag needed);
+    # omit it and you get plain dense attention.
+    vortex=VortexConfig(
+        module_path="path/to/custom_sparse_attention.py",
+        module_name="custom_sparse_attention",  # the @register name of your vFlow
+        topk_val=30,                  # keep the 30 highest-scoring pages per query
+        layers_skip=[0],              # layer 0 runs full/dense attention
+        block_reserved_bos=1,         # always keep the first page (attention sink)
+        block_reserved_eos=1,         # always keep the last (most recent) page
+        max_seq_lens=8192,
+    ),
 )
 ```
 
-If `vortex_module_path` is not provided, Vortex will automatically search in `vortex_torch.flow.algorithms`.
+### What is `VortexConfig`?
+
+`VortexConfig` is a single dataclass
+([`vortex_torch/engine/sgl/config.py`](vortex_torch/engine/sgl/config.py))
+that holds **every** vortex sparse-attention hyper-parameter in one place,
+instead of ~18 loose `vortex_*` arguments scattered across sglang's
+`ServerArgs`. Its presence on the engine is also the on/off switch: pass a
+`VortexConfig` and sparsity is enabled; leave it out and the model runs
+ordinary dense attention. The most useful fields:
+
+| Field | Meaning |
+| --- | --- |
+| `module_path` | Path to your flow's `.py` file. If omitted, vortex searches `vortex_torch.flow.algorithms`. |
+| `module_name` | The `@register` name of the `vFlow` to load. |
+| `topk_val` | Page budget — how many pages each query keeps. The core accuracy↔throughput knob. |
+| `topk_ratio` | Budget as a fraction of context instead of a fixed count (`0.0` = use `topk_val`). |
+| `layers_skip` | List of layer indices that stay **full/dense** (e.g. early layers that need global context). |
+| `block_reserved_bos` / `block_reserved_eos` | Pages always kept at the start / end (attention sinks + most-recent tokens). |
+| `max_seq_lens` | Maximum sequence length to plan for (`-1` = model default). |
+| `block_size` | Vortex page size (defaults to sglang's `page_size`). |
+| `dtype` | Compute/KV dtype for the indexer (`"bfloat16"` default; `"float8_*"` for cheaper KV). |
+| `attention_backend` / `impl_backend` | `flashinfer` (default) vs `trtllm`; kernel impl backend (`triton`). |
+
+Prefer the explicit `VortexConfig(...)` object above. The legacy flat form
+— `sgl.Engine(enable_vortex_sparsity=True, vortex_topk_val=30, vortex_module_name=..., ...)`
+— still works (the adapter folds those `vortex_*` kwargs into a
+`VortexConfig` for you), but the object is clearer and self-documenting.
 
 ---
 
