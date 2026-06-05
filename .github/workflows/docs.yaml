@@ -39,7 +39,9 @@ jobs:
           cp assets/vortex_mark.png assets/vortex_mark.svg \
              assets/vortex_logo_flat.png assets/vortex_logo.svg \
              assets/fig1_workflow.png assets/fig1_results.png \
-             assets/fig11_iter_c.png assets/fig12_glm_a.png assets/fig16_mm_a.png \
+             assets/fig10_inno_a.png assets/fig10_inno_b.png assets/fig10_inno_c.png \
+             assets/fig11_iter_a.png assets/fig11_iter_b.png assets/fig11_iter_c.png \
+             assets/fig12_glm_a.png assets/fig16_mm_a.png \
              public/assets/ || true
 
       - name: Deploy to GitHub Pages
