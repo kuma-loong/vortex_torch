@@ -490,8 +490,20 @@ curl http://127.0.0.1:30000/v1/chat/completions \
 ---
 
 
-## 📘 API Reference
+## 📚 Citation
 
-👉 https://infini-ai-lab.github.io/vortex_torch/
+If you find Vortex useful in your research, please cite:
+
+```bibtex
+@misc{chen2026vortexefficientprogrammablesparse,
+      title={Vortex: Efficient and Programmable Sparse Attention Serving for AI Agents}, 
+      author={Zhuoming Chen and Xinrui Zhong and Qilong Feng and Ranajoy Sadhukhan and Yang Zhou and Michael Qizhe Shieh and Zhihao Jia and Beidi Chen},
+      year={2026},
+      eprint={2606.06453},
+      archivePrefix={arXiv},
+      primaryClass={cs.AI},
+      url={https://arxiv.org/abs/2606.06453}, 
+}
+```
 
 
