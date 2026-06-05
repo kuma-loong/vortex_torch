@@ -87,6 +87,17 @@ Note: Some operators are not yet fused or fully optimized, which may lead to inc
 
 ## 🧠 Iterate & Innovate with Claude Code
 
+<p align="center">
+  <img src="assets/fig11_iter_a.png" alt="mean@16 per iteration" width="32%" />
+  <img src="assets/fig11_iter_b.png" alt="throughput per iteration" width="32%" />
+  <img src="assets/fig11_iter_c.png" alt="accuracy–throughput frontier colored by iteration" width="32%" />
+</p>
+<p align="center">
+  <em>Long-horizon autonomous optimization on AIME24 (Claude Opus 4.7, Qwen3-1.7B, 23 iterations,
+  92 submissions): <b>(a)</b> mean@16 per iteration, <b>(b)</b> throughput per iteration,
+  <b>(c)</b> the accuracy–throughput frontier of all submissions, colored by iteration order.</em>
+</p>
+
 Vortex ships a [Claude Code](https://claude.com/claude-code) workspace
 (`.claude/`) that turns the framework into an autonomous *algorithm
 scientist*: Claude writes sparse-attention submissions, compiles them,
@@ -121,6 +132,18 @@ protocol live under [`AI/`](AI/) (start with
 ---
 
 ## 🧩 Quick Example: Custom Sparse Attention
+
+<p align="center">
+  <img src="assets/fig16_mm_a.png" alt="mean@16 vs throughput" width="32%" />
+  <img src="assets/fig16_mm_b.png" alt="pass@4 vs throughput" width="32%" />
+  <img src="assets/fig16_mm_c.png" alt="pass@8 vs throughput" width="32%" />
+</p>
+<p align="center">
+  <em>Scaling to a 229B model with tensor parallelism — MiniMax-M2.7 (229B) on AIME26 with
+  32K-token generation on four NVIDIA B200 GPUs (TP=4): <b>(a)</b> mean@16, <b>(b)</b> pass@4,
+  <b>(c)</b> pass@8 versus end-to-end throughput. Block top-k and Quest sweep the number of
+  attended blocks; the star marks the full-attention operating point.</em>
+</p>
 
 A working setup is **two files**:
 
@@ -318,6 +341,18 @@ Prefer the explicit `VortexConfig(...)` object above. The legacy flat form
 ---
 
 ## 🧬 MLA Models (DeepSeek-V3 / GLM-4.7 / Kimi-style)
+
+<p align="center">
+  <img src="assets/fig12_glm_a.png" alt="mean@16 vs throughput" width="32%" />
+  <img src="assets/fig12_glm_b.png" alt="pass@4 vs throughput" width="32%" />
+  <img src="assets/fig12_glm_c.png" alt="pass@8 vs throughput" width="32%" />
+</p>
+<p align="center">
+  <em>Sparse attention on an MLA model — GLM-4.7-Flash on AIME26 with 32K-token generation on a
+  single NVIDIA B200: <b>(a)</b> mean@16, <b>(b)</b> pass@4, <b>(c)</b> pass@8 versus end-to-end
+  throughput. Three MLA flows are expressed in vFlow (rope-aware block-sparse, rope-unaware
+  block-sparse, and Quest), sweeping attended blocks with block sizes 16/32/64.</em>
+</p>
 
 Models with **Multi-head Latent Attention** (DeepSeek-V2/V3, GLM-4.7-Flash,
 Kimi, …) compress the KV cache into a single shared low-rank *latent*
