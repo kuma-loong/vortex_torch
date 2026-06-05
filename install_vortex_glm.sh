@@ -13,9 +13,9 @@
 # sglang (editable, vendored v0.5.9), transformers @ 76732b4 (5.0.0.dev0).
 #
 # Usage:
-#   bash install_vortex_glm.bash            # create the env
-#   FORCE=1 bash install_vortex_glm.bash    # remove an existing env first
-#   ENV_NAME=glm2 bash install_vortex_glm.bash   # build under a different name
+#   bash install_vortex_glm.sh            # create the env
+#   FORCE=1 bash install_vortex_glm.sh    # remove an existing env first
+#   ENV_NAME=glm2 bash install_vortex_glm.sh   # build under a different name
 #
 # Install only needs CPU (all kernels are prebuilt wheels or JIT-compiled at
 # runtime), so it works even while the GPUs are busy.
