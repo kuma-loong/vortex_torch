@@ -7,7 +7,7 @@
 </p>
 
 <h3 align="center">
-Vortex: A Flexible and Efficient Sparse Attention Framework
+Vortex: Programmable Sparse Attention for Agents as Algorithm Designers
 </h3>
 
 <p align="center">
@@ -17,10 +17,11 @@ Vortex: A Flexible and Efficient Sparse Attention Framework
 </p>
 
 
-Vortex is a lightweight, modular framework for building **custom sparse attention algorithms** for LLM inference.  
-It exists to make it easy for researchers and engineers to **prototype**, **extend**, and **deploy** advanced sparsity patterns on modern inference backends such as SGLang—without modifying core model code.
+**Vortex turns sparse-attention algorithm design into something AI agents can do.** Sparse attention is increasingly essential for serving LLMs as generation lengths grow — but deploying and evaluating *new* sparse-attention algorithms at scale has been highly engineering-intensive, slowing both **human researchers** and **AI agents** as they explore the design space.
 
-Vortex allows you to express novel sparse attention concisely while relying on an optimized execution engine.
+Vortex couples a **Python-embedded frontend** over a **page-centric tensor abstraction** — concise enough to express a broad range of sparse-attention algorithms — with an **efficient backend tightly integrated into modern LLM serving stacks** (SGLang). A new algorithm goes from idea to deployed-and-benchmarked in minutes, turning its theoretical efficiency into real-world throughput without touching core model code.
+
+This makes Vortex a platform for **autonomous algorithm discovery**: AI agents generate and refine diverse sparse-attention algorithms with Vortex — the best reaching up to **3.46× higher throughput** than full attention while preserving accuracy. Vortex also extends sparse attention to emerging architectures and very large models that are otherwise hard to experiment with (up to **4.7×** on the MLA-based GLM-4.7-Flash and **1.37×** on the 229B-parameter MiniMax-M2.7), and doubles as a research instrument for understanding **where the routing signal lives** in sparse attention.
 
 <p align="center">
   <img src="assets/fig1_workflow.png" alt="A workflow to study sparse attention algorithms with Vortex" width="40%" />
