@@ -3,8 +3,12 @@ __pycache__/
 *.py[cod]
 *$py.class
 debug/
-debug*
+debug*~
+debug.py
+examples/debug_thinking.py
+third_party/sglang/v0.5.9/sglang/python/sglang/srt/debug_utils/__pycache__
 marks/
+slides/
 third_party/flash-attention
 third_party/flashinfer
 # Vendored sglang — track upstream content despite noise rules above and below.
@@ -19,7 +23,7 @@ third_party/flashinfer
 !third_party/sglang/**/*.jsonl
 !third_party/sglang/**/*.png
 !third_party/sglang/**/*.pdf
-
+bench_mla_opt/
 # C extensions
 *.so
 *.whl
@@ -309,3 +313,5 @@ algorithm_scientist/research/traces
 # Paper result-plotting scratch (matplotlib scripts + raw summary dumps)
 /plot.py
 /new_results/
+# Benchmark/summary output archive (moved summary* dirs live here)
+/result/
