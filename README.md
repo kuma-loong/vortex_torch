@@ -20,10 +20,17 @@ It exists to make it easy for researchers and engineers to **prototype**, **exte
 
 Vortex allows you to express novel sparse attention concisely while relying on an optimized execution engine.
 
-<figure>
-  <img src="assets/demov2.0.gif" alt="Demo — OpenHands generating a sparse attention algorithm" />
-  <figcaption align="center"><em>OpenHands generates a sparse attention algorithm (up to 2.7X speedup in this example).</em></figcaption>
-</figure>
+<p align="center">
+  <img src="assets/fig1_workflow.png" alt="A workflow to study sparse attention algorithms with Vortex" width="40%" />
+  &nbsp;&nbsp;
+  <img src="assets/fig1_results.png" alt="Agent-generated sparse attention on Qwen3-1.7B / AIME" width="52%" />
+</p>
+<p align="center">
+  <em><b>(a)</b> A workflow to study sparse attention algorithms using Vortex. &nbsp;
+  <b>(b)</b> Agent-generated sparse attention (Qwen3-1.7B, AIME, NVIDIA H200): each point is one
+  algorithm generated or optimized by AI agents with Vortex — the best reaches up to
+  3.46× the throughput of full attention while preserving accuracy.</em>
+</p>
 
 
 ---
@@ -60,6 +67,11 @@ pip install -e .
 Vortex is designed not only for hand-crafted sparsity patterns but also for AI-generated sparse attention.
 
 Our demo shows how to use SOTA agents OpenHands (https://openhands.dev/) to generate sparse attention algorithms.
+
+<figure>
+  <img src="assets/demov2.0.gif" alt="Demo — OpenHands generating a sparse attention algorithm" />
+  <figcaption align="center"><em>OpenHands generates a sparse attention algorithm (up to 2.7X speedup in this example).</em></figcaption>
+</figure>
 
 ```bash
 export LLM_API_KEY=YOUR_API_KEY
