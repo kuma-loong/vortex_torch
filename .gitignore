@@ -284,6 +284,7 @@ Cargo.lock
 
 # Claude Code per-machine permissions (do not commit)
 .claude/settings.local.json
+.claude/scheduled_tasks.lock
 *.jsonl
 !examples/lcbv5.jsonl
 !examples/aime25.jsonl
