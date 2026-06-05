@@ -234,6 +234,9 @@ work_dirs/
 
 !logo.png
 
+# README/landing assets — track despite the global *.png rule.
+!assets/*.png
+
 # Prerequisites
 *.d
 

@@ -21,10 +21,10 @@ It exists to make it easy for researchers and engineers to **prototype**, **exte
 Vortex allows you to express novel sparse attention concisely while relying on an optimized execution engine.
 
 <figure>
-  <video src="https://github.com/Infini-AI-Lab/vortex_torch/raw/v0.6/assets/demov2.0.mp4" controls muted autoplay loop playsinline>
-    <a href="assets/demov2.0.mp4">▶️ Watch the demo</a>
-  </video>
-  <figcaption align="center"><em>OpenHands generate a sparse attention algorithm (up to 2.7X speedup in this example).</em></figcaption>
+  <a href="https://github.com/Infini-AI-Lab/vortex_torch/raw/v0.6/assets/demov2.0.mp4">
+    <img src="assets/demo_poster.png" alt="Watch the demo — OpenHands generating a sparse attention algorithm" />
+  </a>
+  <figcaption align="center"><em>▶️ Click to play — OpenHands generates a sparse attention algorithm (up to 2.7X speedup in this example).</em></figcaption>
 </figure>
 
 
