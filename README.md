@@ -73,6 +73,41 @@ Note: Some operators are not yet fused or fully optimized, which may lead to inc
 
 ---
 
+## 🧠 Iterate & Innovate with Claude Code
+
+Vortex ships a [Claude Code](https://claude.com/claude-code) workspace
+(`.claude/`) that turns the framework into an autonomous *algorithm
+scientist*: Claude writes sparse-attention submissions, compiles them,
+benchmarks them on AIME24, and pushes the accuracy/throughput Pareto
+frontier outward — one batch at a time. Start a session from the repo
+root and drive it with slash commands:
+
+| Command | What it does |
+| --- | --- |
+| `/new-submission <name>` | Scaffold a new submission pair (`.py` + `.json`). |
+| `/preflight <name>` | Cheap CPU-only config check before spending GPU time. |
+| `/innovate <N> [theme]` | **Innovate** — draft `N` *genuinely novel* algorithms in one shot. All must compile; no benchmark loop. Great for brainstorming ideas the literature doesn't cover. |
+| `/iterate [--max-iterations <N>]` | **Iterate** — the long-horizon loop: design 4 orthogonal variants → pre-flight → RULER quality gate → benchmark on AIME24 → analyse → repeat. Autonomously maps the Pareto frontier. |
+| `/batch-benchmark <n1> <n2> <n3> <n4>` | Launch a 4-variant batch on the currently-free GPUs. |
+| `/review <name>` | Audit a submission against the contract without editing it. |
+
+**Innovate** (explore) and **iterate** (exploit) are complementary:
+`/innovate` generates fresh, compile-checked ideas with no GPU cost,
+while `/iterate` benchmarks four variants per batch and folds the
+results back into `algorithm_scientist/memory.md` so later sessions
+resume from the running best. The full contract, knobs, and benchmark
+protocol live under [`AI/`](AI/) (start with
+[`AI/AGENTS.md`](AI/AGENTS.md)) and
+[`papers/guide.md`](papers/guide.md).
+
+```bash
+# from a Claude Code session opened at the repo root
+/innovate 4 channel-sparsity      # draft 4 novel ideas to explore
+/iterate --max-iterations 3       # run 3 autonomous benchmark batches
+```
+
+---
+
 ## 🧩 Quick Example: Custom Sparse Attention
 
 ```python
