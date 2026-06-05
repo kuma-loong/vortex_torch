@@ -225,20 +225,33 @@ that holds **every** vortex sparse-attention hyper-parameter in one place,
 instead of ~18 loose `vortex_*` arguments scattered across sglang's
 `ServerArgs`. Its presence on the engine is also the on/off switch: pass a
 `VortexConfig` and sparsity is enabled; leave it out and the model runs
-ordinary dense attention. The most useful fields:
+ordinary dense attention.
 
-| Field | Meaning |
-| --- | --- |
-| `module_path` | Path to your flow's `.py` file. If omitted, vortex searches `vortex_torch.flow.algorithms`. |
-| `module_name` | The `@register` name of the `vFlow` to load. |
-| `topk_val` | Page budget — how many pages each query keeps. The core accuracy↔throughput knob. |
-| `topk_ratio` | Budget as a fraction of context instead of a fixed count (`0.0` = use `topk_val`). |
-| `layers_skip` | List of layer indices that stay **full/dense** (e.g. early layers that need global context). |
-| `block_reserved_bos` / `block_reserved_eos` | Pages always kept at the start / end (attention sinks + most-recent tokens). |
-| `max_seq_lens` | Maximum sequence length to plan for (`-1` = model default). |
-| `block_size` | Vortex page size (defaults to sglang's `page_size`). |
-| `dtype` | Compute/KV dtype for the indexer (`"bfloat16"` default; `"float8_*"` for cheaper KV). |
-| `attention_backend` / `impl_backend` | `flashinfer` (default) vs `trtllm`; kernel impl backend (`triton`). |
+**Every field, with what it controls and an example value:**
+
+| Field | Explanation | Example |
+| --- | --- | --- |
+| `module_path` | Path to the `.py` file holding your flow. `None` → vortex searches `vortex_torch.flow.algorithms`. | `"submissions/custom.py"` |
+| `module_name` | The `@register(...)` name of the `vFlow` to load. Must match exactly. | `"custom_sparse_attention"` |
+| `topk_val` | **Static page budget** — the fixed minimum number of pages each sequence keeps, regardless of length. The core accuracy↔throughput knob. | `30` |
+| `topk_ratio` | **Dynamic page budget** — a fraction of the sequence's pages; the engine keeps `max(static floor, topk_ratio × num_pages)`. `0.0` disables it (use `topk_val` only). | `0.0625` |
+| `max_topk_val` | Upper bound on the selected-page count, used to size/pick the top-k kernel variant. `None` → derived from `max_seq_lens`. | `256` |
+| `layers_skip` | Layer indices that **bypass sparse attention and run dense** (e.g. early layers that need global context). `None` → all layers sparse. | `[0, 4, 8, 12]` |
+| `block_reserved_bos` | Pages at the **start** of the sequence that are always selected (attention sink). Int ≥ 1. | `1` |
+| `block_reserved_eos` | Pages at the **end** (most-recent tokens) that are always selected. Int ≥ 1. | `1` |
+| `max_seq_lens` | Maximum sequence length to plan buffers for. `-1` → use the model default. | `8192` |
+| `block_size` | Vortex **page size** (the unit of sparsity). Positive power of 2; smaller = finer granularity, larger = less cache-summary overhead. Defaults to sglang's `page_size`. | `16` |
+| `workload_chunk_size` | Planner granularity — how many blocks are grouped into one indexer workload. Positive power of 2; a throughput-tuning knob. | `32` |
+| `dtype` | dtype for **intermediate** indexer tensors. `"bfloat16"` is the tested default; `"float16"`/`"float32"`/`"fp8_e4m3"`/`"fp8_e5m2"` are accepted. | `"bfloat16"` |
+| `compilation_cache_dir` | Directory for the JIT-compiled kernel cache. `None` → next to the compiler module. | `"/tmp/vortex_cache"` |
+| `schedule_policy` | Decode scheduling policy for the `trtllm` planner. `None` → framework default. | `None` |
+| `attention_backend` | Sparse-attention kernel family: `"flashinfer"` (default) or `"trtllm"`. | `"flashinfer"` |
+| `impl_backend` | Indexer op implementation backend: `"triton"` (default) or `"cuda"`. | `"triton"` |
+| `use_tensor_core` | Enable tensor-core (bf16 `tl.dot`) codegen in the triton kernel. Only valid with `impl_backend="triton"`. | `False` |
+
+> **Budget recap:** pages attended per sequence ≈
+> `min(num_pages, max(topk_val + bos + eos, topk_ratio × num_pages))`.
+> `topk_val` dominates on short sequences, `topk_ratio` on long ones.
 
 Prefer the explicit `VortexConfig(...)` object above. The legacy flat form
 — `sgl.Engine(enable_vortex_sparsity=True, vortex_topk_val=30, vortex_module_name=..., ...)`
