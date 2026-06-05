@@ -55,7 +55,7 @@ pip install -e .
 
 ---
 
-## 🤖 AI-Generated Sparse Attention
+## 🤖 Innovate Sparse Attention with OpenHands
 
 Vortex is designed not only for hand-crafted sparsity patterns but also for AI-generated sparse attention.
 
