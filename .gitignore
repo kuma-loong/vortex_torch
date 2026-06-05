@@ -236,6 +236,8 @@ work_dirs/
 
 # README/landing assets — track despite the global *.png rule.
 !assets/*.png
+# Sphinx docs static assets (logo/favicon) — track despite the global *.png rule.
+!docs/_static/*.png
 
 # Prerequisites
 *.d

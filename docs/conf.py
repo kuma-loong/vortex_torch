@@ -79,6 +79,12 @@ language = "en"
 html_theme = "furo"
 html_title = f"{project} Documentation"
 html_static_path = ["_static"]
+html_favicon = "_static/vortex_mark.png"
+# Vortex mark in the sidebar (same image for light & dark furo modes).
+html_theme_options = {
+    "light_logo": "vortex_mark.png",
+    "dark_logo": "vortex_mark.png",
+}
 
 # -- Intersphinx -------------------------------------------------------------
 intersphinx_mapping = {
