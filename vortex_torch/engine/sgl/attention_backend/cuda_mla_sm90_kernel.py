@@ -30,10 +30,19 @@ _SM_COUNT: dict = {}
 _SPLITS_ENV = os.environ.get("VORTEX_CUDA_MLA_SPLITS")
 
 
-def _positive_env(name: str, default: int) -> int:
-    value = int(os.environ.get(name, default))
+def _geometry_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    if raw.lower() == "auto":
+        # Reproduce the arch-only copy: the C++ geometry derives this value from
+        # the H100 properties / sparse budget when Python passes a non-positive
+        # sentinel.  Keeping this selectable avoids editing or checking out the
+        # tuned source when the formal matrix switches between stages.
+        return -1
+    value = int(raw)
     if value <= 0:
-        raise ValueError(f"{name} must be positive, got {value}.")
+        raise ValueError(f"{name} must be positive or 'auto', got {raw!r}.")
     return value
 
 
@@ -41,9 +50,9 @@ def _positive_env(name: str, default: int) -> int:
 # original SM100 backend and sources remain untouched. Environment overrides
 # keep the arch-only geometry reproducible and allow follow-up tuning without a
 # source edit.
-SM90_MAX_SPLIT_CAP = _positive_env("VORTEX_CUDA_MLA_SM90_MAX_SPLIT_CAP", 32)
-SM90_CHUNK_MIN = _positive_env("VORTEX_CUDA_MLA_SM90_CHUNK_MIN", 16)
-SM90_MINB = _positive_env("VORTEX_CUDA_MLA_SM90_MINB", 3)
+SM90_MAX_SPLIT_CAP = _geometry_env("VORTEX_CUDA_MLA_SM90_MAX_SPLIT_CAP", 32)
+SM90_CHUNK_MIN = _geometry_env("VORTEX_CUDA_MLA_SM90_CHUNK_MIN", 16)
+SM90_MINB = _geometry_env("VORTEX_CUDA_MLA_SM90_MINB", 3)
 
 
 def get_cuda_mla_module():
