@@ -10,7 +10,8 @@ What this module owns
 ---------------------
 1. :func:`integrate` — registers vortex's attention backends into sglang's
    **public** ``ATTENTION_BACKENDS`` dict (wraps ``flashinfer`` / ``trtllm_mla``
-   / ``triton`` with flag-aware shims, and adds ``cuda_mla``). Zero edits to
+   / ``triton`` with flag-aware shims, and adds ``cuda_mla`` / ``cuda_mla_sm90``).
+   Zero edits to
    ``attention_registry.py``. Called automatically from ``vortex_torch/__init__``
    so merely ``import vortex_torch`` wires sglang — and because sglang spawns its
    scheduler worker (``mp.set_start_method("spawn")``), the in-worker
@@ -93,6 +94,19 @@ def _create_cuda_mla_backend(runner):
     return VortexCudaMLABackend(runner)
 
 
+def _create_cuda_mla_sm90_backend(runner):
+    # Independent SM90 copy; never redirects or mutates the existing SM100 path.
+    sa = runner.server_args
+    if not runner.use_mla_backend or not sa.enable_vortex_sparsity:
+        raise ValueError(
+            "cuda_mla_sm90 backend requires an MLA model with "
+            "enable_vortex_sparsity=True."
+        )
+    from .attention_backend import VortexCudaMLASM90Backend
+
+    return VortexCudaMLASM90Backend(runner)
+
+
 def integrate() -> bool:
     """Register vortex attention backends into sglang's public registry.
 
@@ -117,6 +131,7 @@ def integrate() -> bool:
     if "triton" in B:
         B["triton"] = _make_triton_shim(B["triton"])
     B["cuda_mla"] = _create_cuda_mla_backend
+    B["cuda_mla_sm90"] = _create_cuda_mla_sm90_backend
 
     _INTEGRATED = True
     return True

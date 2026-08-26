@@ -134,6 +134,7 @@ ATTENTION_BACKEND_CHOICES = [
     "trtllm_mla",
     "trtllm_mha",
     "cuda_mla",
+    "cuda_mla_sm90",
     "dual_chunk_flash_attn",
     # AMD specific
     "aiter",
