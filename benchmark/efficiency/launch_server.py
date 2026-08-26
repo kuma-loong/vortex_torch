@@ -33,6 +33,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--disable-cuda-graph", action="store_true")
+    parser.add_argument(
+        "--vortex-impl-backend",
+        choices=["triton", "cuda"],
+        default="triton",
+        help="Schedule.W indexer implementation used by Vortex.",
+    )
+    parser.add_argument(
+        "--no-vortex-tensor-core",
+        action="store_true",
+        help="Disable Triton tensor-core indexer codegen (required for CUDA).",
+    )
     return parser.parse_args()
 
 
@@ -54,6 +65,10 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("--mem-fraction-static must be in (0, 1).")
     if not (Path(args.model_path) / "config.json").is_file():
         raise FileNotFoundError(f"Model config not found under {args.model_path}.")
+    if args.vortex_impl_backend == "cuda" and not args.no_vortex_tensor_core:
+        raise ValueError(
+            "--vortex-impl-backend cuda requires --no-vortex-tensor-core."
+        )
 
 
 def main() -> None:
@@ -76,8 +91,8 @@ def main() -> None:
     from sglang.srt.utils import kill_process_tree
 
     vortex_config = {
-        "impl_backend": "triton",
-        "use_tensor_core": True,
+        "impl_backend": args.vortex_impl_backend,
+        "use_tensor_core": not args.no_vortex_tensor_core,
         "attention_backend": "trtllm",
         "layers_skip": [],
         "block_reserved_eos": 2,
