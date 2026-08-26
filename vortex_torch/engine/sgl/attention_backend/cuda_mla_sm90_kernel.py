@@ -30,6 +30,22 @@ _SM_COUNT: dict = {}
 _SPLITS_ENV = os.environ.get("VORTEX_CUDA_MLA_SPLITS")
 
 
+def _positive_env(name: str, default: int) -> int:
+    value = int(os.environ.get(name, default))
+    if value <= 0:
+        raise ValueError(f"{name} must be positive, got {value}.")
+    return value
+
+
+# H100 sweep defaults. These apply only to the independent SM90 backend; the
+# original SM100 backend and sources remain untouched. Environment overrides
+# keep the arch-only geometry reproducible and allow follow-up tuning without a
+# source edit.
+SM90_MAX_SPLIT_CAP = _positive_env("VORTEX_CUDA_MLA_SM90_MAX_SPLIT_CAP", 32)
+SM90_CHUNK_MIN = _positive_env("VORTEX_CUDA_MLA_SM90_CHUNK_MIN", 16)
+SM90_MINB = _positive_env("VORTEX_CUDA_MLA_SM90_MINB", 3)
+
+
 def get_cuda_mla_module():
     """JIT-compile (once, process-cached) and return the CUDA MLA extension."""
     global _MODULE
@@ -63,7 +79,9 @@ CKV = 512
 
 
 def mla_decoder_geometry(bs: int, H: int, block_size: int, max_blocks: int,
-                         max_split_cap: int = -1, chunk_min: int = -1, minb: int = -1):
+                         max_split_cap: int = SM90_MAX_SPLIT_CAP,
+                         chunk_min: int = SM90_CHUNK_MIN,
+                         minb: int = SM90_MINB):
     """Host-only launch geometry for a decode batch size — NO allocation. Returns a
     dict with ``target_ctas`` (run_wq grid / work-queue length) and ``M`` (=ceil(H/16)*16,
     the mid-buffer head-pad). Used to size the shared scratch at the max decode bs."""
@@ -74,8 +92,9 @@ def mla_decoder_geometry(bs: int, H: int, block_size: int, max_blocks: int,
 
 
 def allocate_mla_buffers(max_bs: int, H: int, block_size: int, max_blocks: int,
-                         device, max_split_cap: int = -1, chunk_min: int = -1,
-                         minb: int = -1) -> dict:
+                         device, max_split_cap: int = SM90_MAX_SPLIT_CAP,
+                         chunk_min: int = SM90_CHUNK_MIN,
+                         minb: int = SM90_MINB) -> dict:
     """Allocate the work-queue + split-reduction scratch ONCE, sized for the maximum
     decode batch size. ``target_ctas`` grows monotonically with bs, so these buffers
     cover every smaller bs; all per-bs ``MLADecoder``s slice into them. This replaces
@@ -106,7 +125,9 @@ def allocate_mla_buffers(max_bs: int, H: int, block_size: int, max_blocks: int,
 
 
 def make_mla_decoder(bs: int, H: int, block_size: int, max_blocks: int, buffers: dict,
-                     max_split_cap: int = -1, chunk_min: int = -1, minb: int = -1):
+                     max_split_cap: int = SM90_MAX_SPLIT_CAP,
+                     chunk_min: int = SM90_CHUNK_MIN,
+                     minb: int = SM90_MINB):
     """flashinfer-style plan/run decoder. The launch geometry is fixed per (bs), but
     the work-queue / split scratch is NOT allocated here — pass ``buffers`` from
     ``allocate_mla_buffers(max_bs, ...)`` (sized for the max decode bs) and the decoder
