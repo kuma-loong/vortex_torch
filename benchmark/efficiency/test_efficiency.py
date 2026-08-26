@@ -8,6 +8,13 @@ import unittest
 from pathlib import Path
 
 from benchmark.efficiency.compare_runs import compare
+from benchmark.efficiency.formal_report import (
+    CONCURRENCIES,
+    PROMPTS,
+    SCENARIOS,
+    STAGES,
+    aggregate,
+)
 from benchmark.efficiency.workload import (
     build_request_trace,
     derive_trace_seed,
@@ -99,6 +106,126 @@ class CompareRunsTest(unittest.TestCase):
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["cases"][0]["output_token_throughput_tps_speedup"], 2.0)
         self.assertEqual(result["cases"][0]["ttft_ms_p50_speedup"], 2.0)
+
+
+class FormalReportTest(unittest.TestCase):
+    def _write_stage(self, root: Path, stage: str, multiplier: float) -> None:
+        for scenario in SCENARIOS:
+            for prompt in PROMPTS:
+                shard = root / stage / f"{scenario}_p{prompt}"
+                shard.mkdir(parents=True)
+                label = stage.replace("_", "-")
+                manifest = {
+                    "status": "success",
+                    "args": {
+                        "model_path": "/data2/pretrain_models/GLM-4.7-Flash",
+                        "backend_label": label,
+                        "prompt_lens": [prompt],
+                        "output_lens": [128],
+                        "batch_sizes": list(CONCURRENCIES),
+                        "scenario": scenario,
+                        "num_warmups": 1,
+                        "num_iters": 2,
+                        "seed": 42,
+                        "monitor_gpus": "6",
+                    },
+                    "git": {
+                        "commit": "0" * 40,
+                        "branch": "feat/sm90-support",
+                        "dirty": False,
+                    },
+                    "physical_gpus": [
+                        {
+                            "physical_device_index": 6,
+                            "compute_capability": "9.0",
+                            "uuid": "GPU-test",
+                        }
+                    ],
+                }
+                (shard / "run_manifest.json").write_text(json.dumps(manifest))
+                summaries = []
+                requests = []
+                for concurrency in CONCURRENCIES:
+                    summaries.append(
+                        {
+                            "status": "success",
+                            "scenario": "fixed_batch"
+                            if scenario == "fixed"
+                            else "continuous_churn",
+                            "prompt_len": prompt,
+                            "output_len": 128,
+                            "concurrency": concurrency,
+                            "iterations": 2,
+                            **{
+                                metric: multiplier
+                                for metric in (
+                                    "request_throughput_rps",
+                                    "input_token_throughput_tps",
+                                    "output_token_throughput_tps",
+                                    "total_token_throughput_tps",
+                                )
+                            },
+                            **{
+                                metric: 1.0 / multiplier
+                                for metric in (
+                                    "ttft_ms_p50",
+                                    "ttft_ms_p95",
+                                    "ttft_ms_p99",
+                                    "tpot_ms_p50",
+                                    "tpot_ms_p95",
+                                    "tpot_ms_p99",
+                                    "latency_ms_p50",
+                                    "latency_ms_p95",
+                                    "latency_ms_p99",
+                                )
+                            },
+                        }
+                    )
+                    count = concurrency if scenario == "fixed" else concurrency * 4
+                    for iteration in (0, 1):
+                        for request_index in range(count):
+                            requests.append(
+                                {
+                                    "scenario": scenario,
+                                    "nominal_prompt_len": prompt,
+                                    "nominal_output_len": 128,
+                                    "concurrency": concurrency,
+                                    "iteration": iteration,
+                                    "request_index": request_index,
+                                    "prompt_len": prompt - request_index % 7,
+                                    "requested_output_len": 128,
+                                    "generated_tokens": 128,
+                                    "prompt_digest": f"{scenario}-{prompt}-{concurrency}-{iteration}-{request_index}",
+                                    "status": "success",
+                                }
+                            )
+                (shard / "summary.json").write_text(
+                    json.dumps({"status": "success", "summary": summaries})
+                )
+                (shard / "request_samples.jsonl").write_text(
+                    "".join(json.dumps(row) + "\n" for row in requests)
+                )
+
+    def test_full_matrix_and_trace_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for stage, multiplier in zip(STAGES, (1.0, 2.0, 3.0)):
+                self._write_stage(root, stage, multiplier)
+            result = aggregate(root)
+        self.assertTrue(result["trace_match"])
+        self.assertEqual(result["matrix"]["cases_per_stage"], 30)
+        self.assertAlmostEqual(
+            result["aggregates"]["arch_only_vs_triton"][
+                "output_token_throughput_tps_speedup_geomean"
+            ],
+            2.0,
+        )
+        self.assertAlmostEqual(
+            result["aggregates"]["tuned_vs_arch_only"][
+                "output_token_throughput_tps_speedup_geomean"
+            ],
+            1.5,
+        )
 
 
 if __name__ == "__main__":
