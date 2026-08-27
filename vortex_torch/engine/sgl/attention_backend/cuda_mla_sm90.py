@@ -1,29 +1,10 @@
 from __future__ import annotations
 
-"""
-Independent SM90 copy of the Vortex sparse-attention backend for MLA models on
-the **hand-written CUDA** decode kernel.
+"""SM90 Vortex sparse-attention backend for MLA models.
 
-Structurally similar to ``VortexTritonMLABackend`` (``triton_mla.py``) — same
-``get_decode_planner_trtllm`` metadata (2D ``sparse_block_tables`` +
-``sparse_seqlens``), same indexer compile, composes sglang's ``TritonAttnBackend``
-for skipped-layer decode / cuda-graph machinery. Two kernels are replaced with
-hand-tuned / vendor paths:
-
-* **decode** — the block-sparse MLA decode runs the from-scratch CUDA kernel
-  ``cuda_mla_sm90_kernel.decode_blocktable_mla_cuda`` (ldmatrix + bf16-packed
-  register-O + register softmax + split-KV; see ``cuda_mla/REPORT.md``), instead
-  of the Triton ``decode_blocktable_mla``. Geometry-agnostic (NT=16 tiling), so
-  any MLA head count works.
-* **prefill** — the dense extend runs flashinfer's ragged FA3/cutlass kernel via
-  ``mla_prefill.MLAPrefill`` (planned in ``init_forward_metadata``, run per
-  layer), instead of ``TritonAttnBackend``'s ``_fwd_kernel``. On B200 (sm100)
-  that Triton extend was ~30.7 ms vs flashinfer's ~2.2 ms for the identical
-  192/128 MHA prefill — an ~14× kernel speedup that closes a ~4× end-to-end
-  RULER gap, *and* it's a correctness fix: the Triton extend cannot read this
-  backend's 576-wide latent KV pool (a 192-wide kernel against a 576-wide
-  buffer), so the delegated path produced garbage. Chunked prefill (prefix>0) is
-  handled by reconstructing per-head k/v from the latent + ``merge_state``.
+Decode uses the independent hand-written SM90 CUDA kernel. Dense and chunked
+prefill use ``MLAPrefill``; chunked prefill reconstructs per-head K/V from the
+latent cache before merging attention states.
 
 Calling convention: ``cuda_mla_sm90`` is NOT in
 ``FORWARD_ABSORB_CORE_ATTENTION_BACKENDS``, so for **decode** the model fuses the
@@ -32,11 +13,6 @@ absorbed query/key and calls ``forward_decode(q, k, v)`` with
 (`[tokens, 1, 576]`), ``v = kv_c``. For **prefill** a registered dispatch handler
 routes every extend batch to the per-head MHA path (q/k/v `[T,H,192/192/128]`),
 which ``forward_extend`` serves with ``MLAPrefill``.
-
-Calling convention is the same as the Triton MLA backend: ``cuda_mla_sm90`` is NOT in
-``FORWARD_ABSORB_CORE_ATTENTION_BACKENDS``, so the model fuses the absorbed
-query/key and calls ``forward_decode(q, k, v)`` with ``q = [q_nope_out | q_pe]``
-(`[tokens, H, 576]`), ``k = [kv_c | k_pe]`` (`[tokens, 1, 576]`), ``v = kv_c``.
 """
 from typing import TYPE_CHECKING
 

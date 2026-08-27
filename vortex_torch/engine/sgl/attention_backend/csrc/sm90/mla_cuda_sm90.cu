@@ -1,6 +1,4 @@
-// SM90 arch-only copy of the hand-written CUDA block-table MLA decode kernel.
-// Keep algorithm and launch parameters matched to the original until the
-// arch-only benchmark is complete.
+// SM90 copy of the hand-written CUDA block-table MLA decode kernel.
 //
 // Exposes two interfaces over the same kernel (mla_ldm_sm90.cuh: ldmatrix + bf16-packed
 // register-O + register softmax + split-KV):

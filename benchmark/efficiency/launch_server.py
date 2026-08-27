@@ -1,4 +1,4 @@
-"""Launch the matched GLM-4.7-Flash Quest server for SM90 experiments."""
+"""Launch a guarded GLM-4.7-Flash Quest server for efficiency probes."""
 
 from __future__ import annotations
 
@@ -34,23 +34,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--disable-cuda-graph", action="store_true")
-    parser.add_argument(
-        "--vortex-impl-backend",
-        choices=["triton", "cuda"],
-        default="triton",
-        help="Schedule.W indexer implementation used by Vortex.",
-    )
-    parser.add_argument(
-        "--no-vortex-tensor-core",
-        action="store_true",
-        help="Disable Triton tensor-core indexer codegen (required for CUDA).",
-    )
     return parser.parse_args()
 
 
 def _validate(args: argparse.Namespace) -> None:
     if args.physical_gpu not in {4, 5, 6, 7}:
-        raise ValueError("SM90 experiments may only use physical GPUs 4-7.")
+        raise ValueError("SM90 probes may only use physical GPUs 4-7.")
     state = query_gpu_states([args.physical_gpu])[0]
     if not state.idle:
         raise RuntimeError(
@@ -66,10 +55,6 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("--mem-fraction-static must be in (0, 1).")
     if not (Path(args.model_path) / "config.json").is_file():
         raise FileNotFoundError(f"Model config not found under {args.model_path}.")
-    if args.vortex_impl_backend == "cuda" and not args.no_vortex_tensor_core:
-        raise ValueError(
-            "--vortex-impl-backend cuda requires --no-vortex-tensor-core."
-        )
 
 
 def main() -> None:
@@ -94,8 +79,8 @@ def main() -> None:
     from sglang.srt.utils import kill_process_tree
 
     vortex_config = {
-        "impl_backend": args.vortex_impl_backend,
-        "use_tensor_core": not args.no_vortex_tensor_core,
+        "impl_backend": "triton",
+        "use_tensor_core": True,
         "attention_backend": "trtllm",
         "layers_skip": [],
         "block_reserved_eos": 2,

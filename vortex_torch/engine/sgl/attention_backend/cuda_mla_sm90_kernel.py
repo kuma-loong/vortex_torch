@@ -10,10 +10,10 @@ and returns the extension module; ``decode_blocktable_mla_cuda`` is a drop-in fo
 ``triton_mla_kernel.decode_blocktable_mla`` (identical signature) so the backend
 swap is a one-line change.
 
-The kernel (``csrc/mla_ldm.cuh``) is a from-scratch CUDA flash-decode: ldmatrix +
+The kernel (``csrc/sm90/mla_ldm_sm90.cuh``) is a CUDA flash-decode: ldmatrix +
 ``mma.sync.m16n8k16`` GEMMs, bf16-packed register-O, register-resident online
 softmax, a 576->584 smem bank-conflict pad, ``__launch_bounds__`` occupancy
-forcing, and split-KV. See ``cuda_mla/REPORT.md`` for the design + benchmarks.
+forcing, and split-KV.
 """
 import os
 
@@ -30,29 +30,11 @@ _SM_COUNT: dict = {}
 _SPLITS_ENV = os.environ.get("VORTEX_CUDA_MLA_SPLITS")
 
 
-def _geometry_env(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    if raw.lower() == "auto":
-        # Reproduce the arch-only copy: the C++ geometry derives this value from
-        # the H100 properties / sparse budget when Python passes a non-positive
-        # sentinel.  Keeping this selectable avoids editing or checking out the
-        # tuned source when the formal matrix switches between stages.
-        return -1
-    value = int(raw)
-    if value <= 0:
-        raise ValueError(f"{name} must be positive or 'auto', got {raw!r}.")
-    return value
-
-
-# H100 sweep defaults. These apply only to the independent SM90 backend; the
-# original SM100 backend and sources remain untouched. Environment overrides
-# keep the arch-only geometry reproducible and allow follow-up tuning without a
-# source edit.
-SM90_MAX_SPLIT_CAP = _geometry_env("VORTEX_CUDA_MLA_SM90_MAX_SPLIT_CAP", 32)
-SM90_CHUNK_MIN = _geometry_env("VORTEX_CUDA_MLA_SM90_CHUNK_MIN", 16)
-SM90_MINB = _geometry_env("VORTEX_CUDA_MLA_SM90_MINB", 3)
+# Production launch geometry selected by the H100 sweep. These constants apply
+# only to the independent SM90 backend; the original SM100 path is untouched.
+SM90_MAX_SPLIT_CAP = 32
+SM90_CHUNK_MIN = 16
+SM90_MINB = 3
 
 
 def get_cuda_mla_module():
