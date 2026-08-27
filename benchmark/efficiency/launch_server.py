@@ -6,9 +6,9 @@ import argparse
 import json
 import os
 from pathlib import Path
-import sys
 
 from benchmark.efficiency.gpu_guard import query_gpu_states
+from benchmark.efficiency.runtime_env import prepend_interpreter_bin_to_path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -76,19 +76,7 @@ def main() -> None:
     args = parse_args()
     _validate(args)
 
-    # Calling ``.venv/bin/python`` does not activate the virtual environment.
-    # Torch JIT extensions discover the ``ninja`` executable through PATH, so
-    # explicitly inherit the bin directory of the interpreter that owns this
-    # process.  This keeps all compiler helpers inside the requested root .venv
-    # and makes detached/resumed launches behave like interactive ones.
-    # Do not resolve the Python symlink: uv venvs point it at the shared base
-    # interpreter, while companion executables (notably ninja) live beside the
-    # symlink in the project-local .venv/bin directory.
-    interpreter_bin = str(Path(sys.executable).parent)
-    path_entries = os.environ.get("PATH", "").split(os.pathsep)
-    os.environ["PATH"] = os.pathsep.join(
-        [interpreter_bin, *[entry for entry in path_entries if entry != interpreter_bin]]
-    )
+    prepend_interpreter_bin_to_path()
 
     # Pin immediately after the physical-device idle check. Child scheduler
     # processes inherit this single-device view.

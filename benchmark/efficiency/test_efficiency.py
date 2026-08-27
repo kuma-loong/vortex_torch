@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from benchmark.efficiency.compare_runs import compare
 from benchmark.efficiency.formal_report import (
@@ -15,11 +17,20 @@ from benchmark.efficiency.formal_report import (
     STAGES,
     aggregate,
 )
+from benchmark.efficiency.runtime_env import prepend_interpreter_bin_to_path
 from benchmark.efficiency.workload import (
     build_request_trace,
     derive_trace_seed,
     trace_metadata,
 )
+
+
+class RuntimeEnvironmentTest(unittest.TestCase):
+    def test_interpreter_bin_is_prepended_to_path(self) -> None:
+        with mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}):
+            interpreter_bin = prepend_interpreter_bin_to_path()
+            self.assertEqual(os.environ["PATH"].split(os.pathsep)[0], interpreter_bin)
+            self.assertTrue(interpreter_bin.endswith("/.venv/bin"))
 
 
 class WorkloadTest(unittest.TestCase):

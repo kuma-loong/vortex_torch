@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from benchmark.efficiency.gpu_guard import query_gpu_states
+from benchmark.efficiency.runtime_env import prepend_interpreter_bin_to_path
 
 
 KV_DIM = 576
@@ -295,6 +296,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     _validate_gpu(args.physical_gpu)
+    prepend_interpreter_bin_to_path()
     os.environ.setdefault("SGLANG_ENABLE_TORCH_COMPILE", "0")
     import torch
 

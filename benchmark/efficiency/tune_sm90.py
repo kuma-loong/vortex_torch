@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 
 from benchmark.efficiency.gpu_guard import query_gpu_states
+from benchmark.efficiency.runtime_env import prepend_interpreter_bin_to_path
 from benchmark.efficiency.operator_compare import (
     KV_LORA_RANK,
     NUM_HEADS,
@@ -56,6 +57,7 @@ def _validate_gpu(args: argparse.Namespace) -> None:
 def main() -> None:
     args = parse_args()
     _validate_gpu(args)
+    prepend_interpreter_bin_to_path()
     os.environ.setdefault("SGLANG_ENABLE_TORCH_COMPILE", "0")
 
     import torch
