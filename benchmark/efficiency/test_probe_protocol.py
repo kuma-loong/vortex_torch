@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from benchmark.efficiency.bench_probe import (
     _request_count,
@@ -12,6 +13,7 @@ from benchmark.efficiency.bench_probe import (
     _trace,
     _warmup_request_count,
 )
+from benchmark.efficiency.launch_server import parse_args as parse_server_args
 from benchmark.efficiency.sglang_adapter import RequestResult, TraceResult
 
 
@@ -42,6 +44,30 @@ def _request(
 
 
 class ProbeProtocolTest(unittest.TestCase):
+    def test_server_launcher_retains_original_probe_defaults(self) -> None:
+        argv = [
+            "launch_server.py",
+            "--physical-gpu",
+            "7",
+            "--attention-backend",
+            "cuda_mla_sm90",
+        ]
+        with patch("sys.argv", argv):
+            args = parse_server_args()
+
+        self.assertEqual(args.block_size, 32)
+        self.assertEqual(args.topk, 61)
+        self.assertEqual(args.max_topk, 256)
+        self.assertEqual(args.layers_skip, "")
+        self.assertEqual(args.block_reserved_bos, 1)
+        self.assertEqual(args.block_reserved_eos, 2)
+        self.assertEqual(args.context_length, 33792)
+        self.assertEqual(args.mem_fraction_static, 0.90)
+        self.assertEqual(args.max_running_requests, 64)
+        self.assertIsNone(args.chunked_prefill_size)
+        self.assertIsNone(args.max_prefill_tokens)
+        self.assertIsNone(args.cuda_graph_max_bs)
+
     def test_trace_matches_sparse_vllm_fixed_seed(self) -> None:
         args = SimpleNamespace(
             seed=42,

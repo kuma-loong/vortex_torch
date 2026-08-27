@@ -25,13 +25,29 @@ reported as `skipped_by_policy` instead of being estimated.
 
 ## Server
 
-The launcher defaults match the GLM-4.7-Flash Quest baseline:
+The launcher retains the original Vortex probe defaults. Pass every
+workload-specific Quest setting explicitly when running the
+Sparse-vLLM-matched baseline:
 
 ```bash
 PYTHONPATH="$PWD:$PWD/src" \
 .venv/bin/python benchmark/efficiency/launch_server.py \
   --physical-gpu 7 \
-  --attention-backend cuda_mla_sm90
+  --attention-backend cuda_mla_sm90 \
+  --model-path /data2/pretrain_models/GLM-4.7-Flash \
+  --module-name quest_mla \
+  --block-size 16 \
+  --layers-skip 0,1 \
+  --topk 291 \
+  --max-topk 291 \
+  --block-reserved-bos 0 \
+  --block-reserved-eos 1 \
+  --context-length 16640 \
+  --chunked-prefill-size 8192 \
+  --max-prefill-tokens 8192 \
+  --mem-fraction-static 0.85 \
+  --max-running-requests 32 \
+  --cuda-graph-max-bs 32
 ```
 
 The effective sparse budget is 292 pages: top-291 previous pages plus the

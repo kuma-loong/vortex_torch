@@ -28,18 +28,18 @@ def parse_args() -> argparse.Namespace:
         "--model-path", default="/data2/pretrain_models/GLM-4.7-Flash"
     )
     parser.add_argument("--module-name", default="quest_mla")
-    parser.add_argument("--block-size", type=int, default=16)
-    parser.add_argument("--topk", type=int, default=291)
-    parser.add_argument("--max-topk", type=int, default=291)
-    parser.add_argument("--layers-skip", default="0,1")
-    parser.add_argument("--block-reserved-bos", type=int, default=0)
-    parser.add_argument("--block-reserved-eos", type=int, default=1)
-    parser.add_argument("--context-length", type=int, default=16640)
-    parser.add_argument("--chunked-prefill-size", type=int, default=8192)
-    parser.add_argument("--max-prefill-tokens", type=int, default=8192)
-    parser.add_argument("--mem-fraction-static", type=float, default=0.85)
-    parser.add_argument("--max-running-requests", type=int, default=32)
-    parser.add_argument("--cuda-graph-max-bs", type=int, default=32)
+    parser.add_argument("--block-size", type=int, default=32)
+    parser.add_argument("--topk", type=int, default=61)
+    parser.add_argument("--max-topk", type=int, default=256)
+    parser.add_argument("--layers-skip", default="")
+    parser.add_argument("--block-reserved-bos", type=int, default=1)
+    parser.add_argument("--block-reserved-eos", type=int, default=2)
+    parser.add_argument("--context-length", type=int, default=33792)
+    parser.add_argument("--chunked-prefill-size", type=int)
+    parser.add_argument("--max-prefill-tokens", type=int)
+    parser.add_argument("--mem-fraction-static", type=float, default=0.90)
+    parser.add_argument("--max-running-requests", type=int, default=64)
+    parser.add_argument("--cuda-graph-max-bs", type=int)
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--disable-cuda-graph", action="store_true")
@@ -65,14 +65,20 @@ def _validate(args: argparse.Namespace) -> None:
         layer < 0 for layer in args.layers_skip
     ):
         raise ValueError("--layers-skip must contain unique non-negative layer IDs.")
-    positive = (
+    positive = [
         args.topk,
         args.max_topk,
         args.context_length,
-        args.chunked_prefill_size,
-        args.max_prefill_tokens,
         args.max_running_requests,
-        args.cuda_graph_max_bs,
+    ]
+    positive.extend(
+        value
+        for value in (
+            args.chunked_prefill_size,
+            args.max_prefill_tokens,
+            args.cuda_graph_max_bs,
+        )
+        if value is not None
     )
     if any(value <= 0 for value in positive):
         raise ValueError("Top-k, context, prefill, request, and graph limits must be positive.")
@@ -80,7 +86,10 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("--max-topk must be greater than or equal to --topk.")
     if args.block_reserved_bos < 0 or args.block_reserved_eos < 1:
         raise ValueError("Reserved BOS must be non-negative and reserved EOS at least one.")
-    if args.chunked_prefill_size % args.block_size:
+    if (
+        args.chunked_prefill_size is not None
+        and args.chunked_prefill_size % args.block_size
+    ):
         raise ValueError("--chunked-prefill-size must be divisible by --block-size.")
     if not 0.0 < args.mem_fraction_static < 1.0:
         raise ValueError("--mem-fraction-static must be in (0, 1).")
@@ -139,16 +148,10 @@ def main() -> None:
         json.dumps(vortex_config),
         "--context-length",
         str(args.context_length),
-        "--chunked-prefill-size",
-        str(args.chunked_prefill_size),
-        "--max-prefill-tokens",
-        str(args.max_prefill_tokens),
         "--mem-fraction-static",
         str(args.mem_fraction_static),
         "--max-running-requests",
         str(args.max_running_requests),
-        "--cuda-graph-max-bs",
-        str(args.cuda_graph_max_bs),
         "--disable-radix-cache",
         "--trust-remote-code",
         "--tp-size",
@@ -158,6 +161,14 @@ def main() -> None:
         "--host",
         args.host,
     ]
+    optional_limits = (
+        ("--chunked-prefill-size", args.chunked_prefill_size),
+        ("--max-prefill-tokens", args.max_prefill_tokens),
+        ("--cuda-graph-max-bs", args.cuda_graph_max_bs),
+    )
+    for flag, value in optional_limits:
+        if value is not None:
+            server_cli.extend((flag, str(value)))
     if args.disable_cuda_graph:
         server_cli.append("--disable-cuda-graph")
 
