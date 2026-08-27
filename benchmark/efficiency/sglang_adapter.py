@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import statistics
 import time
 from dataclasses import asdict, dataclass
 from typing import Any
@@ -29,9 +30,71 @@ class RequestResult:
     tpot_ms: float | None
     latency_ms: float
     status: str
+    token_at_s: tuple[float, ...]
 
     def metadata(self) -> dict[str, Any]:
-        return asdict(self)
+        result = asdict(self)
+        # Per-token client timestamps are retained only long enough to rebuild
+        # Sparse-vLLM's fixed-batch decode-step metric.  They are deliberately
+        # omitted from artifacts: request-level TTFT/TPOT/latency are the
+        # stable public contract, and serializing every token timestamp makes
+        # long probe artifacts needlessly large.
+        result.pop("token_at_s")
+        return result
+
+
+@dataclass(frozen=True)
+class TraceResult:
+    """One submitted batch, timed at the same boundaries as Sparse-vLLM.
+
+    Every request is submitted at once.  ``batch_ttft_ms`` is therefore the
+    time from immediately before submission until *all* requests have emitted
+    their first token.  This matches Sparse-vLLM's fixed-batch TTFT instead of
+    aggregating per-request HTTP TTFT samples.
+    """
+
+    request_results: tuple[RequestResult, ...]
+    started_at_s: float
+    finished_at_s: float
+
+    @property
+    def elapsed_s(self) -> float:
+        return self.finished_at_s - self.started_at_s
+
+    @property
+    def batch_ttft_ms(self) -> float:
+        return (
+            max(result.first_token_at_s for result in self.request_results)
+            - self.started_at_s
+        ) * 1000.0
+
+    @property
+    def batch_tpot_ms(self) -> float | None:
+        """Mean fixed-batch token-wave interval observed by the client.
+
+        Sparse-vLLM measures the mean duration of synchronous decode steps.
+        An HTTP client cannot read SGLang's internal step timer, so the matched
+        observable is the interval between successive token waves after every
+        request in the fixed batch has reached that token ordinal.
+        """
+
+        token_counts = {len(result.token_at_s) for result in self.request_results}
+        if len(token_counts) != 1:
+            raise ValueError(
+                "Fixed-batch TPOT requires equal generated token counts, got "
+                f"{sorted(token_counts)}."
+            )
+        token_count = token_counts.pop()
+        if token_count <= 1:
+            return None
+        wave_times = [
+            max(result.token_at_s[token_index] for result in self.request_results)
+            for token_index in range(token_count)
+        ]
+        return statistics.fmean(
+            (later - earlier) * 1000.0
+            for earlier, later in zip(wave_times, wave_times[1:])
+        )
 
 
 async def check_server(base_url: str, timeout_s: float = 10.0) -> None:
@@ -59,6 +122,7 @@ async def _run_one(
     started = time.perf_counter()
     first_token_at: float | None = None
     last_token_at: float | None = None
+    token_at: list[float] = []
     generated_tokens = 0
     last_payload: dict[str, Any] | None = None
 
@@ -82,6 +146,7 @@ async def _run_one(
                 if first_token_at is None:
                     first_token_at = now
                 last_token_at = now
+                token_at.extend([now] * (completion_tokens - generated_tokens))
                 generated_tokens = completion_tokens
 
     finished = time.perf_counter()
@@ -113,6 +178,7 @@ async def _run_one(
         tpot_ms=tpot_ms,
         latency_ms=(finished - started) * 1000.0,
         status="success",
+        token_at_s=tuple(token_at),
     )
 
 
@@ -121,19 +187,16 @@ async def run_trace(
     traces: list[RequestTrace],
     *,
     timeout_s: float,
-    max_in_flight: int | None = None,
-) -> tuple[list[RequestResult], float]:
-    """Run a trace and return request metrics plus wall time.
+) -> TraceResult:
+    """Submit the complete trace as one burst and return matched timing data.
 
-    ``max_in_flight`` implements closed-loop churn: each completion is replaced
-    until the trace is exhausted while keeping at most that many client requests
-    active. With ``None``, all requests are submitted together.
+    Sparse-vLLM registers every request in an oversubscribed churn trace before
+    stepping the engine.  Starting every HTTP request here gives every request
+    an arrival timestamp before SGLang's internal queue, so server queueing is
+    included in request TTFT and latency.
     """
     if not traces:
         raise ValueError("run_trace requires at least one request.")
-    if max_in_flight is not None and max_in_flight <= 0:
-        raise ValueError(f"max_in_flight must be positive, got {max_in_flight}.")
-    worker_count = min(len(traces), max_in_flight or len(traces))
     limits = httpx.Limits(
         max_connections=max(16, len(traces)),
         max_keepalive_connections=max(16, len(traces)),
@@ -141,23 +204,18 @@ async def run_trace(
     timeout = httpx.Timeout(timeout_s, connect=min(timeout_s, 30.0))
     generate_url = f"{base_url.rstrip('/')}/generate"
     async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
-        queue: asyncio.Queue[RequestTrace] = asyncio.Queue()
-        for trace in traces:
-            queue.put_nowait(trace)
-        results: list[RequestResult] = []
-
-        async def worker() -> None:
-            while True:
-                try:
-                    trace = queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    return
-                try:
-                    results.append(await _run_one(client, generate_url, trace))
-                finally:
-                    queue.task_done()
-
         started = time.perf_counter()
-        await asyncio.gather(*(worker() for _ in range(worker_count)))
-        elapsed_s = time.perf_counter() - started
-    return sorted(results, key=lambda result: result.request_index), elapsed_s
+        results = await asyncio.gather(
+            *(_run_one(client, generate_url, trace) for trace in traces)
+        )
+        finished = time.perf_counter()
+    ordered = tuple(sorted(results, key=lambda result: result.request_index))
+    if len(ordered) != len(traces):
+        raise RuntimeError(
+            f"SGLang returned {len(ordered)} results for {len(traces)} requests."
+        )
+    return TraceResult(
+        request_results=ordered,
+        started_at_s=started,
+        finished_at_s=finished,
+    )

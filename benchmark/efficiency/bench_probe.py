@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Matched fixed-batch and churn efficiency probe for a Vortex SGLang server.
 
-The manifest, trace, hardware monitoring, and artifact contracts are adapted
-from Sparse-vLLM commit 6f7b8474c1c5ad4d3eaebe62c51e537a527917a8.
+The metric protocol is matched to Sparse-vLLM's current efficiency probe; the
+trace generator retains the original migrated workload contract.
 """
 
 from __future__ import annotations
@@ -37,7 +37,8 @@ from benchmark.efficiency.workload import (
 
 SOURCE_PROVENANCE = {
     "repository": "Sparse-vLLM",
-    "commit": "6f7b8474c1c5ad4d3eaebe62c51e537a527917a8",
+    "probe_commit": "f09ef4cb796ea69d59d970894429c8c185269bfa",
+    "workload_commit": "eb00c1d313b1dc7856cb838a994174f7b1624d55",
 }
 
 
@@ -135,6 +136,30 @@ def _vocab_size(model_path: str) -> int:
     return vocab_size
 
 
+def _scenario_label(scenario: str) -> str:
+    return {
+        "fixed": "fixed_batch",
+        "churn": "oversubscribed_churn",
+    }[scenario]
+
+
+def _request_count(scenario: str, concurrency: int, churn_multiplier: int) -> int:
+    return concurrency if scenario == "fixed" else concurrency * churn_multiplier
+
+
+def _warmup_request_count(
+    scenario: str,
+    concurrency: int,
+    churn_multiplier: int,
+) -> int:
+    measured_count = _request_count(scenario, concurrency, churn_multiplier)
+    return (
+        concurrency
+        if scenario == "fixed"
+        else min(measured_count, max(concurrency, 2 * concurrency))
+    )
+
+
 def _trace(
     args: argparse.Namespace,
     *,
@@ -146,9 +171,10 @@ def _trace(
     iteration: int,
     request_count: int,
 ):
+    scenario_label = _scenario_label(scenario)
     seed = derive_trace_seed(
         args.seed,
-        scenario=scenario,
+        scenario=scenario_label,
         phase=phase,
         nominal_prompt_len=prompt_len,
         nominal_output_len=output_len,
@@ -163,7 +189,7 @@ def _trace(
         vocab_size=args.vocab_size,
         prompt_jitter_fraction=args.prompt_length_jitter,
         output_jitter_fraction=args.output_length_jitter,
-        vary_output_lengths=scenario == "churn",
+        vary_output_lengths=scenario_label == "oversubscribed_churn",
     )
 
 
@@ -173,7 +199,9 @@ def _hardware_metrics(summary: dict[str, Any]) -> dict[str, Any]:
     aggregate = summary["aggregate"]
     gpus = summary["gpus"]
     return {
-        "hardware_sample_count": int(summary["total_samples"]),
+        "metric_source": "nvidia-smi sampled activity",
+        "sample_count": int(summary["total_samples"]),
+        "sampling_interval_ms": int(summary["sampling_interval_ms"]),
         "gpu_compute_activity_pct_mean": float(aggregate["mean_compute_util_pct"]),
         "gpu_memory_io_activity_pct_mean": float(
             aggregate["mean_memory_io_activity_pct"]
@@ -197,22 +225,21 @@ def _summarize_case(
     iteration_records: list[dict[str, Any]],
     hardware: dict[str, Any],
 ) -> dict[str, Any]:
-    requests = [
-        request
-        for record in iteration_records
-        for request in record["request_results"]
-    ]
-    ttft = [float(request["ttft_ms"]) for request in requests]
-    tpot = [float(request["tpot_ms"]) for request in requests if request["tpot_ms"] is not None]
-    latency = [float(request["latency_ms"]) for request in requests]
     traces = [record["trace"] for record in iteration_records]
     prompt_lengths = [length for trace in traces for length in trace["prompt_lengths"]]
     output_lengths = [length for trace in traces for length in trace["output_lengths"]]
 
-    row = {
-        "engine": "sglang-vortex",
+    row: dict[str, Any] = {
+        "engine": "vortex",
+        "sparse_method": args.sparse_method,
         "backend_label": args.backend_label,
-        "scenario": "fixed_batch" if scenario == "fixed" else "continuous_churn",
+        "protocol_label": args.backend_label,
+        "protocol": {
+            "trace_generator_version": TRACE_GENERATOR_VERSION,
+            "request_arrival": "single_burst",
+            "prefix_caching_enabled": False,
+        },
+        "scenario": "fixed_batch" if scenario == "fixed" else "oversubscribed_churn",
         "prompt_len": prompt_len,
         "output_len": output_len,
         "prompt_len_min": min(prompt_lengths),
@@ -220,8 +247,7 @@ def _summarize_case(
         "output_len_min": min(output_lengths),
         "output_len_max": max(output_lengths),
         "concurrency": concurrency,
-        "request_count": len(requests) // len(iteration_records),
-        "iterations": len(iteration_records),
+        "request_count": int(iteration_records[0]["request_count"]),
         "request_throughput_rps": statistics.fmean(
             record["request_throughput_rps"] for record in iteration_records
         ),
@@ -234,19 +260,52 @@ def _summarize_case(
         "total_token_throughput_tps": statistics.fmean(
             record["total_token_throughput_tps"] for record in iteration_records
         ),
-        "ttft_ms_p50": _percentile(ttft, 0.50),
-        "ttft_ms_p95": _percentile(ttft, 0.95),
-        "ttft_ms_p99": _percentile(ttft, 0.99),
-        "tpot_ms_p50": _percentile(tpot, 0.50),
-        "tpot_ms_p95": _percentile(tpot, 0.95),
-        "tpot_ms_p99": _percentile(tpot, 0.99),
-        "latency_ms_p50": _percentile(latency, 0.50),
-        "latency_ms_p95": _percentile(latency, 0.95),
-        "latency_ms_p99": _percentile(latency, 0.99),
         "status": "success",
+        "actual_hardware_metrics": hardware,
         **{key: value for key, value in hardware.items() if key != "per_gpu"},
-        "per_gpu": hardware["per_gpu"],
     }
+    if scenario == "fixed":
+        ttfts = [float(record["ttft_ms"]) for record in iteration_records]
+        tpots = [
+            float(record["tpot_ms"])
+            for record in iteration_records
+            if record["tpot_ms"] is not None
+        ]
+        row.update(
+            {
+                "sequence_replacements": 0,
+                "ttft_ms_mean": round(statistics.fmean(ttfts), 2),
+                "ttft_ms_p50": round(_percentile(ttfts, 0.50), 2),
+                "ttft_ms_p99": round(_percentile(ttfts, 0.99), 2),
+                "tpot_ms_mean": round(statistics.fmean(tpots), 2) if tpots else None,
+                "decode_metric_status": "success" if tpots else "skipped_by_policy",
+            }
+        )
+    else:
+        requests = [
+            request
+            for record in iteration_records
+            for request in record["request_results"]
+        ]
+        ttfts = [float(request["ttft_ms"]) for request in requests]
+        latencies = [float(request["latency_ms"]) for request in requests]
+        tpots = [
+            float(request["tpot_ms"])
+            for request in requests
+            if request["tpot_ms"] is not None
+        ]
+        request_count = int(iteration_records[0]["request_count"])
+        row.update(
+            {
+                "sequence_replacements": request_count - concurrency,
+                "ttft_ms_mean": statistics.fmean(ttfts),
+                "ttft_ms_p50": _percentile(ttfts, 0.50),
+                "ttft_ms_p99": _percentile(ttfts, 0.99),
+                "latency_ms_p50": _percentile(latencies, 0.50),
+                "latency_ms_p99": _percentile(latencies, 0.99),
+                "tpot_ms_mean": statistics.fmean(tpots) if tpots else None,
+            }
+        )
     return row
 
 
@@ -258,8 +317,18 @@ async def _run_case(
     output_len: int,
     concurrency: int,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    request_count = concurrency if scenario == "fixed" else concurrency * args.churn_request_multiplier
+    request_count = _request_count(
+        scenario, concurrency, args.churn_request_multiplier
+    )
     for warmup_index in range(args.num_warmups):
+        warmup_count = _warmup_request_count(
+            scenario, concurrency, args.churn_request_multiplier
+        )
+        print(
+            f"  [Warmup {warmup_index + 1}/{args.num_warmups}] "
+            f"requests={warmup_count}",
+            flush=True,
+        )
         warmup_trace = _trace(
             args,
             scenario=scenario,
@@ -268,13 +337,12 @@ async def _run_case(
             output_len=output_len,
             concurrency=concurrency,
             iteration=warmup_index,
-            request_count=request_count,
+            request_count=warmup_count,
         )
         await run_trace(
             args.server_url,
             warmup_trace,
             timeout_s=args.request_timeout_s,
-            max_in_flight=concurrency if scenario == "churn" else None,
         )
 
     case_name = f"{scenario}-p{prompt_len}-o{output_len}-c{concurrency}"
@@ -297,36 +365,90 @@ async def _run_case(
                 iteration=iteration,
                 request_count=request_count,
             )
-            request_results, elapsed_s = await run_trace(
+            trace_result = await run_trace(
                 args.server_url,
                 traces,
                 timeout_s=args.request_timeout_s,
-                max_in_flight=concurrency if scenario == "churn" else None,
             )
+            request_results = list(trace_result.request_results)
+            elapsed_s = trace_result.elapsed_s
             total_input = sum(trace.prompt_len for trace in traces)
             total_output = sum(result.generated_tokens for result in request_results)
+            protocol = {
+                "trace_generator_version": TRACE_GENERATOR_VERSION,
+                "request_arrival": "single_burst",
+                "prefix_caching_enabled": False,
+            }
             record = {
+                "engine": "vortex",
+                "sparse_method": args.sparse_method,
                 "backend_label": args.backend_label,
-                "scenario": scenario,
+                "scenario": "fixed_batch" if scenario == "fixed" else "oversubscribed_churn",
                 "prompt_len": prompt_len,
                 "output_len": output_len,
                 "concurrency": concurrency,
+                "request_count": request_count,
                 "iteration": iteration,
+                "status": "success",
                 "elapsed_s": elapsed_s,
                 "request_throughput_rps": request_count / elapsed_s,
                 "input_token_throughput_tps": total_input / elapsed_s,
                 "output_token_throughput_tps": total_output / elapsed_s,
                 "total_token_throughput_tps": (total_input + total_output) / elapsed_s,
                 "trace": trace_metadata(traces),
-                "request_results": [result.metadata() for result in request_results],
-                "status": "success",
+                "profiler_breakdown": None,
+                "profiler_status": "skipped_by_policy",
+                "protocol": protocol,
+                "protocol_label": args.backend_label,
             }
+            if scenario == "fixed":
+                batch_tpot_ms = trace_result.batch_tpot_ms
+                record.update(
+                    {
+                        "ttft_ms": round(trace_result.batch_ttft_ms, 2),
+                        "tpot_ms": (
+                            None
+                            if batch_tpot_ms is None
+                            else round(batch_tpot_ms, 2)
+                        ),
+                        "decode_metric_status": (
+                            "success"
+                            if batch_tpot_ms is not None
+                            else "skipped_by_policy"
+                        ),
+                    }
+                )
+            else:
+                record.update(
+                    {
+                        "queued_request_count": request_count - concurrency,
+                        "step_count": None,
+                        "engine_init_s": None,
+                        "startup_decode_cuda_graph": None,
+                        "decode_cuda_graph_before": None,
+                        "decode_cuda_graph_after": None,
+                        "decode_cuda_graph_counter_delta": None,
+                        "request_results": [
+                            result.metadata() for result in request_results
+                        ],
+                    }
+                )
             records.append(record)
-            print(
-                f"  iter={iteration + 1}/{args.num_iters} elapsed={elapsed_s:.3f}s "
-                f"output_tps={record['output_token_throughput_tps']:.2f}",
-                flush=True,
-            )
+            if scenario == "fixed":
+                print(
+                    f"  Iter {iteration + 1}/{args.num_iters}: "
+                    f"TTFT={record['ttft_ms']:.1f}ms | "
+                    f"TPOT={record['tpot_ms'] if record['tpot_ms'] is not None else 'n/a'}ms | "
+                    f"Output={record['output_token_throughput_tps']:.1f} tok/s",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"  Iter {iteration + 1}/{args.num_iters}: "
+                    f"elapsed={elapsed_s:.3f}s | "
+                    f"Output={record['output_token_throughput_tps']:.1f} tok/s",
+                    flush=True,
+                )
     finally:
         hardware_summary = monitor.stop()
     hardware = _hardware_metrics(hardware_summary)
@@ -342,27 +464,128 @@ async def _run_case(
     return summary, records
 
 
+def _attach_churn_comparisons(rows: list[dict[str, Any]]) -> None:
+    fixed_by_case: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for row in rows:
+        key = (
+            row.get("engine"),
+            row.get("sparse_method"),
+            row.get("protocol_label"),
+            row.get("prompt_len"),
+            row.get("output_len"),
+            row.get("concurrency"),
+        )
+        if row.get("scenario") == "fixed_batch":
+            fixed_by_case[key] = row
+    for row in rows:
+        if row.get("scenario") != "oversubscribed_churn":
+            continue
+        key = (
+            row.get("engine"),
+            row.get("sparse_method"),
+            row.get("protocol_label"),
+            row.get("prompt_len"),
+            row.get("output_len"),
+            row.get("concurrency"),
+        )
+        fixed = fixed_by_case.get(key)
+        if fixed is None:
+            row["fixed_batch_comparison_status"] = "skipped_by_policy"
+            continue
+        fixed_output_tps = float(fixed["output_token_throughput_tps"])
+        fixed_request_rps = float(fixed["request_throughput_rps"])
+        if fixed_output_tps <= 0 or fixed_request_rps <= 0:
+            raise ValueError(f"Fixed-batch throughput must be positive: {fixed}")
+        row["fixed_batch_comparison_status"] = "success"
+        row["churn_output_tps_ratio_vs_fixed_batch"] = (
+            float(row["output_token_throughput_tps"]) / fixed_output_tps
+        )
+        row["churn_request_rps_ratio_vs_fixed_batch"] = (
+            float(row["request_throughput_rps"]) / fixed_request_rps
+        )
+        row["churn_ttft_p99_delta_ms_vs_fixed_batch"] = (
+            float(row["ttft_ms_p99"]) - float(fixed["ttft_ms_p99"])
+        )
+
+
+def _attach_saturation_metrics(rows: list[dict[str, Any]]) -> None:
+    groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for row in rows:
+        key = (
+            row.get("engine"),
+            row.get("sparse_method"),
+            row.get("protocol_label"),
+            row.get("scenario"),
+            row.get("prompt_len"),
+            row.get("output_len"),
+        )
+        groups.setdefault(key, []).append(row)
+
+    for group_rows in groups.values():
+        ordered = sorted(group_rows, key=lambda row: int(row["concurrency"]))
+        concurrencies = [int(row["concurrency"]) for row in ordered]
+        if len(concurrencies) != len(set(concurrencies)):
+            raise ValueError(
+                f"Saturation sweep contains duplicate concurrencies: {concurrencies}."
+            )
+        rates = [float(row["output_token_throughput_tps"]) for row in ordered]
+        if any(rate <= 0 for rate in rates):
+            raise ValueError(f"Saturation sweep throughput must be positive: {rates}.")
+        observed_peak = max(rates)
+        base_concurrency = concurrencies[0]
+        base_rate = rates[0]
+        saturation_concurrency = next(
+            concurrency
+            for concurrency, rate in zip(concurrencies, rates)
+            if rate >= 0.95 * observed_peak
+        )
+        analysis_status = "success" if len(ordered) > 1 else "skipped_by_policy"
+        for index, (row, concurrency, rate) in enumerate(
+            zip(ordered, concurrencies, rates)
+        ):
+            row["saturation_analysis_status"] = analysis_status
+            row["output_tps_pct_of_observed_sweep_peak"] = rate / observed_peak * 100.0
+            row["output_tps_scaling_efficiency_pct_vs_min_concurrency"] = (
+                (rate / base_rate) / (concurrency / base_concurrency) * 100.0
+            )
+            row["marginal_output_tps_gain_pct_vs_previous_concurrency"] = (
+                None if index == 0 else (rate / rates[index - 1] - 1.0) * 100.0
+            )
+            row["observed_output_saturation_threshold_pct"] = 95.0
+            row["observed_output_saturation_concurrency"] = (
+                saturation_concurrency if analysis_status == "success" else None
+            )
+
+
 def _format_report(rows: list[dict[str, Any]], args: argparse.Namespace) -> str:
     lines = [
-        "# Vortex SGLang Efficiency Probe",
+        "# Standardized LLM Efficiency Benchmark Report",
         "",
-        f"- Model: `{args.model_path}`",
-        f"- Backend: `{args.backend_label}`",
-        f"- Iterations: `{args.num_iters}` measured after `{args.num_warmups}` warmup",
+        f"- **Model**: `{Path(args.model_path).name}`",
+        "- **Tensor parallel size**: `1`",
+        "- **GPU metrics**: directly sampled activity; no theoretical MFU/MBU estimates",
+        f"- **Timestamp**: `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`",
         "",
-        "| Scenario | Prompt | Output | Concurrency | Req/s | Output tok/s | TTFT p50/p99 ms | TPOT p50/p99 ms | E2E p50/p99 ms | GPU util | VRAM GB |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| System / Method | Scenario | Prompt Range | Output Range | Concurrency | Req/s | Output tok/s | Observed peak | Scaling efficiency | TTFT p50/p99 (ms) | GPU compute activity | GPU memory I/O activity | Peak VRAM (GB) | Status |",
+        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
     ]
+
+    def number(value: Any, precision: int) -> str:
+        return "n/a" if value is None else f"{float(value):.{precision}f}"
+
     for row in rows:
         lines.append(
-            f"| {row['scenario']} | {row['prompt_len']} | {row['output_len']} "
-            f"| {row['concurrency']} | {row['request_throughput_rps']:.2f} "
-            f"| {row['output_token_throughput_tps']:.2f} "
-            f"| {row['ttft_ms_p50']:.2f}/{row['ttft_ms_p99']:.2f} "
-            f"| {row['tpot_ms_p50']:.2f}/{row['tpot_ms_p99']:.2f} "
-            f"| {row['latency_ms_p50']:.2f}/{row['latency_ms_p99']:.2f} "
-            f"| {row['gpu_compute_activity_pct_mean']:.1f}% "
-            f"| {row['peak_vram_gb_max']:.2f} |"
+            f"| `{row['protocol_label']}` | {row['scenario']} "
+            f"| {row['prompt_len_min']}-{row['prompt_len_max']} "
+            f"| {row['output_len_min']}-{row['output_len_max']} "
+            f"| {row['concurrency']} | {number(row.get('request_throughput_rps'), 2)} "
+            f"| {number(row.get('output_token_throughput_tps'), 2)} "
+            f"| {number(row.get('output_tps_pct_of_observed_sweep_peak'), 1)}% "
+            f"| {number(row.get('output_tps_scaling_efficiency_pct_vs_min_concurrency'), 1)}% "
+            f"| {number(row.get('ttft_ms_p50'), 2)}/{number(row.get('ttft_ms_p99'), 2)} "
+            f"| {number(row.get('gpu_compute_activity_pct_mean'), 1)}% "
+            f"| {number(row.get('gpu_memory_io_activity_pct_mean'), 1)}% "
+            f"| {number(row.get('peak_vram_gb_max'), 2)} | {row['status']} |"
         )
     lines.append("")
     return "\n".join(lines)
@@ -373,6 +596,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--server-url", default="http://127.0.0.1:30000")
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--backend-label", required=True)
+    parser.add_argument("--sparse-method", default="quest")
     parser.add_argument("--prompt-lens", type=_parse_ints, default=[4096, 32768])
     parser.add_argument("--output-lens", type=_parse_ints, default=[64])
     parser.add_argument("--batch-sizes", type=_parse_ints, default=[1, 16])
@@ -399,6 +623,12 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Warmups must be non-negative and iterations positive.")
     if args.churn_request_multiplier < 2:
         raise ValueError("--churn-request-multiplier must be at least 2.")
+    if args.scenario == "all":
+        raise ValueError(
+            "Strict Sparse-vLLM lifecycle matching requires separate server instances "
+            "for fixed and churn. Run --scenario fixed, restart the Vortex server, "
+            "then run --scenario churn into a different output directory."
+        )
     if not 0.0 <= args.prompt_length_jitter < 1.0:
         raise ValueError("--prompt-length-jitter must be in [0, 1).")
     if not 0.0 <= args.output_length_jitter < 1.0:
@@ -428,6 +658,15 @@ async def _main_async(args: argparse.Namespace) -> None:
         "git": _git_metadata(),
         "source_provenance": SOURCE_PROVENANCE,
         "trace_generator_version": TRACE_GENERATOR_VERSION,
+        "workload": {
+            "trace_generator_version": TRACE_GENERATOR_VERSION,
+            "prefix_caching_enabled": False,
+            "cross_engine_trace_contract": "same seed, token IDs, and per-request lengths",
+            "iteration_prompt_reuse_allowed": False,
+            "request_arrival": "single_burst",
+            "fixed_ttft": "batch_start_to_all_requests_first_token",
+            "churn_ttft": "request_submit_to_first_token_including_server_queue",
+        },
         "environment": {
             "python_executable": sys.executable,
             "python_version": platform.python_version(),
@@ -446,7 +685,7 @@ async def _main_async(args: argparse.Namespace) -> None:
     (output_dir / "request_samples.jsonl").write_text("", encoding="utf-8")
 
     rows: list[dict[str, Any]] = []
-    scenarios = ["fixed", "churn"] if args.scenario == "all" else [args.scenario]
+    scenarios = [args.scenario]
     try:
         for scenario in scenarios:
             for prompt_len in args.prompt_lens:
@@ -469,12 +708,23 @@ async def _main_async(args: argparse.Namespace) -> None:
                                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
                         with (output_dir / "request_samples.jsonl").open("a", encoding="utf-8") as handle:
                             for record in records:
-                                for request in record["request_results"]:
+                                requests = (
+                                    record["trace"]["requests"]
+                                    if scenario == "fixed"
+                                    else record["request_results"]
+                                )
+                                for request in requests:
                                     handle.write(
                                         json.dumps(
                                             {
                                                 "backend_label": args.backend_label,
-                                                "scenario": scenario,
+                                                "engine": "vortex",
+                                                "sparse_method": args.sparse_method,
+                                                "scenario": (
+                                                    "fixed_batch"
+                                                    if scenario == "fixed"
+                                                    else "oversubscribed_churn"
+                                                ),
                                                 "nominal_prompt_len": prompt_len,
                                                 "nominal_output_len": output_len,
                                                 "concurrency": concurrency,
@@ -500,6 +750,8 @@ async def _main_async(args: argparse.Namespace) -> None:
         )
         raise
 
+    _attach_churn_comparisons(rows)
+    _attach_saturation_metrics(rows)
     (output_dir / "summary.json").write_text(
         json.dumps({"status": "success", "summary": rows}, indent=2, ensure_ascii=False),
         encoding="utf-8",

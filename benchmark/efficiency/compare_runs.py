@@ -16,10 +16,10 @@ HIGHER_IS_BETTER = (
     "total_token_throughput_tps",
 )
 LOWER_IS_BETTER = (
+    "ttft_ms_mean",
     "ttft_ms_p50",
     "ttft_ms_p99",
-    "tpot_ms_p50",
-    "tpot_ms_p99",
+    "tpot_ms_mean",
     "latency_ms_p50",
     "latency_ms_p99",
 )
@@ -59,6 +59,18 @@ def compare(baseline_path: Path, candidate_path: Path) -> dict[str, Any]:
             row[f"{metric}_candidate"] = candidate_value
             row[f"{metric}_speedup"] = candidate_value / base_value
         for metric in LOWER_IS_BETTER:
+            if metric not in base_row and metric not in candidate_row:
+                continue
+            if metric not in base_row or metric not in candidate_row:
+                raise ValueError(
+                    f"Metric availability differs for {key}: {metric}"
+                )
+            if base_row[metric] is None and candidate_row[metric] is None:
+                continue
+            if base_row[metric] is None or candidate_row[metric] is None:
+                raise ValueError(
+                    f"Metric status differs for {key}: {metric}"
+                )
             base_value = float(base_row[metric])
             candidate_value = float(candidate_row[metric])
             row[f"{metric}_baseline"] = base_value
@@ -74,22 +86,26 @@ def compare(baseline_path: Path, candidate_path: Path) -> dict[str, Any]:
 
 
 def _markdown(payload: dict[str, Any]) -> str:
+    def speedup(row: dict[str, Any], metric: str) -> str:
+        value = row.get(f"{metric}_speedup")
+        return "n/a" if value is None else f"{float(value):.3f}x"
+
     lines = [
         "# Vortex Probe Comparison",
         "",
         f"- Baseline: `{payload['baseline']}`",
         f"- Candidate: `{payload['candidate']}`",
         "",
-        "| Scenario | Prompt | Output | C | Output tok/s speedup | TTFT p50 speedup | TPOT p50 speedup | E2E p50 speedup |",
+        "| Scenario | Prompt | Output | C | Output tok/s speedup | TTFT p50 speedup | TPOT mean speedup | E2E p50 speedup |",
         "|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in payload["cases"]:
         lines.append(
             f"| {row['scenario']} | {row['prompt_len']} | {row['output_len']} "
-            f"| {row['concurrency']} | {row['output_token_throughput_tps_speedup']:.3f}x "
-            f"| {row['ttft_ms_p50_speedup']:.3f}x "
-            f"| {row['tpot_ms_p50_speedup']:.3f}x "
-            f"| {row['latency_ms_p50_speedup']:.3f}x |"
+            f"| {row['concurrency']} | {speedup(row, 'output_token_throughput_tps')} "
+            f"| {speedup(row, 'ttft_ms_p50')} "
+            f"| {speedup(row, 'tpot_ms_mean')} "
+            f"| {speedup(row, 'latency_ms_p50')} |"
         )
     lines.append("")
     return "\n".join(lines)

@@ -5,13 +5,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from benchmark.efficiency.gpu_guard import query_gpu_states
 from benchmark.efficiency.runtime_env import prepend_interpreter_bin_to_path
-
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,11 +28,18 @@ def parse_args() -> argparse.Namespace:
         "--model-path", default="/data2/pretrain_models/GLM-4.7-Flash"
     )
     parser.add_argument("--module-name", default="quest_mla")
-    parser.add_argument("--block-size", type=int, default=32)
-    parser.add_argument("--topk", type=int, default=61)
-    parser.add_argument("--context-length", type=int, default=33792)
-    parser.add_argument("--mem-fraction-static", type=float, default=0.90)
-    parser.add_argument("--max-running-requests", type=int, default=64)
+    parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument("--topk", type=int, default=291)
+    parser.add_argument("--max-topk", type=int, default=291)
+    parser.add_argument("--layers-skip", default="0,1")
+    parser.add_argument("--block-reserved-bos", type=int, default=0)
+    parser.add_argument("--block-reserved-eos", type=int, default=1)
+    parser.add_argument("--context-length", type=int, default=16640)
+    parser.add_argument("--chunked-prefill-size", type=int, default=8192)
+    parser.add_argument("--max-prefill-tokens", type=int, default=8192)
+    parser.add_argument("--mem-fraction-static", type=float, default=0.85)
+    parser.add_argument("--max-running-requests", type=int, default=32)
+    parser.add_argument("--cuda-graph-max-bs", type=int, default=32)
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--disable-cuda-graph", action="store_true")
@@ -49,8 +58,30 @@ def _validate(args: argparse.Namespace) -> None:
         )
     if args.block_size not in {16, 32, 64}:
         raise ValueError("--block-size must be 16, 32, or 64.")
-    if args.topk <= 0 or args.context_length <= 0 or args.max_running_requests <= 0:
-        raise ValueError("topk, context length, and max running requests must be positive.")
+    args.layers_skip = [
+        int(layer.strip()) for layer in args.layers_skip.split(",") if layer.strip()
+    ]
+    if len(args.layers_skip) != len(set(args.layers_skip)) or any(
+        layer < 0 for layer in args.layers_skip
+    ):
+        raise ValueError("--layers-skip must contain unique non-negative layer IDs.")
+    positive = (
+        args.topk,
+        args.max_topk,
+        args.context_length,
+        args.chunked_prefill_size,
+        args.max_prefill_tokens,
+        args.max_running_requests,
+        args.cuda_graph_max_bs,
+    )
+    if any(value <= 0 for value in positive):
+        raise ValueError("Top-k, context, prefill, request, and graph limits must be positive.")
+    if args.max_topk < args.topk:
+        raise ValueError("--max-topk must be greater than or equal to --topk.")
+    if args.block_reserved_bos < 0 or args.block_reserved_eos < 1:
+        raise ValueError("Reserved BOS must be non-negative and reserved EOS at least one.")
+    if args.chunked_prefill_size % args.block_size:
+        raise ValueError("--chunked-prefill-size must be divisible by --block-size.")
     if not 0.0 < args.mem_fraction_static < 1.0:
         raise ValueError("--mem-fraction-static must be in (0, 1).")
     if not (Path(args.model_path) / "config.json").is_file():
@@ -82,16 +113,16 @@ def main() -> None:
         "impl_backend": "triton",
         "use_tensor_core": True,
         "attention_backend": "trtllm",
-        "layers_skip": [],
-        "block_reserved_eos": 2,
-        "block_reserved_bos": 1,
+        "layers_skip": args.layers_skip,
+        "block_reserved_eos": args.block_reserved_eos,
+        "block_reserved_bos": args.block_reserved_bos,
         "topk_val": args.topk,
         "topk_ratio": 0.0,
         "block_size": args.block_size,
         "workload_chunk_size": 64,
         "module_name": args.module_name,
         "max_seq_lens": args.context_length,
-        "max_topk_val": 256,
+        "max_topk_val": args.max_topk,
         "dtype": "bfloat16",
         "compilation_cache_dir": str(
             REPO_ROOT / ".sm90_mla_work" / "build" / "vortex_compilation_cache"
@@ -108,10 +139,16 @@ def main() -> None:
         json.dumps(vortex_config),
         "--context-length",
         str(args.context_length),
+        "--chunked-prefill-size",
+        str(args.chunked_prefill_size),
+        "--max-prefill-tokens",
+        str(args.max_prefill_tokens),
         "--mem-fraction-static",
         str(args.mem_fraction_static),
         "--max-running-requests",
         str(args.max_running_requests),
+        "--cuda-graph-max-bs",
+        str(args.cuda_graph_max_bs),
         "--disable-radix-cache",
         "--trust-remote-code",
         "--tp-size",
