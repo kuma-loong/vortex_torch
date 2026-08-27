@@ -122,11 +122,16 @@ def _error_metrics(torch, reference, candidate) -> dict[str, Any]:
     candidate_f32 = candidate.float()
     delta = (candidate_f32 - reference_f32).abs()
     finite = bool(torch.isfinite(candidate_f32).all().item())
+    rmse = float(torch.sqrt(torch.mean(delta * delta)).item())
+    reference_rms = float(torch.sqrt(torch.mean(reference_f32 * reference_f32)).item())
     return {
         "all_finite": finite,
         "max_abs_diff": float(delta.max().item()),
         "mean_abs_diff": float(delta.mean().item()),
-        "rmse": float(torch.sqrt(torch.mean(delta * delta)).item()),
+        "rmse": rmse,
+        "reference_abs_mean": float(reference_f32.abs().mean().item()),
+        "reference_rms": reference_rms,
+        "relative_rmse": rmse / max(reference_rms, 1e-12),
     }
 
 
